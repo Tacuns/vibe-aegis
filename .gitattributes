@@ -1,0 +1,23 @@
+# Normalise all text files to LF in the repository.
+* text=auto eol=lf
+
+# Scripts MUST be LF. CRLF breaks shebangs on Linux and macOS
+# ("bash: /usr/bin/env: bad interpreter").
+*.sh      text eol=lf
+*.py      text eol=lf
+*.mjs     text eol=lf
+*.js      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+*.mdc     text eol=lf
+llms.txt      text eol=lf
+llms-full.txt text eol=lf
+
+# Keep binaries untouched.
+*.png     binary
+*.jpg     binary
+*.gif     binary
+*.ico     binary
+*.pdf     binary
