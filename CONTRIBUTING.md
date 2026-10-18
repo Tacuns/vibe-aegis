@@ -110,4 +110,4 @@ Open an issue titled `[false-positive] SEC-XX` or `[false-negative] UX-XX` and i
 
 ## License
 
-By contributing you agree that your contributions are licensed under the [MIT License](LICENSE).
+By contributing you agree that your contributions are licensed under the [MIT License](LICENSE), copyright Tacuns.

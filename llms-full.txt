@@ -76,7 +76,7 @@ codex plugin marketplace add Tacuns/vibe-aegis   # OpenAI Codex, then type $vibe
 
 AI coding assistants build features at lightning speed, but they routinely ship hidden security holes (exposed client secrets, missing Row-Level Security, IDOR, unverified webhooks, prompt injection) and broken UI/UX states (dead placeholder buttons, missing loading/disabled states, mobile overflow traps, WCAG accessibility failures).
 
-**Vibe Aegis** combines a **zero-dependency static + live deployment scanner** (`aegis_scan.py`) with a **6-stage adversarial multi-agent analysis loop** that installs in one command across **Claude Code, VS Code (GitHub Copilot), OpenAI Codex, Cursor, Windsurf, Cline, Gemini CLI, and OpenCode**.
+**Vibe Aegis** combines a **zero-dependency static + live deployment scanner** (`aegis_scan.py`) with a **10-stage adversarial multi-agent analysis loop across 8 domains** that installs in one command across **Claude Code, VS Code (GitHub Copilot), OpenAI Codex, Cursor, Windsurf, Cline, Gemini CLI, and OpenCode**.
 
 
 ## 🧭 The 8 Domains
@@ -147,7 +147,7 @@ flowchart TD
 | Capability | Single-Skill Security Checklists | Binary Reverse-Engineering Tools | **Vibe Aegis (`vibe-aegis`)** |
 | :--- | :--- | :--- | :--- |
 | **Pre-Publish Vibe-Code Security Gate** | Partial (15–30 static rules) | No (focused on binary/app decompilation) | **40+ Static + Live HTTP Posture Checks (Low to Critical)** |
-| **Adversarial Verification Loop** | Single-pass prompt (high false positives) | Evidence tracing only | **Hunter → Skeptic → Referee → Guarded Fixer Loop** |
+| **Adversarial Verification Loop** | Single-pass prompt (high false positives) | Evidence tracing only | **10 stages: Hunter → Skeptic → Referee → Guarded Fixer** |
 | **UI/UX Design & Browser QA Bug Finder** | None | None | **Detects dead buttons, missing async loading states, mobile overflow, a11y & visual bugs** |
 | **Stack-Aware Rules** | Basic | JS/Electron/Native | **Next.js, React, Supabase, Firebase, Prisma, Stripe, Razorpay, FastAPI, Express, Mobile** |
 | **Universal Agent Support** | 1–2 agents | MCP clients | **Claude Code, VS Code, Codex, Cursor, Windsurf, Cline, Gemini CLI, GitHub Actions** |
@@ -442,7 +442,7 @@ Vibe Aegis is a **defensive pre-deployment security and UI/UX quality assurance 
 
 ## 📄 License
 
-[MIT](LICENSE) © Vibe Aegis Contributors
+[MIT](LICENSE) © Tacuns
 
 ---
 
