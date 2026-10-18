@@ -89,7 +89,9 @@
         "ARTIFACT_TOTAL",
         "HISTORY_TOTAL",
         "DATAFLOW_TOTAL",
-        "SUPPRESSED"
+        "SUPPRESSED",
+        "PAYMENTS_TOTAL",
+        "RELIABILITY_TOTAL"
       ],
       "properties": {
         "CRITICAL": {
@@ -136,6 +138,14 @@
           "description": "Findings hidden by a baseline file or .aegis-ignore.",
           "type": "integer",
           "minimum": 0
+        },
+        "PAYMENTS_TOTAL": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "RELIABILITY_TOTAL": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     },
@@ -178,15 +188,17 @@
       ],
       "properties": {
         "rule_id": {
-          "description": "Stable rule identifier. SEC/UX/LIVE are source and live-posture rules; DEP is dependency vulnerabilities; ART is build-artifact and mobile-package findings; HIST is git-history forensics; FLOW is data-flow (taint) analysis.",
+          "description": "Stable rule identifier. SEC/UX/LIVE are source and live-posture rules; PAY is payments and business logic; REL is backend reliability and scale; FLOW is data-flow (taint) analysis; DEP is dependency vulnerabilities; ART is build-artifact and mobile-package findings; HIST is git-history forensics.",
           "type": "string",
-          "pattern": "^(SEC|UX|LIVE|DEP|ART|HIST|FLOW)-[0-9]{2}[A-Z]?$"
+          "pattern": "^(SEC|UX|LIVE|DEP|ART|HIST|FLOW|PAY|REL)-[0-9]{2}[A-Z]?$"
         },
         "domain": {
           "description": "Which analysis stage produced this finding.",
           "enum": [
             "SECURITY",
             "UI_UX",
+            "PAYMENTS",
+            "RELIABILITY",
             "SUPPLY_CHAIN",
             "ARTIFACT",
             "HISTORY",

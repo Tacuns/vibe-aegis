@@ -1,6 +1,6 @@
 ---
 name: vibe-aegis
-description: Master 6-stage pre-launch safeguard loop for vibe-coded apps. Orchestrates deterministic triage, deep Low-to-Critical security auditing, UI/UX design & browser bug finding, adversarial false-positive filtering (Skeptic), evidence grading (Referee), and guarded branch auto-fixing. Use whenever the user asks to audit, secure, test UI/UX, or prepare an app for production.
+description: Master 10-stage First-to-Last full-stack safeguard loop for vibe-coded apps across 8 domains. Orchestrates deterministic triage, deep Low-to-Critical security auditing, UI/UX design & browser bug finding, adversarial false-positive filtering (Skeptic), evidence grading (Referee), and guarded branch auto-fixing. Use whenever the user asks to audit, secure, test UI/UX, or prepare an app for production.
 ---
 
 # Vibe Aegis — Master 6-Stage Pre-Launch Audit & Hardening Loop
@@ -12,7 +12,20 @@ Run a complete, adversarial pre-publication audit across both **Application Secu
 - The user types `/aegis`, `/aegis-audit`, or `$vibe-aegis`
 - The user asks to "check if my app is safe to publish", "find security holes and UI/UX bugs", "run a pre-launch audit", or "harden this vibe-coded app"
 
-## 6-Stage Execution Protocol
+## The 8 Domains
+
+| # | Domain | Skill |
+| :--- | :--- | :--- |
+| 1 | Architecture, tenancy & RLS | `architecture-threat-model` |
+| 2 | Application security | `security-redteam-loop` |
+| 3 | Payments & business logic | `payments-logic-auditor` |
+| 4 | AI / LLM | `ai-llm-security-shield` |
+| 5 | Backend reliability & scale | `backend-reliability-scale` |
+| 6 | UI/UX & accessibility | `ui-ux-bug-finder` |
+| 7 | Shipped artifacts | `artifact-leak-hunter` |
+| 8 | Production readiness | `production-preflight-gate` |
+
+## 10-Stage Execution Protocol
 
 ### Stage 1: Deterministic Recon & Triage (`aegis_scan.py`)
 
@@ -39,12 +52,38 @@ Read `.aegis/scan-report.json` to extract:
 2. All deterministic `SECURITY` and `UI_UX` candidate findings.
 3. Map all public entry points (`app/api/**`, `pages/api/**`, `"use server"` actions, webhooks, public routes, and database schema/migrations).
 
+### Stage 1.5: Architecture, Tenancy & Threat Model
+
+Load `skills/architecture-threat-model/SKILL.md`. Map entry points, trust boundaries, assets and
+actors, verify tenant isolation and Row-Level Security, and write `.aegis/THREAT_MODEL.md`.
+
+Do this **before** line-level hunting. Without the map, a missing `aria-label` and a missing tenant
+filter look like two findings of similar size. They are not.
+
 ### Stage 2: Deep Security Red-Team Hunter (Low -> Critical)
 
 Load and follow the instructions in `skills/security-redteam-loop/SKILL.md` (or `.claude/skills/security-redteam-loop/SKILL.md`).
 - Trace data flows across files—do not stop at single-line regex matches.
 - Verify authentication, ownership scoping (IDOR), Row-Level Security (RLS), payment price integrity, webhook signatures, SSRF, SQLi/XSS/CSRF, JWT verification, rate limits, and LLM token/cost caps.
 - Record each candidate finding with exact `file:line`, concrete trigger path, STRIDE category, and CWE ID.
+
+### Stage 2.5: Payments, Webhooks & Race Conditions
+
+Load `skills/payments-logic-auditor/SKILL.md`. Security bugs leak data; payment bugs leak money
+while the app appears to work. Check server-side pricing authority (`PAY-01`), webhook signature
+verification and idempotency (`PAY-03`), and atomic balance updates (`PAY-02`).
+
+### Stage 2.6: AI / LLM Security & Spend
+
+Load `skills/ai-llm-security-shield/SKILL.md`. Confirm every model call has authentication, rate
+limits, an input cap and an explicit `max_tokens`. Map every untrusted text source reaching a
+prompt, follow model output to its sinks, and state the blast radius of a successful injection.
+
+### Stage 2.7: Backend Reliability & Scale
+
+Load `skills/backend-reliability-scale/SKILL.md`. Find the failures that only appear under real
+traffic: unbounded queries, N+1 loops, missing indexes, serverless connection exhaustion, missing
+timeouts, and personal data written to logs.
 
 ### Stage 3: Deep UI/UX Design & Browser QA Hunter
 
@@ -92,3 +131,13 @@ Never edit source files during a scan-only run without user approval. When the u
 3. Re-run `python3 .aegis/scripts/aegis_scan.py .` and the project's native typecheck/test/build command (`npm run build`, `npm test`, or `pytest`).
 4. If any patch introduces a build or test failure, immediately revert that commit and flag the item for `MANUAL_REVIEW`.
 5. Repeat until the Release Readiness Score reaches `>= 90/100` with zero open `CRITICAL` or `HIGH` issues.
+
+### Stage 7: Production Pre-Flight Gate
+
+Load `skills/production-preflight-gate/SKILL.md`. The final go/no-go: live HTTP posture, exposed
+artifacts, container and CI hardening, privacy and account-deletion readiness, and operational
+readiness (rollback, monitoring, tested backups).
+
+Issue exactly one verdict - `READY`, `READY WITH KNOWN LIMITATIONS` or `NOT READY` - and say for
+each section what was checked, how, and what was **not** covered. Never issue `READY` because a
+check was not run; mark it `NOT VERIFIED` and say so.

@@ -1,0 +1,32 @@
+# OpenAI / Codex workspace skill metadata for `payments-logic-auditor`.
+# Read by OpenAI Codex when this skill is installed into .agents/skills/.
+schema_version: 1
+
+interface:
+  display_name: Payments, Webhooks & Race-Condition Auditor
+  short_description: Find client-trusted prices, unverified or replayable webhooks, and TOCTOU double-spend races in checkout, credits and entitlements.
+
+metadata:
+  name: payments-logic-auditor
+  version: 2.0.0
+  license: MIT
+  homepage: https://github.com/Tacuns/vibe-aegis
+  categories:
+    - security
+    - payments
+    - business-logic
+
+entrypoint:
+  instructions: ../SKILL.md
+
+triggers:
+  - "audit my checkout"
+  - "can someone pay less"
+  - "check my stripe webhook"
+  - "are my credits safe"
+  - "billing audit"
+
+commands:
+  - name: scan
+    description: Deterministic rule pass over the repository, writing .aegis/scan-report.json.
+    run: python3 .aegis/scripts/aegis_scan.py . --all --output .aegis/scan-report.json

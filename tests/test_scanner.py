@@ -357,5 +357,71 @@ class TestScoring(unittest.TestCase):
         self.assertTrue(aegis_scan.compute_readiness_score(many_medium)[1].startswith("NEEDS REVIEW"))
 
 
+class TestPaymentsAndReliability(unittest.TestCase):
+    """PAY and REL domains: money bugs and failures that only appear at scale."""
+
+    VULNERABLE = """
+    export async function POST(req: Request) {
+      const body = await req.json();
+      const session = await stripe.checkout.sessions.create({
+        line_items: [{ price_data: { unit_amount: body.price } }]
+      });
+      await prisma.user.update({ where: { id }, data: { credits: user.credits - 1 } });
+      const all = await prisma.order.findMany();
+      for (const item of items) { await prisma.order.findUnique({ where: { id: item.id } }); }
+      console.log("charging", user.email, "apiKey", key);
+      const r = await fetch("https://api.example.com/charge");
+    }
+    """
+
+    SAFE = """
+    export async function POST(req: Request) {
+      const { planId } = schema.parse(await req.json());
+      const plan = await db.plan.findUniqueOrThrow({ where: { id: planId } });
+      await prisma.$executeRaw`UPDATE wallets SET balance = balance - 1 WHERE user_id = ${uid} AND balance >= 1`;
+      const page = await prisma.order.findMany({ take: 50 });
+      const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    }
+    """
+
+    def _scan(self, source):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "app/api/pay/route.ts", source)
+            findings, _ = aegis_scan.scan_repository(root)
+            return findings
+
+    def test_detects_all_payment_and_reliability_flaws(self):
+        rule_ids = {f.rule_id for f in self._scan(self.VULNERABLE)}
+        for expected in ("PAY-01", "PAY-02", "REL-01", "REL-02", "REL-03", "REL-04"):
+            self.assertIn(expected, rule_ids, f"{expected} did not fire")
+
+    def test_correct_implementations_produce_no_payment_or_reliability_findings(self):
+        """Atomic SQL, paginated queries and fetch timeouts must not be flagged."""
+        noisy = [f.rule_id for f in self._scan(self.SAFE)
+                 if f.domain in ("PAYMENTS", "RELIABILITY")]
+        self.assertEqual(noisy, [], f"false positives on correct code: {noisy}")
+
+    def test_domains_are_separated_for_reporting(self):
+        findings = self._scan(self.VULNERABLE)
+        self.assertEqual({f.domain for f in findings if f.rule_id.startswith("PAY-")}, {"PAYMENTS"})
+        self.assertEqual({f.domain for f in findings if f.rule_id.startswith("REL-")}, {"RELIABILITY"})
+
+    def test_reliability_findings_are_medium_confidence(self):
+        """A pattern cannot know your data volume, so REL must not claim certainty."""
+        rel = [f for f in self._scan(self.VULNERABLE) if f.domain == "RELIABILITY"]
+        self.assertTrue(rel)
+        self.assertTrue(all(f.confidence == "MEDIUM" for f in rel))
+
+    def test_ignore_rules_accept_the_new_prefixes(self):
+        rules, globs = set(), []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, ".aegis-ignore", "PAY-02\nREL-01\nlegacy/**\n")
+            rules, globs = aegis_scan.load_ignore_rules(root)
+        self.assertEqual(rules, {"PAY-02", "REL-01"})
+        self.assertEqual(globs, ["legacy/**"])
+
+
 if __name__ == "__main__":
     unittest.main()

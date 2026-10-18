@@ -1,0 +1,32 @@
+# OpenAI / Codex workspace skill metadata for `ai-llm-security-shield`.
+# Read by OpenAI Codex when this skill is installed into .agents/skills/.
+schema_version: 1
+
+interface:
+  display_name: AI / LLM Security & Denial-of-Wallet Shield
+  short_description: Audit AI features for prompt injection, unbounded token spend, unsafe model-output handling and over-privileged tool calls.
+
+metadata:
+  name: ai-llm-security-shield
+  version: 2.0.0
+  license: MIT
+  homepage: https://github.com/Tacuns/vibe-aegis
+  categories:
+    - security
+    - ai
+    - llm
+
+entrypoint:
+  instructions: ../SKILL.md
+
+triggers:
+  - "is my ai feature safe"
+  - "can someone drain my api credits"
+  - "check my chatbot"
+  - "prompt injection audit"
+  - "rag security"
+
+commands:
+  - name: scan
+    description: Deterministic rule pass over the repository, writing .aegis/scan-report.json.
+    run: python3 .aegis/scripts/aegis_scan.py . --all --output .aegis/scan-report.json

@@ -219,6 +219,15 @@ def schema_part(text):
     )
 
 
+
+EXTRA_SKILLS = [
+    ("architecture-threat-model", "ARCHITECTURE, TENANCY & STRIDE THREAT MODEL"),
+    ("payments-logic-auditor", "PAYMENTS, WEBHOOKS & RACE CONDITIONS"),
+    ("ai-llm-security-shield", "AI / LLM SECURITY & DENIAL-OF-WALLET"),
+    ("backend-reliability-scale", "BACKEND RELIABILITY, SCALE & PRIVACY"),
+    ("production-preflight-gate", "PRODUCTION PRE-FLIGHT GATE"),
+]
+
 parts = [
     HEADER,
     "\n# =============================================================================\n"

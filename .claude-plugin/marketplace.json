@@ -5,15 +5,15 @@
     "url": "https://github.com/Tacuns"
   },
   "metadata": {
-    "description": "Universal pre-launch Security (Low-to-Critical) and UI/UX design bug finder with a 6-stage adversarial audit loop for vibe-coded apps.",
-    "version": "2.0.0"
+    "description": "10-stage First-to-Last full-stack safeguard across 8 domains: architecture and threat model, security, payments and race conditions, AI/LLM, backend reliability, UI/UX and accessibility, shipped-artifact verification, and the production pre-flight gate.",
+    "version": "2.1.0"
   },
   "plugins": [
     {
       "name": "vibe-aegis",
       "source": "./",
-      "description": "Master 6-stage pre-launch safeguard loop: deterministic recon, deep Low-to-Critical security hunting, UI/UX and accessibility bug finding, adversarial false-positive filtering, evidence grading, and guarded auto-fixing. Bundles all three skills plus the /aegis slash command.",
-      "version": "2.0.0",
+      "description": "10-stage First-to-Last full-stack safeguard across 8 domains: architecture and threat model, security, payments and race conditions, AI/LLM, backend reliability, UI/UX and accessibility, shipped-artifact verification, and the production pre-flight gate.",
+      "version": "2.1.0",
       "author": {
         "name": "Tacuns",
         "url": "https://github.com/Tacuns"
@@ -41,9 +41,14 @@
       ],
       "skills": [
         "./skills/vibe-aegis",
+        "./skills/architecture-threat-model",
         "./skills/security-redteam-loop",
+        "./skills/payments-logic-auditor",
+        "./skills/ai-llm-security-shield",
+        "./skills/backend-reliability-scale",
         "./skills/ui-ux-bug-finder",
-        "./skills/artifact-leak-hunter"
+        "./skills/artifact-leak-hunter",
+        "./skills/production-preflight-gate"
       ]
     }
   ]

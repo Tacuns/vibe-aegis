@@ -1,0 +1,32 @@
+# OpenAI / Codex workspace skill metadata for `backend-reliability-scale`.
+# Read by OpenAI Codex when this skill is installed into .agents/skills/.
+schema_version: 1
+
+interface:
+  display_name: Backend Reliability, Scale & Privacy
+  short_description: Catch unbounded queries, N+1 loops, missing indexes, serverless connection exhaustion, missing timeouts and PII written to logs.
+
+metadata:
+  name: backend-reliability-scale
+  version: 2.0.0
+  license: MIT
+  homepage: https://github.com/Tacuns/vibe-aegis
+  categories:
+    - reliability
+    - performance
+    - privacy
+
+entrypoint:
+  instructions: ../SKILL.md
+
+triggers:
+  - "will this handle load"
+  - "why is my app slow"
+  - "is this production ready"
+  - "check my database queries"
+  - "scale audit"
+
+commands:
+  - name: scan
+    description: Deterministic rule pass over the repository, writing .aegis/scan-report.json.
+    run: python3 .aegis/scripts/aegis_scan.py . --all --output .aegis/scan-report.json

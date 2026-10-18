@@ -4,6 +4,42 @@ All notable changes to Vibe Aegis are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-10-18
+
+Expands Vibe Aegis into a 10-stage First-to-Last safeguard across 8 domains. Everything in 2.0.0 is retained; all flags behave identically.
+
+### Added - Payments & Business Logic domain
+
+- `PAY-01` Critical: `amount`, `unit_amount`, `price`, `quantity`, `currency` or `discount` taken from the request body. A user edits the request and sets their own price.
+- `PAY-02` High: non-atomic balance updates. Read-then-write on credits lets two parallel requests both succeed (double-spend).
+- `PAY-03` Critical: payment webhooks without signature verification against the raw unparsed body.
+- New skill `skills/payments-logic-auditor/SKILL.md`, covering server-side pricing authority, webhook idempotency against replay, and atomic conditional updates.
+
+### Added - Backend Reliability domain
+
+- `REL-01` unbounded queries without pagination, `REL-02` N+1 database loops, `REL-03` passwords/tokens/PII written to logs, `REL-04` outbound requests with no timeout.
+- Reported at `MEDIUM` confidence by design: a pattern cannot know your data volume, so the Skeptic stage confirms against real table sizes.
+- New skill `skills/backend-reliability-scale/SKILL.md`, also covering indexes, serverless connection exhaustion and failure behaviour.
+
+### Added - Three more domain skills
+
+- `skills/architecture-threat-model/SKILL.md`: trust boundaries, tenant isolation, Row-Level Security policy-by-policy, and a STRIDE pass. Runs before line-level hunting so findings can be ranked by what an attacker gains.
+- `skills/ai-llm-security-shield/SKILL.md`: prompt injection, denial-of-wallet, unsafe model-output handling, agent tool scope, and RAG tenant isolation.
+- `skills/production-preflight-gate/SKILL.md`: live HTTP posture, exposed artifacts, container and CI hardening, privacy and account-deletion readiness, and the `READY` / `READY WITH KNOWN LIMITATIONS` / `NOT READY` verdict.
+
+### Changed
+
+- Master orchestrator is now a 10-stage protocol across the 8 domains.
+- `AGENTS.md` gains always-on payment and reliability rules, so these are prevented while code is written rather than only caught at audit time.
+- Schema: `domain` enum extended with `PAYMENTS` and `RELIABILITY`; rule-id pattern extended for `PAY` and `REL`; `summary_counts` gains `PAYMENTS_TOTAL` and `RELIABILITY_TOTAL`.
+- `.aegis-ignore` accepts the new rule prefixes.
+- Tests 25 -> 30, including a negative suite proving atomic SQL, paginated queries and `AbortSignal.timeout()` produce zero findings.
+
+### Fixed
+
+- `run_git()` decoded git output using the locale codec, which is cp1252 on Windows. Any non-ASCII byte raised `UnicodeDecodeError` and silently killed the entire `--git-history` stage, so it appeared to find nothing rather than failing.
+- `.gitignore` hardened against `.env` files, private keys, keystores, service-account JSON, `.npmrc`/`.netrc`/`.pypirc` and build output.
+
 ## [2.0.0] - 2026-10-18
 
 Closes the gap between "my source looks fine" and "what I ship is safe". Everything from 1.0.0 is retained; all previous flags still behave identically.

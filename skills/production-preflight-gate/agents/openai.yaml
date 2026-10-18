@@ -1,0 +1,32 @@
+# OpenAI / Codex workspace skill metadata for `production-preflight-gate`.
+# Read by OpenAI Codex when this skill is installed into .agents/skills/.
+schema_version: 1
+
+interface:
+  display_name: Production Pre-Flight Gate
+  short_description: Final go/no-go: live HTTP posture, exposed artifacts, container and CI hardening, privacy readiness, and the Release Readiness verdict.
+
+metadata:
+  name: production-preflight-gate
+  version: 2.0.0
+  license: MIT
+  homepage: https://github.com/Tacuns/vibe-aegis
+  categories:
+    - security
+    - release-engineering
+    - compliance
+
+entrypoint:
+  instructions: ../SKILL.md
+
+triggers:
+  - "am i ready to launch"
+  - "final check before launch"
+  - "can i go live"
+  - "pre-flight check"
+  - "release gate"
+
+commands:
+  - name: scan
+    description: Deterministic rule pass over the repository, writing .aegis/scan-report.json.
+    run: python3 .aegis/scripts/aegis_scan.py . --all --output .aegis/scan-report.json

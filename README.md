@@ -1,6 +1,6 @@
 # 🛡️ Vibe Aegis (`vibe-aegis`)
 
-**The Universal Pre-Launch Security & UI/UX Safeguard Loop for Vibe-Coded Apps.**
+**The 10-Stage First-to-Last Full-Stack Safeguard for Vibe-Coded Apps — across 8 domains.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.8+ Zero-Deps](https://img.shields.io/badge/Python-3.8%2B%20zero--deps-3776AB?logo=python&logoColor=white)](scripts/aegis_scan.py)
@@ -35,7 +35,25 @@ AI coding assistants build features at lightning speed, but they routinely ship 
 
 **Vibe Aegis** combines a **zero-dependency static + live deployment scanner** (`aegis_scan.py`) with a **6-stage adversarial multi-agent analysis loop** that installs in one command across **Claude Code, VS Code (GitHub Copilot), OpenAI Codex, Cursor, Windsurf, Cline, Gemini CLI, and OpenCode**.
 
-## 🔄 The 6-Stage Adversarial Analysis Loop
+
+## 🧭 The 8 Domains
+
+A single pass over eight separate failure modes. Each has its own skill, its own rules, and its own place in the 10-stage loop.
+
+| # | Domain | Catches | Skill |
+| :--- | :--- | :--- | :--- |
+| 1 | **Architecture & Tenancy** | Broken tenant isolation, missing RLS, weak trust boundaries | `architecture-threat-model` |
+| 2 | **Application Security** | Secrets, IDOR, injection, XSS, SSRF, auth & session flaws | `security-redteam-loop` |
+| 3 | **Payments & Business Logic** | Client-trusted prices, replayable webhooks, double-spend races | `payments-logic-auditor` |
+| 4 | **AI / LLM** | Prompt injection, denial-of-wallet, unsafe output, tool scope | `ai-llm-security-shield` |
+| 5 | **Backend Reliability** | Unbounded queries, N+1 loops, missing timeouts, PII in logs | `backend-reliability-scale` |
+| 6 | **UI/UX & Accessibility** | Dead buttons, missing async states, mobile overflow, WCAG 2.2 AA | `ui-ux-bug-finder` |
+| 7 | **Shipped Artifacts** | Secrets in the built bundle, source maps, unsigned/debuggable APKs | `artifact-leak-hunter` |
+| 8 | **Production Readiness** | Headers, exposed files, container & CI hardening, go/no-go verdict | `production-preflight-gate` |
+
+Security bugs leak data. **Payment bugs leak money.** **Reliability bugs only appear the day you succeed.** They need separate passes, because each one looks fine from inside the others.
+
+## 🔄 The Adversarial Analysis Loop
 
 ```mermaid
 flowchart TD
@@ -214,7 +232,26 @@ Also honoured: a `.aegis-ignore` file in the repo root, one entry per line — e
 | `UX-09` | **Unfinished AI Placeholders in UI** | High | Leftover `"Lorem ipsum"`, `"TODO:"`, `"placeholder"`, `"example.com"`, or fake `$99,999` mock metrics in production views |
 | `UX-10` | **Z-Index & Modal Scroll Traps** | Low | Arbitrary `z-[99999]` collisions or modals that lock `document.body.style.overflow` without cleanup on unmount |
 
-### C. Data-Flow Analysis (follows the value, not the pattern)
+### C. Payments & Business Logic
+
+| ID | Category | Severity | What it catches |
+| :--- | :--- | :--- | :--- |
+| `PAY-01` | Client-trusted price | Critical | `amount`, `unit_amount`, `price`, `quantity`, `currency` or `discount` taken from the request body |
+| `PAY-02` | Non-atomic balance update | High | Read-then-write on credits or balances — two parallel requests both succeed (double-spend) |
+| `PAY-03` | Unverified webhook | Critical | Payment webhook without signature verification against the raw body |
+
+### D. Backend Reliability & Privacy
+
+| ID | Category | Severity | What it catches |
+| :--- | :--- | :--- | :--- |
+| `REL-01` | Unbounded query | Medium | `findMany()` with no `take` — fine at 100 rows, fatal at 100,000 |
+| `REL-02` | N+1 query loop | Medium | A database `await` inside a `for` loop or `.map(async …)` |
+| `REL-03` | Sensitive data in logs | High | Passwords, tokens, API keys or PII passed to `console.log` or a logger |
+| `REL-04` | Missing timeout | Medium | `await fetch()` with no `AbortSignal.timeout()` — a hung upstream eats your concurrency |
+
+`REL` findings are reported at `MEDIUM` confidence: a pattern cannot know your data volume, so the Skeptic stage confirms against real table sizes.
+
+### E. Data-Flow Analysis (follows the value, not the pattern)
 
 A regex says *"there is a template literal in a query."* Taint analysis says *"**this** value came from the request and reaches **that** query unvalidated."* Input is traced from request sources (`req.body`, `req.json()`, `searchParams.get`, `formData.get`, route `params`) through assignments to dangerous sinks. A value that passes a validator (`zod.parse`, `parseInt`, `encodeURIComponent`, an allowlist check) is treated as clean and **not** reported.
 
@@ -228,7 +265,7 @@ A regex says *"there is a template literal in a query."* Taint analysis says *"*
 
 Reported at `MEDIUM` confidence by design — the tracker works within a function scope, so the Skeptic stage confirms before anything is called CONFIRMED.
 
-### D. Shipped-Artifact Verification (what your users actually receive)
+### F. Shipped-Artifact Verification (what your users actually receive)
 
 Source code says what you wrote. The build output says what ships. Because the scanner already read your source, it can **cross-reference** — turning a guess into proof.
 
@@ -243,7 +280,7 @@ Source code says what you wrote. The build output says what ships. Because the s
 | `ART-14` | Debuggable release | High | Manifest may mark the app debuggable |
 | `ART-15` | Credential in package | Critical–Medium | A key embedded in packaged assets, resources or code |
 
-### E. Supply Chain & Git History
+### G. Supply Chain & Git History
 
 | ID | Category | Severity | What it catches |
 | :--- | :--- | :--- | :--- |

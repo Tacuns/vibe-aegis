@@ -1,6 +1,6 @@
 {
   "name": "vibe-aegis",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Pre-launch Security, UI/UX and build-artifact verification for vibe-coded apps: 40+ rules, taint analysis, secret + git-history scanning, dependency CVEs, SBOM, SARIF, and a 6-stage adversarial audit loop",
   "license": "MIT",
   "bin": {

@@ -1,0 +1,32 @@
+# OpenAI / Codex workspace skill metadata for `architecture-threat-model`.
+# Read by OpenAI Codex when this skill is installed into .agents/skills/.
+schema_version: 1
+
+interface:
+  display_name: Architecture & STRIDE Threat Model
+  short_description: Map trust boundaries, tenant isolation and database Row-Level Security, then build a STRIDE threat model before auditing individual lines.
+
+metadata:
+  name: architecture-threat-model
+  version: 2.0.0
+  license: MIT
+  homepage: https://github.com/Tacuns/vibe-aegis
+  categories:
+    - security
+    - architecture
+    - threat-modeling
+
+entrypoint:
+  instructions: ../SKILL.md
+
+triggers:
+  - "threat model this"
+  - "map my architecture"
+  - "check my RLS"
+  - "is my tenant isolation safe"
+  - "where are my weak points"
+
+commands:
+  - name: scan
+    description: Deterministic rule pass over the repository, writing .aegis/scan-report.json.
+    run: python3 .aegis/scripts/aegis_scan.py . --all --output .aegis/scan-report.json

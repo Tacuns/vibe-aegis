@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-SCANNER_VERSION = "2.0.0"
+SCANNER_VERSION = "2.1.0"
 
 IGNORE_DIRS: Set[str] = {
     ".git", "node_modules", ".next", "dist", "build", "out", ".vercel",
@@ -578,6 +578,27 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None) -> Tuple[
                         )
                     )
 
+            for rule_id, dom, sev, title, pattern, std, rem, allowed_exts in DOMAIN_PATTERNS:
+                if allowed_exts and ext not in allowed_exts:
+                    continue
+                for m in pattern.finditer(text):
+                    line_no = text[:m.start()].count("\n") + 1
+                    snippet = lines[line_no - 1].strip()[:140] if line_no <= len(lines) else m.group(0)[:140]
+                    findings.append(
+                        Finding(
+                            rule_id=rule_id,
+                            domain=dom,
+                            severity=sev,
+                            title=title,
+                            file=rel_path,
+                            line=line_no,
+                            snippet=snippet,
+                            cwe_or_standard=std,
+                            remediation=rem,
+                            confidence="MEDIUM" if dom == "RELIABILITY" else "HIGH",
+                        )
+                    )
+
             for rule_id, sev, title, pattern, cwe, rem, allowed_exts in UIUX_PATTERNS:
                 if allowed_exts and ext not in allowed_exts:
                     continue
@@ -709,6 +730,110 @@ def check_live_url_posture(target_url: str) -> List[Finding]:
             pass
 
     return findings
+
+
+# ---------------------------------------------------------------------------
+# Domain Rules: Payments / Business Logic and Backend Reliability
+# ---------------------------------------------------------------------------
+# These carry their own domain so the report separates "someone can steal money"
+# from "this will fall over at scale". Tuple shape adds a domain to the front:
+#   (rule_id, domain, severity, title, pattern, standard, remediation, exts)
+
+DOMAIN_PATTERNS: List[Tuple[str, str, str, str, re.Pattern, str, str, Optional[Set[str]]]] = [
+    (
+        "PAY-01",
+        "PAYMENTS",
+        "CRITICAL",
+        "Client-Submitted Price Or Amount Trusted In Payment Checkout",
+        re.compile(
+            r"(?:unit_amount|amount|price|quantity|discount)\s*:\s*"
+            r"(?:req\.body\.|body\.|params\.|searchParams\.|data\.|input\.|"
+            r"Number\(\s*(?:req\.)?body\.|parseInt\(\s*(?:req\.)?body\.)",
+            re.IGNORECASE,
+        ),
+        "CWE-602 Client-Side Enforcement of Server-Side Security / OWASP A04",
+        "Never accept amount, price, quantity or discount from the request body - a user can "
+        "change it before it is sent. Take only a plan or product ID from the client and look the "
+        "real price up on the server from a trusted table or your provider's price object.",
+        {".js", ".ts", ".jsx", ".tsx", ".mjs", ".py"},
+    ),
+    (
+        "PAY-02",
+        "PAYMENTS",
+        "HIGH",
+        "Non-Atomic Balance Or Credit Update (TOCTOU Double-Spend Race)",
+        re.compile(
+            r"(?:credits|balance|tokens|quota|points|wallet)\s*:\s*"
+            r"(?:\w+\.)?(?:credits|balance|tokens|quota|points|wallet)\s*-\s*\d+"
+            r"|\.update\([^)]*\b(?:credits|balance)\b\s*:\s*\w+\s*-\s*",
+            re.IGNORECASE,
+        ),
+        "CWE-367 Time-of-Check Time-of-Use Race Condition / OWASP A04",
+        "Reading a balance and then writing `balance - 1` lets two simultaneous requests both "
+        "succeed, so a user spends credits they do not have. Make it one atomic statement the "
+        "database enforces: UPDATE wallets SET balance = balance - $1 WHERE user_id = $2 AND "
+        "balance >= $1, and treat zero affected rows as 'insufficient funds'.",
+        {".js", ".ts", ".jsx", ".tsx", ".mjs", ".py", ".sql"},
+    ),
+    (
+        "REL-01",
+        "RELIABILITY",
+        "MEDIUM",
+        "Unbounded Database Query Without Pagination",
+        re.compile(r"\.findMany\s*\(\s*\)|\.select\(\s*['\"]\*['\"]\s*\)(?![\s\S]{0,120}\.(?:limit|range)\()"),
+        "Backend Reliability / CWE-770 Allocation Without Limits",
+        "This loads every row into memory. It is fine with 100 rows and takes the server down at "
+        "100,000. Pass an explicit page size (`take: 50`, `.limit(50)`) and paginate with a cursor.",
+        {".js", ".ts", ".jsx", ".tsx", ".mjs"},
+    ),
+    (
+        "REL-02",
+        "RELIABILITY",
+        "MEDIUM",
+        "Database Query Inside A Loop (N+1 Query Pattern)",
+        re.compile(
+            r"for\s*\((?:[^)]*)\)\s*\{[^}]{0,300}?await\s+(?:prisma|supabase|db|sql|knex)\."
+            r"|\.map\(\s*async[^)]{0,80}\)\s*=>\s*\{[^}]{0,300}?await\s+(?:prisma|supabase|db|sql)\.",
+            re.DOTALL,
+        ),
+        "Backend Reliability / Performance",
+        "One query per loop iteration means 100 items cause 100 round trips. Fetch them in a "
+        "single query with `WHERE id IN (...)` or a join, then match them up in memory.",
+        {".js", ".ts", ".jsx", ".tsx", ".mjs"},
+    ),
+    (
+        "REL-03",
+        "RELIABILITY",
+        "HIGH",
+        "Sensitive Data Written To Logs",
+        re.compile(
+            r"console\.(?:log|info|debug|warn|error)\s*\([^)]{0,160}?\b"
+            r"(?:password|passwd|secret|access[_-]?token|refresh[_-]?token|api[_-]?key|"
+            r"credit[_-]?card|card[_-]?number|cvv|ssn|session[_-]?token)\b"
+            r"|logger\.\w+\([^)]{0,160}?\b(?:password|secret|api[_-]?key|access[_-]?token)\b",
+            re.IGNORECASE,
+        ),
+        "CWE-532 Insertion of Sensitive Information into Log File / OWASP A09",
+        "Logs are shipped to third-party services, kept for months, and readable by anyone with "
+        "dashboard access. Log an identifier instead of the value, and redact these fields before "
+        "they reach your logger or error tracker.",
+        {".js", ".ts", ".jsx", ".tsx", ".mjs", ".py"},
+    ),
+    (
+        "REL-04",
+        "RELIABILITY",
+        "MEDIUM",
+        "External Request Without A Timeout",
+        re.compile(
+            r"await\s+fetch\((?![\s\S]{0,200}?(?:signal|AbortSignal|timeout))[^;]{0,200};",
+            re.IGNORECASE,
+        ),
+        "Backend Reliability / CWE-1088 Synchronous Access of Remote Resource",
+        "A hung upstream request holds your serverless function open until it is killed, consuming "
+        "your concurrency budget. Attach `AbortSignal.timeout(10000)` so it fails fast.",
+        {".ts", ".js", ".mjs"},
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -1575,7 +1700,7 @@ def load_ignore_rules(root: Path) -> Tuple[Set[str], List[str]]:
         line = line.split("#", 1)[0].strip()
         if not line:
             continue
-        if re.match(r"^(?:SEC|UX|LIVE|DEP|ART|HIST|FLOW)-[0-9]{2}[A-Z]?$", line):
+        if re.match(r"^(?:SEC|UX|LIVE|DEP|ART|HIST|FLOW|PAY|REL)-[0-9]{2}[A-Z]?$", line):
             rules.add(line)
         else:
             globs.append(line)
@@ -1854,6 +1979,8 @@ def main() -> int:
         "ARTIFACT_TOTAL": sum(1 for f in findings if f.domain == "ARTIFACT"),
         "HISTORY_TOTAL": sum(1 for f in findings if f.domain == "HISTORY"),
         "DATAFLOW_TOTAL": sum(1 for f in findings if f.domain == "DATAFLOW"),
+        "PAYMENTS_TOTAL": sum(1 for f in findings if f.domain == "PAYMENTS"),
+        "RELIABILITY_TOTAL": sum(1 for f in findings if f.domain == "RELIABILITY"),
         "SUPPRESSED": suppressed,
     }
 
@@ -1915,6 +2042,8 @@ def main() -> int:
             f"Security: {counts['SECURITY_TOTAL']}",
             f"UI/UX: {counts['UI_UX_TOTAL']}",
             f"Data-flow: {counts['DATAFLOW_TOTAL']}",
+            f"Payments: {counts['PAYMENTS_TOTAL']}",
+            f"Reliability: {counts['RELIABILITY_TOTAL']}",
             f"Supply chain: {counts['SUPPLY_CHAIN_TOTAL']}",
             f"Build artifacts: {counts['ARTIFACT_TOTAL']}",
             f"Git history: {counts['HISTORY_TOTAL']}",

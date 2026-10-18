@@ -1,6 +1,6 @@
 # Vibe Aegis
 
-> The universal pre-launch Security, UI/UX and shipped-artifact verification loop for vibe-coded apps. A zero-dependency Python scanner covering source rules, data-flow (taint) analysis, high-precision secret detection, git-history forensics, dependency CVEs and build-artifact verification, plus a 6-stage adversarial multi-agent audit loop (Recon -> Security Hunter + UI/UX Hunter -> Artifact Verification -> Adversarial Skeptic -> Evidence Referee -> Guarded Fixer) that installs in one command across Claude Code, VS Code Copilot, OpenAI Codex, Cursor, Windsurf, Cline, and Gemini CLI. Outputs JSON, SARIF and CycloneDX SBOM.
+> The 10-stage First-to-Last full-stack safeguard for vibe-coded apps, across 8 domains: architecture and tenancy, application security, payments and business logic, AI/LLM, backend reliability, UI/UX and accessibility, shipped artifacts, and production readiness. A zero-dependency Python scanner covering source rules, data-flow (taint) analysis, high-precision secret detection, git-history forensics, dependency CVEs and build-artifact verification, plus a 6-stage adversarial multi-agent audit loop (Recon -> Security Hunter + UI/UX Hunter -> Artifact Verification -> Adversarial Skeptic -> Evidence Referee -> Guarded Fixer) that installs in one command across Claude Code, VS Code Copilot, OpenAI Codex, Cursor, Windsurf, Cline, and Gemini CLI. Outputs JSON, SARIF and CycloneDX SBOM.
 
 AI coding assistants ship features fast, but they routinely leave two classes of defect behind: hidden **security holes** (secrets exposed in client bundles, Row-Level Security never enabled, unprotected API routes, IDOR, client-trusted prices, unverified webhooks, unbounded LLM spend) and broken **UI/UX states** (dead placeholder buttons, buttons that stay enabled during async calls and double-charge customers, silent `catch {}` blocks, blank screens where an empty state belongs, mobile horizontal overflow, WCAG failures).
 
@@ -86,6 +86,10 @@ codex plugin marketplace add Tacuns/vibe-aegis   # OpenAI Codex, then $vibe-aegi
 
 **Adoption:** `--diff` scans only changed files; `--baseline` suppresses pre-existing findings so a team sees only what they just introduced; `.aegis-ignore` accepts rule ids and path globs.
 
+**Payments, `PAY-01` to `PAY-03`:** client-trusted prices and amounts, unverified or replayable webhooks, and non-atomic balance updates that let two parallel requests both spend the same credit.
+
+**Reliability, `REL-01` to `REL-04`:** unbounded queries without pagination, N+1 database loops, sensitive data written to logs, and outbound requests with no timeout. Reported at MEDIUM confidence because a pattern cannot know your data volume.
+
 **Scoring:** 100 minus 25 per `CRITICAL`, 10 per `HIGH`, 4 per `MEDIUM`, 1 per `LOW`, floored at 0. Any open `CRITICAL` or `HIGH` returns `BLOCKED`.
 
 ## Docs
@@ -104,6 +108,11 @@ codex plugin marketplace add Tacuns/vibe-aegis   # OpenAI Codex, then $vibe-aegi
 - [skills/vibe-aegis/SKILL.md](skills/vibe-aegis/SKILL.md): Master orchestrator defining the 6-stage protocol end to end, including the Guarded Fixer branch-and-revert rules.
 - [skills/security-redteam-loop/SKILL.md](skills/security-redteam-loop/SKILL.md): Deep Low-to-Critical security auditor covering five trust boundaries with STRIDE and OWASP Top 10.
 - [skills/ui-ux-bug-finder/SKILL.md](skills/ui-ux-bug-finder/SKILL.md): Five-point UI/UX protocol: dead controls, the four-state async matrix, responsive layout, WCAG 2.2 AA, and live DOM inspection.
+- [skills/architecture-threat-model/SKILL.md](skills/architecture-threat-model/SKILL.md): Map trust boundaries, tenant isolation and Row-Level Security, then build a STRIDE threat model before line-level hunting.
+- [skills/payments-logic-auditor/SKILL.md](skills/payments-logic-auditor/SKILL.md): Client-trusted prices, webhook signature verification and idempotency, and TOCTOU double-spend races on credits and balances.
+- [skills/ai-llm-security-shield/SKILL.md](skills/ai-llm-security-shield/SKILL.md): Prompt injection, denial-of-wallet (unbounded token spend), unsafe model-output handling, and over-privileged agent tool calls.
+- [skills/backend-reliability-scale/SKILL.md](skills/backend-reliability-scale/SKILL.md): Unbounded queries, N+1 loops, missing indexes, serverless connection exhaustion, missing timeouts, and PII written to logs.
+- [skills/production-preflight-gate/SKILL.md](skills/production-preflight-gate/SKILL.md): Final go/no-go - live HTTP posture, exposed artifacts, container and CI hardening, privacy readiness, Release Readiness verdict.
 - [skills/artifact-leak-hunter/SKILL.md](skills/artifact-leak-hunter/SKILL.md): Verify what the build actually ships - cross-references source credentials against the bundle, inspects source maps, and audits `.apk`/`.aab`/`.ipa` packages.
 - [skills/artifact-leak-hunter/agents/openai.yaml](skills/artifact-leak-hunter/agents/openai.yaml): OpenAI/Codex workspace metadata for the artifact skill.
 - [skills/vibe-aegis/agents/openai.yaml](skills/vibe-aegis/agents/openai.yaml): OpenAI/Codex workspace metadata for the orchestrator skill.

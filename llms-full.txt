@@ -43,7 +43,7 @@
 
 # 🛡️ Vibe Aegis (`vibe-aegis`)
 
-**The Universal Pre-Launch Security & UI/UX Safeguard Loop for Vibe-Coded Apps.**
+**The 10-Stage First-to-Last Full-Stack Safeguard for Vibe-Coded Apps — across 8 domains.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.8+ Zero-Deps](https://img.shields.io/badge/Python-3.8%2B%20zero--deps-3776AB?logo=python&logoColor=white)](scripts/aegis_scan.py)
@@ -78,7 +78,25 @@ AI coding assistants build features at lightning speed, but they routinely ship 
 
 **Vibe Aegis** combines a **zero-dependency static + live deployment scanner** (`aegis_scan.py`) with a **6-stage adversarial multi-agent analysis loop** that installs in one command across **Claude Code, VS Code (GitHub Copilot), OpenAI Codex, Cursor, Windsurf, Cline, Gemini CLI, and OpenCode**.
 
-## 🔄 The 6-Stage Adversarial Analysis Loop
+
+## 🧭 The 8 Domains
+
+A single pass over eight separate failure modes. Each has its own skill, its own rules, and its own place in the 10-stage loop.
+
+| # | Domain | Catches | Skill |
+| :--- | :--- | :--- | :--- |
+| 1 | **Architecture & Tenancy** | Broken tenant isolation, missing RLS, weak trust boundaries | `architecture-threat-model` |
+| 2 | **Application Security** | Secrets, IDOR, injection, XSS, SSRF, auth & session flaws | `security-redteam-loop` |
+| 3 | **Payments & Business Logic** | Client-trusted prices, replayable webhooks, double-spend races | `payments-logic-auditor` |
+| 4 | **AI / LLM** | Prompt injection, denial-of-wallet, unsafe output, tool scope | `ai-llm-security-shield` |
+| 5 | **Backend Reliability** | Unbounded queries, N+1 loops, missing timeouts, PII in logs | `backend-reliability-scale` |
+| 6 | **UI/UX & Accessibility** | Dead buttons, missing async states, mobile overflow, WCAG 2.2 AA | `ui-ux-bug-finder` |
+| 7 | **Shipped Artifacts** | Secrets in the built bundle, source maps, unsigned/debuggable APKs | `artifact-leak-hunter` |
+| 8 | **Production Readiness** | Headers, exposed files, container & CI hardening, go/no-go verdict | `production-preflight-gate` |
+
+Security bugs leak data. **Payment bugs leak money.** **Reliability bugs only appear the day you succeed.** They need separate passes, because each one looks fine from inside the others.
+
+## 🔄 The Adversarial Analysis Loop
 
 ```mermaid
 flowchart TD
@@ -257,7 +275,26 @@ Also honoured: a `.aegis-ignore` file in the repo root, one entry per line — e
 | `UX-09` | **Unfinished AI Placeholders in UI** | High | Leftover `"Lorem ipsum"`, `"TODO:"`, `"placeholder"`, `"example.com"`, or fake `$99,999` mock metrics in production views |
 | `UX-10` | **Z-Index & Modal Scroll Traps** | Low | Arbitrary `z-[99999]` collisions or modals that lock `document.body.style.overflow` without cleanup on unmount |
 
-### C. Data-Flow Analysis (follows the value, not the pattern)
+### C. Payments & Business Logic
+
+| ID | Category | Severity | What it catches |
+| :--- | :--- | :--- | :--- |
+| `PAY-01` | Client-trusted price | Critical | `amount`, `unit_amount`, `price`, `quantity`, `currency` or `discount` taken from the request body |
+| `PAY-02` | Non-atomic balance update | High | Read-then-write on credits or balances — two parallel requests both succeed (double-spend) |
+| `PAY-03` | Unverified webhook | Critical | Payment webhook without signature verification against the raw body |
+
+### D. Backend Reliability & Privacy
+
+| ID | Category | Severity | What it catches |
+| :--- | :--- | :--- | :--- |
+| `REL-01` | Unbounded query | Medium | `findMany()` with no `take` — fine at 100 rows, fatal at 100,000 |
+| `REL-02` | N+1 query loop | Medium | A database `await` inside a `for` loop or `.map(async …)` |
+| `REL-03` | Sensitive data in logs | High | Passwords, tokens, API keys or PII passed to `console.log` or a logger |
+| `REL-04` | Missing timeout | Medium | `await fetch()` with no `AbortSignal.timeout()` — a hung upstream eats your concurrency |
+
+`REL` findings are reported at `MEDIUM` confidence: a pattern cannot know your data volume, so the Skeptic stage confirms against real table sizes.
+
+### E. Data-Flow Analysis (follows the value, not the pattern)
 
 A regex says *"there is a template literal in a query."* Taint analysis says *"**this** value came from the request and reaches **that** query unvalidated."* Input is traced from request sources (`req.body`, `req.json()`, `searchParams.get`, `formData.get`, route `params`) through assignments to dangerous sinks. A value that passes a validator (`zod.parse`, `parseInt`, `encodeURIComponent`, an allowlist check) is treated as clean and **not** reported.
 
@@ -271,7 +308,7 @@ A regex says *"there is a template literal in a query."* Taint analysis says *"*
 
 Reported at `MEDIUM` confidence by design — the tracker works within a function scope, so the Skeptic stage confirms before anything is called CONFIRMED.
 
-### D. Shipped-Artifact Verification (what your users actually receive)
+### F. Shipped-Artifact Verification (what your users actually receive)
 
 Source code says what you wrote. The build output says what ships. Because the scanner already read your source, it can **cross-reference** — turning a guess into proof.
 
@@ -286,7 +323,7 @@ Source code says what you wrote. The build output says what ships. Because the s
 | `ART-14` | Debuggable release | High | Manifest may mark the app debuggable |
 | `ART-15` | Credential in package | Critical–Medium | A key embedded in packaged assets, resources or code |
 
-### E. Supply Chain & Git History
+### G. Supply Chain & Git History
 
 | ID | Category | Severity | What it catches |
 | :--- | :--- | :--- | :--- |
@@ -441,6 +478,16 @@ You are operating in a repository protected by **Vibe Aegis**. Every code change
    - Never render unsanitized HTML via `dangerouslySetInnerHTML`, `v-html`, or `innerHTML`.
    - Store session tokens in `HttpOnly; Secure; SameSite=Lax/Strict` cookies—never in `localStorage`.
 
+5. **Payments & Entitlements (`PAY-01`, `PAY-02`, `PAY-03`)**:
+   - Never accept `amount`, `unit_amount`, `price`, `quantity`, `currency` or `discount` from the client. Take a plan or product ID and resolve the real price on the server.
+   - Verify every webhook signature against the raw unparsed body, and store each processed `event.id` under a unique constraint so a replay cannot grant an entitlement twice.
+   - Never read a balance, decide, then write it back. Use one atomic statement: `UPDATE wallets SET balance = balance - $1 WHERE user_id = $2 AND balance >= $1`, and treat zero affected rows as insufficient funds.
+6. **Reliability & Privacy (`REL-01` to `REL-04`)**:
+   - Every list query needs an explicit maximum page size. `findMany()` with no `take` loads the whole table into memory.
+   - Never `await` a database call inside a loop. Batch with `WHERE id IN (...)` or a join.
+   - Attach `AbortSignal.timeout(10000)` to outbound `fetch()` so a hung dependency cannot consume your concurrency budget.
+   - Never log passwords, tokens, API keys or personal data. Log an identifier instead of the value.
+
 ## 2. Non-Negotiable UI/UX Quality Rules (Prevent Broken Frontend Experiences)
 
 1. **Complete Interactive States (`UX-01`, `UX-02`, `UX-03`, `UX-04`)**:
@@ -476,7 +523,7 @@ Source file: `skills/vibe-aegis/SKILL.md`
 
 ---
 name: vibe-aegis
-description: Master 6-stage pre-launch safeguard loop for vibe-coded apps. Orchestrates deterministic triage, deep Low-to-Critical security auditing, UI/UX design & browser bug finding, adversarial false-positive filtering (Skeptic), evidence grading (Referee), and guarded branch auto-fixing. Use whenever the user asks to audit, secure, test UI/UX, or prepare an app for production.
+description: Master 10-stage First-to-Last full-stack safeguard loop for vibe-coded apps across 8 domains. Orchestrates deterministic triage, deep Low-to-Critical security auditing, UI/UX design & browser bug finding, adversarial false-positive filtering (Skeptic), evidence grading (Referee), and guarded branch auto-fixing. Use whenever the user asks to audit, secure, test UI/UX, or prepare an app for production.
 ---
 
 # Vibe Aegis — Master 6-Stage Pre-Launch Audit & Hardening Loop
@@ -488,7 +535,20 @@ Run a complete, adversarial pre-publication audit across both **Application Secu
 - The user types `/aegis`, `/aegis-audit`, or `$vibe-aegis`
 - The user asks to "check if my app is safe to publish", "find security holes and UI/UX bugs", "run a pre-launch audit", or "harden this vibe-coded app"
 
-## 6-Stage Execution Protocol
+## The 8 Domains
+
+| # | Domain | Skill |
+| :--- | :--- | :--- |
+| 1 | Architecture, tenancy & RLS | `architecture-threat-model` |
+| 2 | Application security | `security-redteam-loop` |
+| 3 | Payments & business logic | `payments-logic-auditor` |
+| 4 | AI / LLM | `ai-llm-security-shield` |
+| 5 | Backend reliability & scale | `backend-reliability-scale` |
+| 6 | UI/UX & accessibility | `ui-ux-bug-finder` |
+| 7 | Shipped artifacts | `artifact-leak-hunter` |
+| 8 | Production readiness | `production-preflight-gate` |
+
+## 10-Stage Execution Protocol
 
 ### Stage 1: Deterministic Recon & Triage (`aegis_scan.py`)
 
@@ -515,12 +575,38 @@ Read `.aegis/scan-report.json` to extract:
 2. All deterministic `SECURITY` and `UI_UX` candidate findings.
 3. Map all public entry points (`app/api/**`, `pages/api/**`, `"use server"` actions, webhooks, public routes, and database schema/migrations).
 
+### Stage 1.5: Architecture, Tenancy & Threat Model
+
+Load `skills/architecture-threat-model/SKILL.md`. Map entry points, trust boundaries, assets and
+actors, verify tenant isolation and Row-Level Security, and write `.aegis/THREAT_MODEL.md`.
+
+Do this **before** line-level hunting. Without the map, a missing `aria-label` and a missing tenant
+filter look like two findings of similar size. They are not.
+
 ### Stage 2: Deep Security Red-Team Hunter (Low -> Critical)
 
 Load and follow the instructions in `skills/security-redteam-loop/SKILL.md` (or `.claude/skills/security-redteam-loop/SKILL.md`).
 - Trace data flows across files—do not stop at single-line regex matches.
 - Verify authentication, ownership scoping (IDOR), Row-Level Security (RLS), payment price integrity, webhook signatures, SSRF, SQLi/XSS/CSRF, JWT verification, rate limits, and LLM token/cost caps.
 - Record each candidate finding with exact `file:line`, concrete trigger path, STRIDE category, and CWE ID.
+
+### Stage 2.5: Payments, Webhooks & Race Conditions
+
+Load `skills/payments-logic-auditor/SKILL.md`. Security bugs leak data; payment bugs leak money
+while the app appears to work. Check server-side pricing authority (`PAY-01`), webhook signature
+verification and idempotency (`PAY-03`), and atomic balance updates (`PAY-02`).
+
+### Stage 2.6: AI / LLM Security & Spend
+
+Load `skills/ai-llm-security-shield/SKILL.md`. Confirm every model call has authentication, rate
+limits, an input cap and an explicit `max_tokens`. Map every untrusted text source reaching a
+prompt, follow model output to its sinks, and state the blast radius of a successful injection.
+
+### Stage 2.7: Backend Reliability & Scale
+
+Load `skills/backend-reliability-scale/SKILL.md`. Find the failures that only appear under real
+traffic: unbounded queries, N+1 loops, missing indexes, serverless connection exhaustion, missing
+timeouts, and personal data written to logs.
 
 ### Stage 3: Deep UI/UX Design & Browser QA Hunter
 
@@ -568,6 +654,16 @@ Never edit source files during a scan-only run without user approval. When the u
 3. Re-run `python3 .aegis/scripts/aegis_scan.py .` and the project's native typecheck/test/build command (`npm run build`, `npm test`, or `pytest`).
 4. If any patch introduces a build or test failure, immediately revert that commit and flag the item for `MANUAL_REVIEW`.
 5. Repeat until the Release Readiness Score reaches `>= 90/100` with zero open `CRITICAL` or `HIGH` issues.
+
+### Stage 7: Production Pre-Flight Gate
+
+Load `skills/production-preflight-gate/SKILL.md`. The final go/no-go: live HTTP posture, exposed
+artifacts, container and CI hardening, privacy and account-deletion readiness, and operational
+readiness (rollback, monitoring, tested backups).
+
+Issue exactly one verdict - `READY`, `READY WITH KNOWN LIMITATIONS` or `NOT READY` - and say for
+each section what was checked, how, and what was **not** covered. Never issue `READY` because a
+check was not run; mark it `NOT VERIFIED` and say so.
 
 ---
 
@@ -929,7 +1025,9 @@ Findings arrive pre-sorted: severity first (CRITICAL to LOW), then domain, file,
         "ARTIFACT_TOTAL",
         "HISTORY_TOTAL",
         "DATAFLOW_TOTAL",
-        "SUPPRESSED"
+        "SUPPRESSED",
+        "PAYMENTS_TOTAL",
+        "RELIABILITY_TOTAL"
       ],
       "properties": {
         "CRITICAL": {
@@ -976,6 +1074,14 @@ Findings arrive pre-sorted: severity first (CRITICAL to LOW), then domain, file,
           "description": "Findings hidden by a baseline file or .aegis-ignore.",
           "type": "integer",
           "minimum": 0
+        },
+        "PAYMENTS_TOTAL": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "RELIABILITY_TOTAL": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     },
@@ -1018,15 +1124,17 @@ Findings arrive pre-sorted: severity first (CRITICAL to LOW), then domain, file,
       ],
       "properties": {
         "rule_id": {
-          "description": "Stable rule identifier. SEC/UX/LIVE are source and live-posture rules; DEP is dependency vulnerabilities; ART is build-artifact and mobile-package findings; HIST is git-history forensics; FLOW is data-flow (taint) analysis.",
+          "description": "Stable rule identifier. SEC/UX/LIVE are source and live-posture rules; PAY is payments and business logic; REL is backend reliability and scale; FLOW is data-flow (taint) analysis; DEP is dependency vulnerabilities; ART is build-artifact and mobile-package findings; HIST is git-history forensics.",
           "type": "string",
-          "pattern": "^(SEC|UX|LIVE|DEP|ART|HIST|FLOW)-[0-9]{2}[A-Z]?$"
+          "pattern": "^(SEC|UX|LIVE|DEP|ART|HIST|FLOW|PAY|REL)-[0-9]{2}[A-Z]?$"
         },
         "domain": {
           "description": "Which analysis stage produced this finding.",
           "enum": [
             "SECURITY",
             "UI_UX",
+            "PAYMENTS",
+            "RELIABILITY",
             "SUPPLY_CHAIN",
             "ARTIFACT",
             "HISTORY",

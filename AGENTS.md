@@ -22,6 +22,16 @@ You are operating in a repository protected by **Vibe Aegis**. Every code change
    - Never render unsanitized HTML via `dangerouslySetInnerHTML`, `v-html`, or `innerHTML`.
    - Store session tokens in `HttpOnly; Secure; SameSite=Lax/Strict` cookies—never in `localStorage`.
 
+5. **Payments & Entitlements (`PAY-01`, `PAY-02`, `PAY-03`)**:
+   - Never accept `amount`, `unit_amount`, `price`, `quantity`, `currency` or `discount` from the client. Take a plan or product ID and resolve the real price on the server.
+   - Verify every webhook signature against the raw unparsed body, and store each processed `event.id` under a unique constraint so a replay cannot grant an entitlement twice.
+   - Never read a balance, decide, then write it back. Use one atomic statement: `UPDATE wallets SET balance = balance - $1 WHERE user_id = $2 AND balance >= $1`, and treat zero affected rows as insufficient funds.
+6. **Reliability & Privacy (`REL-01` to `REL-04`)**:
+   - Every list query needs an explicit maximum page size. `findMany()` with no `take` loads the whole table into memory.
+   - Never `await` a database call inside a loop. Batch with `WHERE id IN (...)` or a join.
+   - Attach `AbortSignal.timeout(10000)` to outbound `fetch()` so a hung dependency cannot consume your concurrency budget.
+   - Never log passwords, tokens, API keys or personal data. Log an identifier instead of the value.
+
 ## 2. Non-Negotiable UI/UX Quality Rules (Prevent Broken Frontend Experiences)
 
 1. **Complete Interactive States (`UX-01`, `UX-02`, `UX-03`, `UX-04`)**:
