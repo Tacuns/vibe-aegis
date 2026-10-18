@@ -1,0 +1,33 @@
+# OpenAI / Codex workspace skill metadata for `ui-ux-bug-finder`.
+# Read by OpenAI Codex when this skill is installed into .agents/skills/.
+schema_version: 1
+
+interface:
+  display_name: UI/UX Design & Browser QA Bug Finder
+  short_description: Find dead buttons, missing loading, empty and error states, mobile overflow traps, z-index collisions, and WCAG 2.2 AA accessibility failures in frontend code and the live DOM.
+
+metadata:
+  name: ui-ux-bug-finder
+  version: 1.0.0
+  license: MIT
+  homepage: https://github.com/Tacuns/vibe-aegis
+  categories:
+    - code-quality
+    - accessibility
+    - frontend
+
+entrypoint:
+  instructions: ../SKILL.md
+
+triggers:
+  - "ui ux audit"
+  - "find broken buttons"
+  - "accessibility audit"
+  - "check mobile responsiveness"
+  - "wcag check"
+  - "why is my page broken on mobile"
+
+commands:
+  - name: scan
+    description: Deterministic UI/UX rule pass (UX-01 to UX-10) over the repository.
+    run: python3 .aegis/scripts/aegis_scan.py . --json --output .aegis/scan-report.json

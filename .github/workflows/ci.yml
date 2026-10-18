@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit Tests (Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Oldest supported interpreter (3.8 images are only available on 22.04)
+          - python-version: "3.8"
+            os: ubuntu-22.04
+          - python-version: "3.12"
+            os: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Verify zero dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            echo "::error::requirements.txt found - vibe-aegis must stay zero-dependency"
+            exit 1
+          fi
+          echo "No Python dependencies required."
+
+      - name: Run unit tests
+        run: python3 -B -m unittest discover -s tests -v
+
+  installer:
+    name: Installer Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run installer for all agents
+        run: bash install.sh --target /tmp/test-app --agent all
+
+      - name: Verify installed files
+        run: |
+          set -e
+          expected=(
+            "/tmp/test-app/.aegis/scripts/aegis_scan.py"
+            "/tmp/test-app/AGENTS.md"
+            "/tmp/test-app/CLAUDE.md"
+            "/tmp/test-app/.claude/skills/vibe-aegis/SKILL.md"
+            "/tmp/test-app/.claude/skills/security-redteam-loop/SKILL.md"
+            "/tmp/test-app/.claude/skills/ui-ux-bug-finder/SKILL.md"
+            "/tmp/test-app/.claude/commands/aegis.md"
+            "/tmp/test-app/.github/copilot-instructions.md"
+            "/tmp/test-app/.github/prompts/aegis-audit.prompt.md"
+            "/tmp/test-app/.vscode/tasks.json"
+            "/tmp/test-app/.agents/skills/vibe-aegis/SKILL.md"
+            "/tmp/test-app/.cursor/rules/vibe-aegis.mdc"
+            "/tmp/test-app/.cursorrules"
+            "/tmp/test-app/.windsurf/rules/vibe-aegis.md"
+            "/tmp/test-app/.clinerules"
+            "/tmp/test-app/GEMINI.md"
+          )
+          for f in "${expected[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Missing expected installed file: $f"
+              exit 1
+            fi
+            echo "ok: $f"
+          done
+
+      - name: Verify skill frontmatter is parseable
+        run: |
+          set -e
+          for f in skills/*/SKILL.md; do
+            head -1 "$f" | grep -qx -- "---" || { echo "::error::$f is missing opening YAML frontmatter delimiter"; exit 1; }
+            echo "ok: $f"
+          done
+
+      - name: Run installed scanner against the installed project
+        run: python3 /tmp/test-app/.aegis/scripts/aegis_scan.py /tmp/test-app
+
+      - name: Validate JSON report against schema
+        run: |
+          set -e
+          python3 scripts/aegis_scan.py . --json --output /tmp/scan-report.json > /dev/null
+          python3 - <<'PY'
+          import json, sys
+          report = json.load(open("/tmp/scan-report.json"))
+          schema = json.load(open("schemas/scan-report.schema.json"))
+          required = schema["required"]
+          missing = [k for k in required if k not in report]
+          if missing:
+              print(f"::error::Report is missing required schema keys: {missing}")
+              sys.exit(1)
+          for f in report["findings"]:
+              fmissing = [k for k in schema["$defs"]["finding"]["required"] if k not in f]
+              if fmissing:
+                  print(f"::error::Finding missing required keys: {fmissing}")
+                  sys.exit(1)
+          print(f"Schema check passed: {len(report['findings'])} findings, score {report['readiness_score']}/100")
+          PY

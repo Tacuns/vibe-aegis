@@ -1,0 +1,65 @@
+{
+  "name": "vibe-aegis",
+  "version": "1.0.0",
+  "description": "Universal Pre-Launch Security & UI/UX Safeguard Loop for Vibe-Coded Apps (Claude Code, VS Code Copilot, OpenAI Codex, Cursor, Windsurf, Gemini CLI)",
+  "license": "MIT",
+  "bin": {
+    "vibe-aegis": "./bin/vibe-aegis.mjs"
+  },
+  "scripts": {
+    "setup": "node ./bin/vibe-aegis.mjs setup",
+    "scan": "python3 ./scripts/aegis_scan.py .",
+    "test": "python3 -m unittest discover -s tests"
+  },
+  "keywords": [
+    "vibe-coding",
+    "ai-security",
+    "ui-ux-audit",
+    "claude-code",
+    "codex",
+    "vscode-copilot",
+    "cursor",
+    "agent-skills",
+    "owasp",
+    "pre-launch-checklist",
+    "windsurf",
+    "cline",
+    "gemini-cli",
+    "accessibility",
+    "wcag",
+    "appsec",
+    "static-analysis",
+    "devsecops",
+    "llm-agents",
+    "bug-hunter",
+    "supabase-security",
+    "nextjs-security"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "homepage": "https://github.com/Tacuns/vibe-aegis#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tacuns/vibe-aegis.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Tacuns/vibe-aegis/issues"
+  },
+  "author": "Tacuns (https://github.com/Tacuns)",
+  "files": [
+    "bin/",
+    "scripts/",
+    "skills/",
+    "adapters/",
+    "schemas/",
+    "docs/",
+    "install.sh",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "llms.txt",
+    "llms-full.txt",
+    "README.md",
+    "LICENSE"
+  ]
+}

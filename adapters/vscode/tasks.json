@@ -1,0 +1,19 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Vibe Aegis: Run Security & UI/UX Scanner",
+      "type": "shell",
+      "command": "python3 .aegis/scripts/aegis_scan.py . --output .aegis/scan-report.json",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      }
+    }
+  ]
+}

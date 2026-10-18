@@ -1,0 +1,42 @@
+{
+  "name": "vibe-aegis",
+  "owner": {
+    "name": "Tacuns",
+    "url": "https://github.com/Tacuns"
+  },
+  "metadata": {
+    "description": "Universal pre-launch Security (Low-to-Critical) and UI/UX design bug finder with a 6-stage adversarial audit loop for vibe-coded apps.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "vibe-aegis",
+      "source": "./",
+      "description": "Master 6-stage pre-launch safeguard loop: deterministic recon, deep Low-to-Critical security hunting, UI/UX and accessibility bug finding, adversarial false-positive filtering, evidence grading, and guarded auto-fixing. Bundles all three skills plus the /aegis slash command.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Tacuns",
+        "url": "https://github.com/Tacuns"
+      },
+      "homepage": "https://github.com/Tacuns/vibe-aegis",
+      "repository": "https://github.com/Tacuns/vibe-aegis",
+      "license": "MIT",
+      "keywords": [
+        "security",
+        "ui-ux",
+        "accessibility",
+        "owasp",
+        "audit",
+        "pre-launch",
+        "vibe-coding",
+        "static-analysis"
+      ],
+      "commands": ["./adapters/claude/aegis.md"],
+      "skills": [
+        "./skills/vibe-aegis",
+        "./skills/security-redteam-loop",
+        "./skills/ui-ux-bug-finder"
+      ]
+    }
+  ]
+}

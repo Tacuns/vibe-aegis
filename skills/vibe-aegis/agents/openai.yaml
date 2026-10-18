@@ -1,0 +1,33 @@
+# OpenAI / Codex workspace skill metadata for `vibe-aegis`.
+# Read by OpenAI Codex when this skill is installed into .agents/skills/.
+schema_version: 1
+
+interface:
+  display_name: Vibe Aegis - Full Pre-Launch Audit
+  short_description: Run the 6-stage adversarial Security + UI/UX audit loop and produce a 0-100 Release Readiness Score before publishing.
+
+metadata:
+  name: vibe-aegis
+  version: 1.0.0
+  license: MIT
+  homepage: https://github.com/Tacuns/vibe-aegis
+  categories:
+    - security
+    - code-quality
+    - accessibility
+
+entrypoint:
+  instructions: ../SKILL.md
+
+triggers:
+  - "run a vibe aegis audit"
+  - "is my app safe to publish"
+  - "pre-launch audit"
+  - "find security holes and UI/UX bugs"
+  - "harden this vibe-coded app"
+  - "$vibe-aegis"
+
+commands:
+  - name: scan
+    description: Deterministic zero-dependency static and passive live scan producing .aegis/scan-report.json.
+    run: python3 .aegis/scripts/aegis_scan.py . --json --output .aegis/scan-report.json

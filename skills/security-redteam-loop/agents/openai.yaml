@@ -1,0 +1,32 @@
+# OpenAI / Codex workspace skill metadata for `security-redteam-loop`.
+# Read by OpenAI Codex when this skill is installed into .agents/skills/.
+schema_version: 1
+
+interface:
+  display_name: Security Red-Team Loop - Low to Critical
+  short_description: Deep defensive security audit across secrets, auth and IDOR, database RLS, payments and webhooks, and AI/LLM endpoints using STRIDE and OWASP Top 10.
+
+metadata:
+  name: security-redteam-loop
+  version: 1.0.0
+  license: MIT
+  homepage: https://github.com/Tacuns/vibe-aegis
+  categories:
+    - security
+    - appsec
+
+entrypoint:
+  instructions: ../SKILL.md
+
+triggers:
+  - "security audit"
+  - "red team this app"
+  - "check for vulnerabilities"
+  - "owasp audit"
+  - "check my supabase RLS"
+  - "are my API routes protected"
+
+commands:
+  - name: scan
+    description: Deterministic security rule pass (SEC-01 to SEC-17) over the repository.
+    run: python3 .aegis/scripts/aegis_scan.py . --json --output .aegis/scan-report.json

@@ -1,0 +1,35 @@
+name: Vibe Aegis Pre-Publish Gate
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+
+jobs:
+  aegis-gate:
+    name: Security & UI/UX Safeguard Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Vibe Aegis Deterministic Scanner
+        run: |
+          if [ -f ".aegis/scripts/aegis_scan.py" ]; then
+            python3 .aegis/scripts/aegis_scan.py . --output .aegis/scan-report.json --fail-on-high
+          else
+            python3 scripts/aegis_scan.py . --output .aegis/scan-report.json --fail-on-high
+          fi
+
+      - name: Upload Audit Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibe-aegis-scan-report
+          path: .aegis/scan-report.json

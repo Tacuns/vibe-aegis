@@ -1,0 +1,128 @@
+# Vibe Aegis
+
+> The universal pre-launch Security and UI/UX safeguard loop for vibe-coded apps. A zero-dependency Python scanner with 40+ Low-to-Critical rules, plus a 6-stage adversarial multi-agent audit loop (Recon -> Security Hunter + UI/UX Hunter -> Adversarial Skeptic -> Evidence Referee -> Guarded Fixer) that installs in one command across Claude Code, VS Code Copilot, OpenAI Codex, Cursor, Windsurf, Cline, and Gemini CLI.
+
+AI coding assistants ship features fast, but they routinely leave two classes of defect behind: hidden **security holes** (secrets exposed in client bundles, Row-Level Security never enabled, unprotected API routes, IDOR, client-trusted prices, unverified webhooks, unbounded LLM spend) and broken **UI/UX states** (dead placeholder buttons, buttons that stay enabled during async calls and double-charge customers, silent `catch {}` blocks, blank screens where an empty state belongs, mobile horizontal overflow, WCAG failures).
+
+Vibe Aegis catches both before you publish, and grades the result as a 0-100 **Release Readiness Score**.
+
+- **License:** MIT
+- **Runtime:** Python 3.8+ (zero dependencies) for the scanner; Node 18+ only for the optional `npx` wrapper
+- **Repository:** https://github.com/Tacuns/vibe-aegis
+- **Scope:** Defensive pre-deployment auditing of applications you own. Live `--url` checks are passive, read-only HTTP GET requests. See SECURITY.md.
+
+## Run This Repository In One Pass (For AI Agents)
+
+An agent that can fetch a URL needs exactly one of these lines. Each is self-contained.
+
+**Learn the entire framework from a single fetch:**
+
+```text
+Read https://raw.githubusercontent.com/Tacuns/vibe-aegis/main/llms-full.txt and run the Vibe Aegis setup and 6-stage Security + UI/UX audit in this project.
+```
+
+**Full pre-launch audit (Security + UI/UX), writing `.aegis/AUDIT_REPORT.md`:**
+
+```text
+Read https://raw.githubusercontent.com/Tacuns/vibe-aegis/main/docs/prompts/01-full-prelaunch-audit.md and execute it against this repository.
+```
+
+**Security-only deep red-team audit:**
+
+```text
+Read https://raw.githubusercontent.com/Tacuns/vibe-aegis/main/docs/prompts/02-security-redteam-loop.md and execute it against this repository.
+```
+
+**UI/UX and accessibility-only audit:**
+
+```text
+Read https://raw.githubusercontent.com/Tacuns/vibe-aegis/main/docs/prompts/03-ui-ux-and-browser-qa.md and execute it against this repository.
+```
+
+**Install into the current project for every agent, then scan:**
+
+```bash
+git clone https://github.com/Tacuns/vibe-aegis.git /tmp/vibe-aegis
+bash /tmp/vibe-aegis/install.sh --target . --agent all
+python3 .aegis/scripts/aegis_scan.py . --json --output .aegis/scan-report.json
+```
+
+**Run the scanner alone, no install:**
+
+```bash
+python3 scripts/aegis_scan.py /path/to/app                                   # human-readable report
+python3 scripts/aegis_scan.py /path/to/app --url https://staging.example.com # + passive live posture
+python3 scripts/aegis_scan.py /path/to/app --json --output .aegis/scan-report.json
+python3 scripts/aegis_scan.py /path/to/app --fail-on-high                    # exit 1 on CRITICAL/HIGH (CI gate)
+```
+
+**Install as a Claude Code or Codex plugin:**
+
+```text
+/plugin marketplace add Tacuns/vibe-aegis        # Claude Code, then /aegis
+codex plugin marketplace add Tacuns/vibe-aegis   # OpenAI Codex, then $vibe-aegis
+```
+
+## What It Detects
+
+**Security, `SEC-01` to `SEC-17`:** client-exposed secrets; Supabase/Postgres RLS disabled or `USING (true)`; permissive Firebase rules; unprotected API routes and `"use server"` actions; IDOR; payment and checkout price tampering; unverified webhook signatures; SQL and raw-query injection; command and code injection; XSS; JWT `decode()` without `verify()` and `localStorage` tokens; SSRF; LLM prompt injection and unbounded token spend; wildcard CORS and CSRF; missing rate limiting; insecure file uploads; supply-chain slopsquatting; live posture (missing CSP, HSTS, `X-Frame-Options`, `X-Content-Type-Options`; exposed `/.env` and `/.git/config`).
+
+**UI/UX, `UX-01` to `UX-10`:** dead buttons and `href="#"`; missing async `disabled`/loading state (double-submit); silent `catch {}`; missing empty and skeleton states; mobile viewport overflow traps; form label and validation gaps; icon-button and image accessibility; focus-ring suppression; unfinished AI placeholder content; z-index collisions and modal scroll-lock leaks.
+
+**Scoring:** 100 minus 25 per `CRITICAL`, 10 per `HIGH`, 4 per `MEDIUM`, 1 per `LOW`, floored at 0. Any open `CRITICAL` or `HIGH` returns `BLOCKED`.
+
+## Docs
+
+- [README.md](README.md): Full human documentation, install options for all 8 agents, the complete rule coverage matrix, and the 6-stage loop diagram.
+- [llms-full.txt](llms-full.txt): Single self-contained document holding the README, the agent rules, all three skill definitions, the CLI reference and the JSON report schema. One fetch teaches an agent the entire framework.
+- [AGENTS.md](AGENTS.md): Always-on prevention rules applied while an agent writes code, not only at audit time. Installed as `AGENTS.md`, `.cursorrules`, `.clinerules`, `GEMINI.md` and `.windsurf/rules/`.
+- [CLAUDE.md](CLAUDE.md): Claude Code bridge pointing at the installed skills and the `/aegis` command.
+- [CONTRIBUTING.md](CONTRIBUTING.md): How to add a new `SEC-XX` or `UX-XX` rule with tests, and the severity rubric.
+- [SECURITY.md](SECURITY.md): Defensive scope, the passive read-only behaviour of `--url`, the authorization requirement, and private vulnerability reporting.
+- [CHANGELOG.md](CHANGELOG.md): Release history, starting at v1.0.0.
+- [LICENSE](LICENSE): MIT License.
+
+## Skills
+
+- [skills/vibe-aegis/SKILL.md](skills/vibe-aegis/SKILL.md): Master orchestrator defining the 6-stage protocol end to end, including the Guarded Fixer branch-and-revert rules.
+- [skills/security-redteam-loop/SKILL.md](skills/security-redteam-loop/SKILL.md): Deep Low-to-Critical security auditor covering five trust boundaries with STRIDE and OWASP Top 10.
+- [skills/ui-ux-bug-finder/SKILL.md](skills/ui-ux-bug-finder/SKILL.md): Five-point UI/UX protocol: dead controls, the four-state async matrix, responsive layout, WCAG 2.2 AA, and live DOM inspection.
+- [skills/vibe-aegis/agents/openai.yaml](skills/vibe-aegis/agents/openai.yaml): OpenAI/Codex workspace metadata for the orchestrator skill.
+- [skills/security-redteam-loop/agents/openai.yaml](skills/security-redteam-loop/agents/openai.yaml): OpenAI/Codex workspace metadata for the security skill.
+- [skills/ui-ux-bug-finder/agents/openai.yaml](skills/ui-ux-bug-finder/agents/openai.yaml): OpenAI/Codex workspace metadata for the UI/UX skill.
+
+## Prompt Recipes
+
+- [docs/prompts/01-full-prelaunch-audit.md](docs/prompts/01-full-prelaunch-audit.md): Copy-paste prompt running all six stages across Security and UI/UX, producing `.aegis/AUDIT_REPORT.md` with the Release Readiness Score.
+- [docs/prompts/02-security-redteam-loop.md](docs/prompts/02-security-redteam-loop.md): Security-only deep audit prompt covering secrets, auth and IDOR, RLS, payments and webhooks, SSRF, and AI endpoint hardening.
+- [docs/prompts/03-ui-ux-and-browser-qa.md](docs/prompts/03-ui-ux-and-browser-qa.md): UI/UX-only prompt covering dead controls, the four async states, mobile overflow, WCAG 2.2 AA, and live `agent-browser` inspection.
+
+## Code
+
+- [scripts/aegis_scan.py](scripts/aegis_scan.py): The deterministic zero-dependency scanner. Fingerprints the stack, applies all 40+ rules, performs passive live posture checks, and emits the human or JSON report.
+- [bin/vibe-aegis.mjs](bin/vibe-aegis.mjs): Node 18+ CLI wrapper providing `npx vibe-aegis setup` and `npx vibe-aegis scan`.
+- [install.sh](install.sh): Universal installer placing the scanner, rules, skills and commands into a project or a global profile for any supported agent.
+- [package.json](package.json): NPM package manifest defining the `vibe-aegis` binary and the `setup`, `scan` and `test` scripts.
+- [tests/test_scanner.py](tests/test_scanner.py): Unit test suite building a deliberately vulnerable fixture app and asserting the expected rule IDs fire.
+- [schemas/scan-report.schema.json](schemas/scan-report.schema.json): Strict JSON Schema (Draft 2020-12) for `.aegis/scan-report.json`, so CI and agents can validate scanner output deterministically.
+
+## Agent Adapters
+
+- [adapters/claude/aegis.md](adapters/claude/aegis.md): The Claude Code `/aegis` slash command definition.
+- [adapters/vscode/copilot-instructions.md](adapters/vscode/copilot-instructions.md): Workspace instructions installed to `.github/copilot-instructions.md` for GitHub Copilot.
+- [adapters/vscode/aegis-audit.prompt.md](adapters/vscode/aegis-audit.prompt.md): Reusable VS Code prompt file enabling `/aegis-audit` in Copilot Chat.
+- [adapters/vscode/tasks.json](adapters/vscode/tasks.json): One-click VS Code task that runs the scanner.
+- [adapters/cursor/vibe-aegis.mdc](adapters/cursor/vibe-aegis.mdc): Cursor rule file installed to `.cursor/rules/`.
+- [adapters/github-actions/vibe-aegis-ci.yml](adapters/github-actions/vibe-aegis-ci.yml): Drop-in GitHub Actions workflow gating merges on the scanner result.
+
+## Plugin Manifests
+
+- [.claude-plugin/marketplace.json](.claude-plugin/marketplace.json): Marketplace registration enabling `/plugin marketplace add Tacuns/vibe-aegis` in Claude Code and the equivalent in OpenAI Codex.
+- [.claude-plugin/plugin.json](.claude-plugin/plugin.json): Plugin manifest declaring the three bundled skills and the `/aegis` command.
+- [.github/workflows/ci.yml](.github/workflows/ci.yml): This repository's own CI, running the unit tests on Python 3.8 and 3.12 plus an installer smoke test and a schema validation of the scanner output.
+
+## Optional
+
+- [adapters/vscode/tasks.json](adapters/vscode/tasks.json): Skip if you do not use VS Code.
+- [adapters/cursor/vibe-aegis.mdc](adapters/cursor/vibe-aegis.mdc): Skip if you do not use Cursor.
+- [CHANGELOG.md](CHANGELOG.md): Release history only; not needed to run an audit.

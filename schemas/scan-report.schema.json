@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Tacuns/vibe-aegis/main/schemas/scan-report.schema.json",
+  "title": "Vibe Aegis Scan Report",
+  "description": "Deterministic output of `python3 scripts/aegis_scan.py <target> --json --output .aegis/scan-report.json`. CI pipelines and AI agents can validate scan output against this schema before acting on it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "scanner",
+    "version",
+    "timestamp",
+    "target_path",
+    "live_url",
+    "scanned_files",
+    "tech_stack",
+    "readiness_score",
+    "release_verdict",
+    "summary_counts",
+    "findings"
+  ],
+  "properties": {
+    "scanner": {
+      "description": "Scanner identifier. Always the constant `vibe-aegis`.",
+      "const": "vibe-aegis"
+    },
+    "version": {
+      "description": "Semantic version of the scanner that produced this report.",
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "timestamp": {
+      "description": "UTC ISO-8601 timestamp of when the scan completed.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "target_path": {
+      "description": "Absolute resolved filesystem path of the scanned repository.",
+      "type": "string",
+      "minLength": 1
+    },
+    "live_url": {
+      "description": "The live or staging URL passed via `--url`, or null when only a static scan was run.",
+      "type": ["string", "null"]
+    },
+    "scanned_files": {
+      "description": "Number of source files read during the static scan.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "tech_stack": {
+      "description": "Fingerprinted stack. Each key maps to the list of detected technologies in that category; an empty array means nothing was detected for it.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "type": "string" },
+        "uniqueItems": true
+      }
+    },
+    "readiness_score": {
+      "description": "Release Readiness Score from 0 to 100. Starts at 100 and subtracts 25 per CRITICAL, 10 per HIGH, 4 per MEDIUM and 1 per LOW finding, floored at 0.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "release_verdict": {
+      "description": "Human-readable release gate decision. Begins with BLOCKED when any CRITICAL or HIGH finding is open.",
+      "type": "string",
+      "minLength": 1
+    },
+    "summary_counts": {
+      "description": "Finding tallies by severity and by domain.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "SECURITY_TOTAL", "UI_UX_TOTAL"],
+      "properties": {
+        "CRITICAL": { "type": "integer", "minimum": 0 },
+        "HIGH": { "type": "integer", "minimum": 0 },
+        "MEDIUM": { "type": "integer", "minimum": 0 },
+        "LOW": { "type": "integer", "minimum": 0 },
+        "SECURITY_TOTAL": { "type": "integer", "minimum": 0 },
+        "UI_UX_TOTAL": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "findings": {
+      "description": "All deterministic findings, pre-sorted by severity (CRITICAL first), then domain, file and line.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/finding" }
+    }
+  },
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rule_id",
+        "domain",
+        "severity",
+        "title",
+        "file",
+        "line",
+        "snippet",
+        "cwe_or_standard",
+        "remediation",
+        "confidence"
+      ],
+      "properties": {
+        "rule_id": {
+          "description": "Stable rule identifier, e.g. SEC-01, SEC-17B, UX-05 or LIVE-00.",
+          "type": "string",
+          "pattern": "^(SEC|UX|LIVE)-[0-9]{2}[A-Z]?$"
+        },
+        "domain": {
+          "description": "Which hunter owns this finding.",
+          "enum": ["SECURITY", "UI_UX"]
+        },
+        "severity": {
+          "description": "Impact rating used by the Release Readiness Score.",
+          "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+        },
+        "title": {
+          "description": "Short human-readable description of the defect.",
+          "type": "string",
+          "minLength": 1
+        },
+        "file": {
+          "description": "Repository-relative file path, or the probed URL for live posture findings.",
+          "type": "string",
+          "minLength": 1
+        },
+        "line": {
+          "description": "1-indexed line number, or 0 for findings that are not tied to a source line (live URL checks).",
+          "type": "integer",
+          "minimum": 0
+        },
+        "snippet": {
+          "description": "Trimmed evidence excerpt showing why the rule fired.",
+          "type": "string"
+        },
+        "cwe_or_standard": {
+          "description": "Cited authority: a CWE ID, an OWASP Top 10 category, or a WCAG 2.2 success criterion.",
+          "type": "string",
+          "minLength": 1
+        },
+        "remediation": {
+          "description": "Concrete, actionable fix instruction.",
+          "type": "string",
+          "minLength": 1
+        },
+        "confidence": {
+          "description": "Scanner confidence before the adversarial Skeptic stage reviews the claim.",
+          "enum": ["HIGH", "MEDIUM", "LOW"],
+          "default": "HIGH"
+        }
+      }
+    }
+  }
+}
