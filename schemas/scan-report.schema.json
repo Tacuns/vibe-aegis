@@ -11,7 +11,9 @@
     "timestamp",
     "target_path",
     "live_url",
+    "stages",
     "scanned_files",
+    "dependencies_parsed",
     "tech_stack",
     "readiness_score",
     "release_verdict",
@@ -40,7 +42,10 @@
     },
     "live_url": {
       "description": "The live or staging URL passed via `--url`, or null when only a static scan was run.",
-      "type": ["string", "null"]
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "scanned_files": {
       "description": "Number of source files read during the static scan.",
@@ -52,7 +57,9 @@
       "type": "object",
       "additionalProperties": {
         "type": "array",
-        "items": { "type": "string" },
+        "items": {
+          "type": "string"
+        },
         "uniqueItems": true
       }
     },
@@ -71,20 +78,85 @@
       "description": "Finding tallies by severity and by domain.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "SECURITY_TOTAL", "UI_UX_TOTAL"],
+      "required": [
+        "CRITICAL",
+        "HIGH",
+        "MEDIUM",
+        "LOW",
+        "SECURITY_TOTAL",
+        "UI_UX_TOTAL",
+        "SUPPLY_CHAIN_TOTAL",
+        "ARTIFACT_TOTAL",
+        "HISTORY_TOTAL",
+        "DATAFLOW_TOTAL",
+        "SUPPRESSED"
+      ],
       "properties": {
-        "CRITICAL": { "type": "integer", "minimum": 0 },
-        "HIGH": { "type": "integer", "minimum": 0 },
-        "MEDIUM": { "type": "integer", "minimum": 0 },
-        "LOW": { "type": "integer", "minimum": 0 },
-        "SECURITY_TOTAL": { "type": "integer", "minimum": 0 },
-        "UI_UX_TOTAL": { "type": "integer", "minimum": 0 }
+        "CRITICAL": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "HIGH": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "MEDIUM": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "LOW": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "SECURITY_TOTAL": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "UI_UX_TOTAL": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "SUPPLY_CHAIN_TOTAL": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ARTIFACT_TOTAL": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "HISTORY_TOTAL": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "DATAFLOW_TOTAL": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "SUPPRESSED": {
+          "description": "Findings hidden by a baseline file or .aegis-ignore.",
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "findings": {
       "description": "All deterministic findings, pre-sorted by severity (CRITICAL first), then domain, file and line.",
       "type": "array",
-      "items": { "$ref": "#/$defs/finding" }
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    },
+    "stages": {
+      "description": "Which analysis stages actually ran, e.g. static, diff:origin/main, git-history, dependencies, artifacts, live-url, baseline:<n>.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "dependencies_parsed": {
+      "description": "Number of dependencies parsed from lockfiles and manifests (0 when the dependency stage did not run).",
+      "type": "integer",
+      "minimum": 0
     }
   },
   "$defs": {
@@ -101,21 +173,34 @@
         "snippet",
         "cwe_or_standard",
         "remediation",
-        "confidence"
+        "confidence",
+        "fingerprint"
       ],
       "properties": {
         "rule_id": {
-          "description": "Stable rule identifier, e.g. SEC-01, SEC-17B, UX-05 or LIVE-00.",
+          "description": "Stable rule identifier. SEC/UX/LIVE are source and live-posture rules; DEP is dependency vulnerabilities; ART is build-artifact and mobile-package findings; HIST is git-history forensics; FLOW is data-flow (taint) analysis.",
           "type": "string",
-          "pattern": "^(SEC|UX|LIVE)-[0-9]{2}[A-Z]?$"
+          "pattern": "^(SEC|UX|LIVE|DEP|ART|HIST|FLOW)-[0-9]{2}[A-Z]?$"
         },
         "domain": {
-          "description": "Which hunter owns this finding.",
-          "enum": ["SECURITY", "UI_UX"]
+          "description": "Which analysis stage produced this finding.",
+          "enum": [
+            "SECURITY",
+            "UI_UX",
+            "SUPPLY_CHAIN",
+            "ARTIFACT",
+            "HISTORY",
+            "DATAFLOW"
+          ]
         },
         "severity": {
           "description": "Impact rating used by the Release Readiness Score.",
-          "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+          "enum": [
+            "CRITICAL",
+            "HIGH",
+            "MEDIUM",
+            "LOW"
+          ]
         },
         "title": {
           "description": "Short human-readable description of the defect.",
@@ -133,7 +218,7 @@
           "minimum": 0
         },
         "snippet": {
-          "description": "Trimmed evidence excerpt showing why the rule fired.",
+          "description": "Trimmed evidence excerpt. Credentials are always redacted (first 6 and last 4 characters only) so reports are safe to commit and share.",
           "type": "string"
         },
         "cwe_or_standard": {
@@ -148,8 +233,17 @@
         },
         "confidence": {
           "description": "Scanner confidence before the adversarial Skeptic stage reviews the claim.",
-          "enum": ["HIGH", "MEDIUM", "LOW"],
+          "enum": [
+            "HIGH",
+            "MEDIUM",
+            "LOW"
+          ],
           "default": "HIGH"
+        },
+        "fingerprint": {
+          "description": "Stable 16-hex-character id derived from rule, file and normalised evidence. Used for baseline suppression and SARIF partialFingerprints; survives line-number shifts.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{16}$"
         }
       }
     }

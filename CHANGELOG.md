@@ -4,6 +4,69 @@ All notable changes to Vibe Aegis are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-10-18
+
+Closes the gap between "my source looks fine" and "what I ship is safe". Everything from 1.0.0 is retained; all previous flags still behave identically.
+
+### Added - Shipped-Artifact Verification (`--artifact`)
+
+- `ART-01` **cross-reference leak detection**: because the scanner reads your source first, it knows which credential to hunt for in the build output. The one finding in the framework confirmed by construction rather than inferred.
+- `ART-02` source maps in build output, raised when `sourcesContent` ships original code.
+- `ART-03` provider-format credentials found directly in shipped JS/HTML/JSON.
+- `.apk`/`.aab`/`.ipa` inspection as a zip, with no external tooling: `ART-11` unsigned package, `ART-12` bundled `.env`/keystore/service-account files, `ART-13` cleartext traffic, `ART-14` debuggable release, `ART-15` credentials in packaged assets.
+- New skill `skills/artifact-leak-hunter/SKILL.md`, including the publishable-vs-server-only classification step and the rotation-first remediation order.
+
+### Added - Data-Flow (Taint) Analysis
+
+- `FLOW-01`–`FLOW-05`: request input traced through assignments into SQL, shell/code execution, HTML rendering, server-side fetch (SSRF) and filesystem paths.
+- Sanitiser awareness: a value passing `zod.parse`, `parseInt`, `encodeURIComponent`, an allowlist check or similar is treated as clean and not reported.
+- Reported at `MEDIUM` confidence by design - the tracker is function-scoped, so the Skeptic stage confirms before anything is called CONFIRMED.
+
+### Added - High-Precision Secret Detection
+
+- Provider key formats: AWS, Stripe, GitHub, Google, Slack, OpenAI, Anthropic, SendGrid, Twilio, Razorpay, Mailgun, npm, PEM private keys, Supabase service-role JWTs, and database URLs with inline credentials.
+- Shannon entropy scoring for secret-named variables holding random values.
+- Placeholder rejection for `your-api-key-here`, `changeme`, `${process.env.X}`, `<insert-key>` and AWS's own documentation key `AKIAIOSFODNN7EXAMPLE`.
+- **All credentials are redacted in all outputs** to first 6 / last 4 characters, so reports are safe to commit, attach to an issue or hand to an agent.
+
+### Added - Git History Forensics (`--git-history`)
+
+- `HIST-01`: credentials committed at any point, reported with commit hash, author and date, even when the file has since been deleted. Remediation states plainly that deleting the line does not help - only rotation does.
+
+### Added - Supply Chain (`--deps`, `--sbom`)
+
+- `DEP-01`: dependency vulnerabilities via the free OSV.dev batch API across npm, PyPI, crates.io and Go.
+- CycloneDX 1.5 SBOM output.
+- Severity is reported as MEDIUM with linked advisories, because the OSV batch endpoint returns advisory IDs without CVSS scores - grading them locally would be inventing a number.
+
+### Added - Adoption On Real Codebases
+
+- `--diff [REF]` scans only files changed against a ref, for pull requests.
+- `--baseline` / `--write-baseline` accept pre-existing findings so a team sees only what they just introduced.
+- `.aegis-ignore` supporting rule ids and path globs.
+- Stable 16-character fingerprints that survive line-number shifts.
+- `--fail-on <level>` for any severity threshold, and `--quiet` for one-line CI output.
+- `--offline` to guarantee no network request is made.
+
+### Added - Output Formats
+
+- `--sarif`: SARIF 2.1.0 with `security-severity` and `partialFingerprints`, so findings appear natively in GitHub's Security tab.
+- Report gains `stages` and `dependencies_parsed`; `summary_counts` gains per-domain totals and `SUPPRESSED`; every finding gains `fingerprint`.
+- Schema updated: new domains `SUPPLY_CHAIN`, `ARTIFACT`, `HISTORY`, `DATAFLOW`; rule-id pattern extended for `DEP`/`ART`/`HIST`/`FLOW`.
+
+### Fixed
+
+- **Secret-named variables in `SCREAMING_SNAKE_CASE` were never matched.** `_` is a word character, so `secret` could not match inside `NEXT_PUBLIC_API_SECRET`. Separators are now normalised before the keyword test. This silently disabled client-exposure detection for the most common naming convention in the ecosystem.
+- Dependency findings all collapsed into one, because they shared the same `file:line` dedupe key.
+- Data-flow findings named the variable being assigned rather than the one carrying the taint.
+- Build artifact paths are resolved before `relative_to`, so they display as repository-relative.
+- `.env` and config files inside a mobile package are now swept for credentials, not merely reported as present.
+
+### Changed
+
+- Test suite expanded from 1 test to 25, covering secret precision and false-positive rejection, taint tracing and sanitiser handling, baseline and ignore behaviour, artifact cross-referencing, mobile package inspection, SARIF and SBOM shape, and scoring.
+- CI additionally verifies the deep stages end to end, that reports never contain an unredacted credential, that the release gate exits 1, and that baseline adoption works.
+
 ## [1.0.0] - 2026-10-18
 
 Initial public release.

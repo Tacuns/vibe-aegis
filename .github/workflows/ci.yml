@@ -67,6 +67,7 @@ jobs:
             "/tmp/test-app/.claude/skills/vibe-aegis/SKILL.md"
             "/tmp/test-app/.claude/skills/security-redteam-loop/SKILL.md"
             "/tmp/test-app/.claude/skills/ui-ux-bug-finder/SKILL.md"
+            "/tmp/test-app/.claude/skills/artifact-leak-hunter/SKILL.md"
             "/tmp/test-app/.claude/commands/aegis.md"
             "/tmp/test-app/.github/copilot-instructions.md"
             "/tmp/test-app/.github/prompts/aegis-audit.prompt.md"
@@ -96,6 +97,59 @@ jobs:
 
       - name: Run installed scanner against the installed project
         run: python3 /tmp/test-app/.aegis/scripts/aegis_scan.py /tmp/test-app
+
+      - name: Verify the new deep-analysis stages run end to end
+        run: |
+          set -e
+          mkdir -p /tmp/leak/dist/assets
+          # Split so no contiguous valid-format key is stored in this file;
+          # GitHub push protection blocks those, and rightly so.
+          KEY="sk_live_""51QzAbCdEfGhIjKlMnOpQrStUv0123456789wxyz"
+          TAIL="51QzAbCdEfGhIjKlMnOpQrStUv""0123456789wxyz"
+          printf 'STRIPE_SECRET_KEY=%s\n' "$KEY" > /tmp/leak/.env.local
+          printf 'const K="%s";export default K;' "$KEY" > /tmp/leak/dist/assets/index.js
+          printf '{"version":3,"sourcesContent":["x"]}' > /tmp/leak/dist/assets/index.js.map
+
+          python3 scripts/aegis_scan.py /tmp/leak --artifact /tmp/leak/dist --offline             --output /tmp/leak/report.json --sarif /tmp/leak/out.sarif > /dev/null
+
+          TAIL="$TAIL" python3 - <<'PY'
+          import json, os, sys
+          r = json.load(open("/tmp/leak/report.json"))
+          ids = {f["rule_id"] for f in r["findings"]}
+          for required in ("ART-01", "ART-02"):
+              if required not in ids:
+                  print(f"::error::{required} did not fire on the leak fixture ({sorted(ids)})")
+                  sys.exit(1)
+          # A report may be committed or attached to an issue - it must never carry a live key.
+          raw = open("/tmp/leak/report.json").read()
+          if os.environ["TAIL"] in raw:
+              print("::error::report contains an unredacted credential")
+              sys.exit(1)
+          sarif = json.load(open("/tmp/leak/out.sarif"))
+          assert sarif["version"] == "2.1.0", "SARIF version wrong"
+          assert sarif["runs"][0]["results"], "SARIF has no results"
+          print(f"Deep stages OK: {sorted(ids)}; credentials redacted; SARIF valid")
+          PY
+
+      - name: Verify the release gate exit codes
+        run: |
+          set +e
+          python3 scripts/aegis_scan.py /tmp/leak --offline --quiet --fail-on-high > /dev/null
+          code=$?
+          set -e
+          if [ "$code" != "1" ]; then echo "::error::--fail-on-high should exit 1, got $code"; exit 1; fi
+          echo "Release gate exits 1 on blocking findings, as designed."
+
+      - name: Verify baseline adoption suppresses pre-existing findings
+        run: |
+          set -e
+          python3 scripts/aegis_scan.py /tmp/leak --offline --write-baseline /tmp/leak/baseline.json > /dev/null
+          out=$(python3 scripts/aegis_scan.py /tmp/leak --offline --baseline /tmp/leak/baseline.json --quiet)
+          echo "$out"
+          case "$out" in
+            *"100/100"*) echo "Baseline suppression works." ;;
+            *) echo "::error::baseline did not suppress known findings: $out"; exit 1 ;;
+          esac
 
       - name: Validate JSON report against schema
         run: |

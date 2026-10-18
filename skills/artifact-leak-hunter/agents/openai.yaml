@@ -1,0 +1,36 @@
+# OpenAI / Codex workspace skill metadata for `artifact-leak-hunter`.
+# Read by OpenAI Codex when this skill is installed into .agents/skills/.
+schema_version: 1
+
+interface:
+  display_name: Artifact Leak Hunter - Verify What You Ship
+  short_description: Prove no credential reached your built bundle or mobile package by cross-referencing source secrets against the actual build output, source maps and .apk/.aab/.ipa contents.
+
+metadata:
+  name: artifact-leak-hunter
+  version: 2.0.0
+  license: MIT
+  homepage: https://github.com/Tacuns/vibe-aegis
+  categories:
+    - security
+    - release-engineering
+    - mobile
+
+entrypoint:
+  instructions: ../SKILL.md
+
+triggers:
+  - "did my api key leak"
+  - "is my secret in the bundle"
+  - "check my build output"
+  - "check my apk before upload"
+  - "verify my release artifact"
+  - "scan my dist folder"
+
+commands:
+  - name: verify-build
+    description: Cross-reference source credentials against the built bundle and flag shipped source maps.
+    run: python3 .aegis/scripts/aegis_scan.py . --artifact --output .aegis/scan-report.json
+  - name: verify-mobile
+    description: Inspect an .apk/.aab/.ipa for bundled config, signing state, debuggable and cleartext flags, and embedded credentials.
+    run: python3 .aegis/scripts/aegis_scan.py . --artifact path/to/app-release.apk

@@ -1,7 +1,7 @@
 {
   "name": "vibe-aegis",
-  "version": "1.0.0",
-  "description": "Universal Pre-Launch Security & UI/UX Safeguard Loop for Vibe-Coded Apps (Claude Code, VS Code Copilot, OpenAI Codex, Cursor, Windsurf, Gemini CLI)",
+  "version": "2.0.0",
+  "description": "Pre-launch Security, UI/UX and build-artifact verification for vibe-coded apps: 40+ rules, taint analysis, secret + git-history scanning, dependency CVEs, SBOM, SARIF, and a 6-stage adversarial audit loop",
   "license": "MIT",
   "bin": {
     "vibe-aegis": "./bin/vibe-aegis.mjs"
@@ -33,7 +33,13 @@
     "llm-agents",
     "bug-hunter",
     "supabase-security",
-    "nextjs-security"
+    "nextjs-security",
+    "sbom",
+    "sarif",
+    "taint-analysis",
+    "secret-scanning",
+    "apk-analysis",
+    "supply-chain"
   ],
   "engines": {
     "node": ">=18.0.0"

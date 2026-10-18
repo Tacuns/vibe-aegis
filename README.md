@@ -8,6 +8,7 @@
 [![CI](https://github.com/Tacuns/vibe-aegis/actions/workflows/ci.yml/badge.svg)](https://github.com/Tacuns/vibe-aegis/actions/workflows/ci.yml)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![AI-Ready llms.txt](https://img.shields.io/badge/AI--Ready-llms.txt-8A2BE2)](llms.txt)
+[![SARIF + SBOM](https://img.shields.io/badge/output-SARIF%20%7C%20SBOM%20%7C%20JSON-0A7E8C)](schemas/scan-report.schema.json)
 
 ---
 
@@ -133,15 +134,46 @@ python3 scripts/aegis_scan.py /path/to/your/app --fail-on-high
 
 ### Scanner CLI Reference
 
-| Argument | Type | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `target` | positional | `.` | Path to the repository to scan |
-| `--url <URL>` | option | none | Live/staging URL for passive, read-only header & exposure checks |
-| `--json` | flag | off | Print the full JSON report to stdout |
-| `--output <PATH>` | option | none | Write the JSON report to a file (parent directories are created) |
-| `--fail-on-high` | flag | off | Exit with code `1` if any `CRITICAL` or `HIGH` finding exists |
+**Output**
 
-**Exit codes:** `0` success · `1` blocking findings with `--fail-on-high` · `2` target path does not exist.
+| Argument | Description |
+| :--- | :--- |
+| `target` | Path to the repository to scan (default `.`) |
+| `--json` | Print the full JSON report to stdout |
+| `--output <PATH>` | Write the JSON report to a file (parent directories are created) |
+| `--sarif <PATH>` | Write SARIF 2.1.0 so findings appear in GitHub's Security tab |
+| `--sbom <PATH>` | Write a CycloneDX 1.5 SBOM of all detected dependencies |
+| `--quiet` | Print only the one-line summary |
+
+**Release gate**
+
+| Argument | Description |
+| :--- | :--- |
+| `--fail-on-high` | Exit `1` if any `CRITICAL` or `HIGH` finding exists |
+| `--fail-on <level>` | Exit `1` at or above `critical`/`high`/`medium`/`low` |
+
+**Scope — how you adopt this on a real codebase**
+
+| Argument | Description |
+| :--- | :--- |
+| `--diff [REF]` | Scan only files changed vs `REF` (default `origin/main`). Ideal for pull requests |
+| `--baseline <PATH>` | Suppress findings recorded in a baseline file |
+| `--write-baseline <PATH>` | Accept every current finding as pre-existing, so future scans show only new issues |
+
+**Deep analysis**
+
+| Argument | Description |
+| :--- | :--- |
+| `--artifact [PATH]` | Verify a build directory or an `.apk`/`.aab`/`.ipa`. Auto-detects `dist/`, `build/`, `.next/` |
+| `--git-history [N]` | Hunt credentials committed in the last `N` commits (default 300) |
+| `--deps` | Check dependencies against the OSV vulnerability database |
+| `--url <URL>` | Passive, read-only live header & exposure checks |
+| `--all` | Enable artifacts + git history + dependencies |
+| `--offline` | Never make a network request |
+
+**Exit codes:** `0` success · `1` blocking findings with a gate flag · `2` target path does not exist.
+
+Also honoured: a `.aegis-ignore` file in the repo root, one entry per line — either a rule id (`SEC-03`) or a path glob (`src/legacy/**`).
 
 ## 🔍 Complete Audit Coverage Matrix (Low to Critical)
 
@@ -181,6 +213,48 @@ python3 scripts/aegis_scan.py /path/to/your/app --fail-on-high
 | `UX-08` | **Focus Ring Suppression** | Low | `outline-none` or `outline: 0` applied without a replacement `focus-visible:ring` keyboard indicator |
 | `UX-09` | **Unfinished AI Placeholders in UI** | High | Leftover `"Lorem ipsum"`, `"TODO:"`, `"placeholder"`, `"example.com"`, or fake `$99,999` mock metrics in production views |
 | `UX-10` | **Z-Index & Modal Scroll Traps** | Low | Arbitrary `z-[99999]` collisions or modals that lock `document.body.style.overflow` without cleanup on unmount |
+
+### C. Data-Flow Analysis (follows the value, not the pattern)
+
+A regex says *"there is a template literal in a query."* Taint analysis says *"**this** value came from the request and reaches **that** query unvalidated."* Input is traced from request sources (`req.body`, `req.json()`, `searchParams.get`, `formData.get`, route `params`) through assignments to dangerous sinks. A value that passes a validator (`zod.parse`, `parseInt`, `encodeURIComponent`, an allowlist check) is treated as clean and **not** reported.
+
+| ID | Flow | Severity |
+| :--- | :--- | :--- |
+| `FLOW-01` | Request input reaches a raw SQL query | Critical |
+| `FLOW-02` | Request input reaches a shell or code-execution sink | Critical |
+| `FLOW-03` | Request input reaches an HTML rendering sink | High |
+| `FLOW-04` | Request input reaches a server-side fetch (SSRF) | High |
+| `FLOW-05` | Request input reaches a filesystem path | High |
+
+Reported at `MEDIUM` confidence by design — the tracker works within a function scope, so the Skeptic stage confirms before anything is called CONFIRMED.
+
+### D. Shipped-Artifact Verification (what your users actually receive)
+
+Source code says what you wrote. The build output says what ships. Because the scanner already read your source, it can **cross-reference** — turning a guess into proof.
+
+| ID | Category | Severity | What it proves |
+| :--- | :--- | :--- | :--- |
+| `ART-01` | **Confirmed secret leak** | Critical | A credential from your source is present in the shipped bundle. Confirmed by construction |
+| `ART-02` | Source map shipped | Medium / Low | With `sourcesContent`, your original unminified source reaches every visitor |
+| `ART-03` | Credential in bundle | Critical–Medium | A provider-format key found directly in shipped JS/HTML/JSON |
+| `ART-11` | Unsigned package | High | No signature block under `META-INF/` |
+| `ART-12` | Config bundled in app | Critical | `.env`, `id_rsa` or `service-account.json` inside the `.apk`/`.aab`/`.ipa` |
+| `ART-13` | Cleartext traffic | Medium | Manifest references cleartext HTTP |
+| `ART-14` | Debuggable release | High | Manifest may mark the app debuggable |
+| `ART-15` | Credential in package | Critical–Medium | A key embedded in packaged assets, resources or code |
+
+### E. Supply Chain & Git History
+
+| ID | Category | Severity | What it catches |
+| :--- | :--- | :--- | :--- |
+| `DEP-01` | Known dependency vulnerability | Medium | Package versions with OSV advisories (npm, PyPI, crates.io, Go) |
+| `HIST-01` | Credential in git history | Critical–Medium | A key committed at any point — **even if deleted later**, it is still readable and still compromised |
+
+### Secret Detection Precision
+
+A noisy scanner gets uninstalled. Credential rules only fire on real provider key shapes (AWS, Stripe, GitHub, Google, Slack, OpenAI, Anthropic, SendGrid, Twilio, Razorpay, npm, PEM private keys, Supabase service-role JWTs, database URLs with inline credentials) or on secret-named variables holding high-entropy values. Placeholders such as `your-api-key-here`, `changeme`, `${process.env.X}` and AWS's own documentation key `AKIAIOSFODNN7EXAMPLE` are rejected.
+
+**Every credential in every report is redacted** to its first 6 and last 4 characters, so `.aegis/scan-report.json` is safe to commit, attach to an issue, or hand to an agent.
 
 ### Release Readiness Score
 
@@ -243,8 +317,11 @@ vibe-aegis/
 │   ├── security-redteam-loop/
 │   │   ├── SKILL.md                           # Deep security auditor skill (OWASP, RLS, Auth, Payments, AI/LLM)
 │   │   └── agents/openai.yaml                 # OpenAI/Codex workspace skill metadata
-│   └── ui-ux-bug-finder/
-│       ├── SKILL.md                           # Deep UI/UX, layout, state & accessibility skill
+│   ├── ui-ux-bug-finder/
+│   │   ├── SKILL.md                           # Deep UI/UX, layout, state & accessibility skill
+│   │   └── agents/openai.yaml                 # OpenAI/Codex workspace skill metadata
+│   └── artifact-leak-hunter/
+│       ├── SKILL.md                           # Verify what the build actually ships (bundles, maps, APK)
 │       └── agents/openai.yaml                 # OpenAI/Codex workspace skill metadata
 ├── docs/
 │   └── prompts/
@@ -258,7 +335,7 @@ vibe-aegis/
 │   └── github-actions/vibe-aegis-ci.yml       # Ready-to-use GitHub Actions pre-merge gate
 ├── .claude-plugin/
 │   ├── marketplace.json                       # Claude Code / Codex plugin marketplace manifest
-│   └── plugin.json                            # Plugin manifest (3 skills + /aegis command)
+│   └── plugin.json                            # Plugin manifest (4 skills + /aegis command)
 ├── .github/
 │   └── workflows/ci.yml                       # Unit tests, installer smoke test, schema validation
 └── tests/

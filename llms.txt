@@ -1,6 +1,6 @@
 # Vibe Aegis
 
-> The universal pre-launch Security and UI/UX safeguard loop for vibe-coded apps. A zero-dependency Python scanner with 40+ Low-to-Critical rules, plus a 6-stage adversarial multi-agent audit loop (Recon -> Security Hunter + UI/UX Hunter -> Adversarial Skeptic -> Evidence Referee -> Guarded Fixer) that installs in one command across Claude Code, VS Code Copilot, OpenAI Codex, Cursor, Windsurf, Cline, and Gemini CLI.
+> The universal pre-launch Security, UI/UX and shipped-artifact verification loop for vibe-coded apps. A zero-dependency Python scanner covering source rules, data-flow (taint) analysis, high-precision secret detection, git-history forensics, dependency CVEs and build-artifact verification, plus a 6-stage adversarial multi-agent audit loop (Recon -> Security Hunter + UI/UX Hunter -> Artifact Verification -> Adversarial Skeptic -> Evidence Referee -> Guarded Fixer) that installs in one command across Claude Code, VS Code Copilot, OpenAI Codex, Cursor, Windsurf, Cline, and Gemini CLI. Outputs JSON, SARIF and CycloneDX SBOM.
 
 AI coding assistants ship features fast, but they routinely leave two classes of defect behind: hidden **security holes** (secrets exposed in client bundles, Row-Level Security never enabled, unprotected API routes, IDOR, client-trusted prices, unverified webhooks, unbounded LLM spend) and broken **UI/UX states** (dead placeholder buttons, buttons that stay enabled during async calls and double-charge customers, silent `catch {}` blocks, blank screens where an empty state belongs, mobile horizontal overflow, WCAG failures).
 
@@ -50,10 +50,17 @@ python3 .aegis/scripts/aegis_scan.py . --json --output .aegis/scan-report.json
 **Run the scanner alone, no install:**
 
 ```bash
-python3 scripts/aegis_scan.py /path/to/app                                   # human-readable report
-python3 scripts/aegis_scan.py /path/to/app --url https://staging.example.com # + passive live posture
-python3 scripts/aegis_scan.py /path/to/app --json --output .aegis/scan-report.json
-python3 scripts/aegis_scan.py /path/to/app --fail-on-high                    # exit 1 on CRITICAL/HIGH (CI gate)
+python3 scripts/aegis_scan.py /path/to/app                       # human-readable report
+python3 scripts/aegis_scan.py /path/to/app --all                 # + artifacts, git history, dependencies
+python3 scripts/aegis_scan.py /path/to/app --artifact dist/      # verify what actually ships
+python3 scripts/aegis_scan.py /path/to/app --artifact app.apk    # inspect a mobile release package
+python3 scripts/aegis_scan.py /path/to/app --git-history         # credentials committed at any point
+python3 scripts/aegis_scan.py /path/to/app --deps                # OSV dependency vulnerabilities
+python3 scripts/aegis_scan.py /path/to/app --diff origin/main    # only what this PR changed
+python3 scripts/aegis_scan.py /path/to/app --write-baseline .aegis/baseline.json   # adopt on a big repo
+python3 scripts/aegis_scan.py /path/to/app --sarif results.sarif --sbom sbom.json
+python3 scripts/aegis_scan.py /path/to/app --fail-on-high        # exit 1 on CRITICAL/HIGH (CI gate)
+python3 scripts/aegis_scan.py /path/to/app --offline             # never touch the network
 ```
 
 **Install as a Claude Code or Codex plugin:**
@@ -68,6 +75,16 @@ codex plugin marketplace add Tacuns/vibe-aegis   # OpenAI Codex, then $vibe-aegi
 **Security, `SEC-01` to `SEC-17`:** client-exposed secrets; Supabase/Postgres RLS disabled or `USING (true)`; permissive Firebase rules; unprotected API routes and `"use server"` actions; IDOR; payment and checkout price tampering; unverified webhook signatures; SQL and raw-query injection; command and code injection; XSS; JWT `decode()` without `verify()` and `localStorage` tokens; SSRF; LLM prompt injection and unbounded token spend; wildcard CORS and CSRF; missing rate limiting; insecure file uploads; supply-chain slopsquatting; live posture (missing CSP, HSTS, `X-Frame-Options`, `X-Content-Type-Options`; exposed `/.env` and `/.git/config`).
 
 **UI/UX, `UX-01` to `UX-10`:** dead buttons and `href="#"`; missing async `disabled`/loading state (double-submit); silent `catch {}`; missing empty and skeleton states; mobile viewport overflow traps; form label and validation gaps; icon-button and image accessibility; focus-ring suppression; unfinished AI placeholder content; z-index collisions and modal scroll-lock leaks.
+
+**Data-flow, `FLOW-01` to `FLOW-05`:** request input traced through assignments into SQL, shell/code execution, HTML rendering, server-side fetch (SSRF) and filesystem paths. Values passing a validator are treated as clean and not reported.
+
+**Shipped artifacts, `ART-01` to `ART-15`:** `ART-01` cross-references a credential found in your source against the built bundle - the one finding confirmed by construction rather than inferred. Also source maps containing original code, and for `.apk`/`.aab`/`.ipa`: unsigned packages, bundled `.env`/keystore/service-account files, debuggable and cleartext manifests, and credentials embedded in packaged assets.
+
+**Supply chain and history:** `DEP-01` known dependency vulnerabilities via OSV (npm, PyPI, crates.io, Go); `HIST-01` credentials committed at any point in git history, even if deleted later - the value is still readable and still compromised.
+
+**Precision:** credential rules fire only on real provider key shapes or secret-named high-entropy values. Placeholders (`your-api-key-here`, `changeme`, `${process.env.X}`, AWS's documentation key `AKIAIOSFODNN7EXAMPLE`) are rejected. Every credential in every report is redacted to first 6 / last 4 characters, so reports are safe to commit and share.
+
+**Adoption:** `--diff` scans only changed files; `--baseline` suppresses pre-existing findings so a team sees only what they just introduced; `.aegis-ignore` accepts rule ids and path globs.
 
 **Scoring:** 100 minus 25 per `CRITICAL`, 10 per `HIGH`, 4 per `MEDIUM`, 1 per `LOW`, floored at 0. Any open `CRITICAL` or `HIGH` returns `BLOCKED`.
 
@@ -87,6 +104,8 @@ codex plugin marketplace add Tacuns/vibe-aegis   # OpenAI Codex, then $vibe-aegi
 - [skills/vibe-aegis/SKILL.md](skills/vibe-aegis/SKILL.md): Master orchestrator defining the 6-stage protocol end to end, including the Guarded Fixer branch-and-revert rules.
 - [skills/security-redteam-loop/SKILL.md](skills/security-redteam-loop/SKILL.md): Deep Low-to-Critical security auditor covering five trust boundaries with STRIDE and OWASP Top 10.
 - [skills/ui-ux-bug-finder/SKILL.md](skills/ui-ux-bug-finder/SKILL.md): Five-point UI/UX protocol: dead controls, the four-state async matrix, responsive layout, WCAG 2.2 AA, and live DOM inspection.
+- [skills/artifact-leak-hunter/SKILL.md](skills/artifact-leak-hunter/SKILL.md): Verify what the build actually ships - cross-references source credentials against the bundle, inspects source maps, and audits `.apk`/`.aab`/`.ipa` packages.
+- [skills/artifact-leak-hunter/agents/openai.yaml](skills/artifact-leak-hunter/agents/openai.yaml): OpenAI/Codex workspace metadata for the artifact skill.
 - [skills/vibe-aegis/agents/openai.yaml](skills/vibe-aegis/agents/openai.yaml): OpenAI/Codex workspace metadata for the orchestrator skill.
 - [skills/security-redteam-loop/agents/openai.yaml](skills/security-redteam-loop/agents/openai.yaml): OpenAI/Codex workspace metadata for the security skill.
 - [skills/ui-ux-bug-finder/agents/openai.yaml](skills/ui-ux-bug-finder/agents/openai.yaml): OpenAI/Codex workspace metadata for the UI/UX skill.
@@ -96,6 +115,7 @@ codex plugin marketplace add Tacuns/vibe-aegis   # OpenAI Codex, then $vibe-aegi
 - [docs/prompts/01-full-prelaunch-audit.md](docs/prompts/01-full-prelaunch-audit.md): Copy-paste prompt running all six stages across Security and UI/UX, producing `.aegis/AUDIT_REPORT.md` with the Release Readiness Score.
 - [docs/prompts/02-security-redteam-loop.md](docs/prompts/02-security-redteam-loop.md): Security-only deep audit prompt covering secrets, auth and IDOR, RLS, payments and webhooks, SSRF, and AI endpoint hardening.
 - [docs/prompts/03-ui-ux-and-browser-qa.md](docs/prompts/03-ui-ux-and-browser-qa.md): UI/UX-only prompt covering dead controls, the four async states, mobile overflow, WCAG 2.2 AA, and live `agent-browser` inspection.
+- [docs/prompts/04-artifact-and-release-verification.md](docs/prompts/04-artifact-and-release-verification.md): Verify the shipped bundle or mobile package carries no credentials, with the publishable-vs-server-only classification step and the rotation-first fix order.
 
 ## Code
 
@@ -103,6 +123,7 @@ codex plugin marketplace add Tacuns/vibe-aegis   # OpenAI Codex, then $vibe-aegi
 - [bin/vibe-aegis.mjs](bin/vibe-aegis.mjs): Node 18+ CLI wrapper providing `npx vibe-aegis setup` and `npx vibe-aegis scan`.
 - [install.sh](install.sh): Universal installer placing the scanner, rules, skills and commands into a project or a global profile for any supported agent.
 - [package.json](package.json): NPM package manifest defining the `vibe-aegis` binary and the `setup`, `scan` and `test` scripts.
+- [scripts/build_llms_full.py](scripts/build_llms_full.py): Regenerates `llms-full.txt` from the real files, so the single-fetch document can never drift from the repository.
 - [tests/test_scanner.py](tests/test_scanner.py): Unit test suite building a deliberately vulnerable fixture app and asserting the expected rule IDs fire.
 - [schemas/scan-report.schema.json](schemas/scan-report.schema.json): Strict JSON Schema (Draft 2020-12) for `.aegis/scan-report.json`, so CI and agents can validate scanner output deterministically.
 

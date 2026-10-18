@@ -19,10 +19,20 @@ Run a complete, adversarial pre-publication audit across both **Application Secu
 Run the bundled zero-dependency scanner first so you never waste context guessing the stack:
 
 ```bash
-python3 .aegis/scripts/aegis_scan.py . --output .aegis/scan-report.json
+# Full sweep: source + data-flow + git history + dependencies + build artifacts
+python3 .aegis/scripts/aegis_scan.py . --all --output .aegis/scan-report.json
+
 # Fallback if running directly from the vibe-aegis repo:
-python3 scripts/aegis_scan.py . --output .aegis/scan-report.json
+python3 scripts/aegis_scan.py . --all --output .aegis/scan-report.json
+
+# Reviewing a pull request? Scan only what changed, and suppress pre-existing noise:
+python3 .aegis/scripts/aegis_scan.py . --diff origin/main --baseline .aegis/baseline.json
 ```
+
+The scanner now reports six domains: `SECURITY`, `UI_UX`, `DATAFLOW` (request input traced
+to a dangerous sink), `SUPPLY_CHAIN` (known dependency vulnerabilities), `ARTIFACT` (what the
+build actually ships) and `HISTORY` (credentials committed at any point). Credentials in the
+report are always redacted, so `.aegis/scan-report.json` is safe to attach to an issue.
 
 Read `.aegis/scan-report.json` to extract:
 1. Detected frameworks, database/BaaS, auth libraries, payment SDKs, UI libraries, and AI SDKs.
@@ -43,11 +53,28 @@ Load and follow the instructions in `skills/ui-ux-bug-finder/SKILL.md` (or `.cla
 - Check for dead buttons (`href="#"`, empty `onClick`), missing async `disabled`/`loading` states (double-submit bugs), missing empty/error states, mobile viewport overflow (`320px–375px`), z-index collisions, and WCAG 2.2 AA accessibility issues.
 - If a local dev server is running and `agent-browser` or Playwright is installed, open the live app and inspect both desktop (`1440x900`) and mobile (`375x812`) viewports plus the accessibility tree (`agent-browser snapshot`).
 
+### Stage 3.5: Shipped-Artifact Verification
+
+Load and follow `skills/artifact-leak-hunter/SKILL.md`. Source code says what you wrote; the
+build output says what users receive. Cross-reference the credentials found in Stage 2 against
+`dist/`, `.next/`, `build/` and any `.apk`/`.aab`/`.ipa`.
+
+An `ART-01` finding is the one result in this framework that is **confirmed by construction** -
+the same value is demonstrably present in both the source and the shipped bundle. Never downgrade
+it, and always give the rotation-first remediation order.
+
 ### Stage 4: Adversarial Skeptic (False-Positive Elimination)
 
 Switch perspective to the **Skeptic**. For every candidate finding from Stages 1–3:
 - Attempt to **disprove** the claim by checking upstream middleware (`middleware.ts`), layout auth guards, ORM automatic parameterization, framework auto-escaping, or parent responsive containers.
 - If a defence completely blocks the trigger, mark the finding `DISMISSED` and cite the exact defensive `file:line`.
+- `DATAFLOW` findings are reported at `MEDIUM` confidence by design: the tracker works within a
+  single function scope, so confirm the value really is attacker-controlled and really is unvalidated
+  before promoting one to `CONFIRMED`.
+- `ART-01` is the exception - it is already confirmed evidence and must not be dismissed.
+- A publishable key (Supabase anon, Stripe publishable, Firebase web config) in a bundle is **not**
+  a leak. Instead verify the protection it depends on: an anon key is only safe when Row-Level
+  Security is enabled and enforced. Check that, and report on the RLS, not the key.
 
 ### Stage 5: Evidence Referee & Release Readiness Report
 

@@ -53,6 +53,32 @@ Same process, but add to `UI_UX_PATTERNS`, set the domain to `UI_UX`, and cite a
 
 UI/UX severity guide: `HIGH` = the feature is broken or loses user data (dead button, double-submit, swallowed error). `MEDIUM` = confusing or inaccessible. `LOW` = polish.
 
+## Rule Prefixes
+
+| Prefix | Domain | Lives in |
+| :--- | :--- | :--- |
+| `SEC-XX` | Source security rules | `SECURITY_PATTERNS` + `check_contextual_file_rules` |
+| `UX-XX` | UI/UX and accessibility | `UI_UX_PATTERNS` |
+| `FLOW-XX` | Data-flow (taint) analysis | `TAINT_SINKS` |
+| `DEP-XX` | Dependency vulnerabilities | `check_dependency_vulnerabilities` |
+| `ART-XX` | Build artifacts and mobile packages | `scan_build_artifacts`, `scan_mobile_package` |
+| `HIST-XX` | Git history forensics | `scan_git_history` |
+| `LIVE-XX` | Live deployment posture | `check_live_url_posture` |
+
+Adding a new prefix means updating the `rule_id` pattern in `schemas/scan-report.schema.json` and the matching regex in `load_ignore_rules`.
+
+### Adding a credential pattern
+
+Append to `PROVIDER_SECRETS` as `(label, severity, compiled_regex)`. Then add **both** a positive test and a negative test proving a placeholder form of the same key does not fire. Never widen a pattern enough to match a documentation example - `test_rejects_placeholders_and_documentation_keys` exists to stop exactly that.
+
+### Adding a taint sink
+
+Append to `TAINT_SINKS` as `(rule_id, severity, title, standard, compiled_regex)`. If the sink has a safe calling convention, add it to `SANITIZERS` too, and add a test proving the sanitised form produces **zero** findings. A taint rule without a negative test will be rejected.
+
+### Never print a raw credential
+
+`redact_findings()` runs over every finding before output. If you add a rule that surfaces credential material in `snippet`, make sure `redact()` covers it, and assert it in a test. Reports get committed and attached to issues.
+
 ## Running the Tests
 
 ```bash
@@ -75,6 +101,7 @@ Verify the expected files land in `/tmp/test-app` for each agent, then delete th
 - [ ] New rule has both a positive and a negative test case
 - [ ] Rule is documented in the README coverage matrix
 - [ ] `llms.txt` file map updated if you added or removed a file
+- [ ] `python3 scripts/build_llms_full.py .` re-run if you changed README, AGENTS.md, a SKILL.md, the CLI or the schema
 - [ ] No new dependencies
 
 ## Reporting Rule Accuracy Problems

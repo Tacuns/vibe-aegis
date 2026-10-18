@@ -1,7 +1,7 @@
 {
   "name": "vibe-aegis",
   "description": "Universal pre-launch Security (Low-to-Critical) and UI/UX design bug finder with a 6-stage adversarial audit loop (Recon -> Security Hunter + UI/UX Hunter -> Skeptic -> Referee -> Guarded Fixer) for vibe-coded apps.",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "author": {
     "name": "Tacuns",
     "url": "https://github.com/Tacuns"
@@ -17,12 +17,20 @@
     "audit",
     "pre-launch",
     "vibe-coding",
-    "static-analysis"
+    "static-analysis",
+    "sbom",
+    "sarif",
+    "taint-analysis",
+    "secret-scanning",
+    "apk-analysis"
   ],
-  "commands": ["./adapters/claude/aegis.md"],
+  "commands": [
+    "./adapters/claude/aegis.md"
+  ],
   "skills": [
     "./skills/vibe-aegis",
     "./skills/security-redteam-loop",
-    "./skills/ui-ux-bug-finder"
+    "./skills/ui-ux-bug-finder",
+    "./skills/artifact-leak-hunter"
   ]
 }
