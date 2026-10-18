@@ -16,3 +16,46 @@ venv/
 .DS_Store
 Thumbs.db
 .idea/
+
+# ---------------------------------------------------------------------------
+# Never commit credentials or local machine state.
+# These patterns exist so an accidental `git add -A` cannot publish a secret.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+*.jks
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.ppk
+credentials.json
+service-account*.json
+gha-creds-*.json
+.npmrc
+.netrc
+.pypirc
+secrets.*
+*.secret
+
+# Vibe Aegis local state
+.aegis-baseline.json
+*.sarif
+sbom.json
+
+# Build output (never source, but keep it out of the repo)
+dist/
+build/
+out/
+.next/
+.output/
+.svelte-kit/
+*.apk
+*.aab
+*.ipa

@@ -905,6 +905,12 @@ def run_git(root: Path, args: List[str], timeout: int = 60) -> Optional[str]:
             ["git", "-C", str(root)] + args,
             capture_output=True,
             text=True,
+            # Git output is bytes in whatever encoding the files use. Without an
+            # explicit codec Python falls back to the locale (cp1252 on Windows)
+            # and raises UnicodeDecodeError on the first non-ASCII byte, which
+            # silently killed the whole git-history stage.
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             shell=False,
         )
