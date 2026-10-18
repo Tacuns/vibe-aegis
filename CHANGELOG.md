@@ -4,6 +4,27 @@ All notable changes to Vibe Aegis are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-10-19
+
+Acts on community feedback: an action rendered as a link is an accessibility bug, and the fix is to use the right element, not a better `href`.
+
+### Added
+
+- `UX-11` High: an action marked up as a link - `<a href="#" onClick={...}>` or `href="javascript:"`. A screen reader announces "link" so the user expects navigation, Space does not activate it, and `#` jumps the page to the top and pollutes browser history. Cites WCAG 2.2 AA 4.1.2 Name, Role, Value.
+- `UX-12` High: a clickable `<div>`, `<span>`, `<li>` or `<td>` with no `role` and no `tabIndex`. Unreachable by Tab, not activatable by Enter or Space, announced as plain text - the control is invisible to anyone not using a mouse. Cites WCAG 2.2 AA 2.1.1 Keyboard and 4.1.2.
+- Both rules recognise a correct retrofit (`role` + `tabIndex` + `onKeyDown`) and stay silent on it.
+
+### Changed
+
+- `UX-01` now fires only on genuinely dead controls - `href="#"` with no handler, or a no-op/`console.log` stub. Previously it also matched `<a href="#" onClick={realHandler}>`, which is a working control with the wrong semantics, and gave the wrong advice for it ("replace with a real route").
+- `UX-01` now cites WCAG 2.2 AA 2.4.4 instead of the invented standard "UI/UX Functional Completeness".
+- `skills/ui-ux-bug-finder/SKILL.md` gains a table separating the three cases, and states the principle: if it performs an action it is a button, if it navigates it is a link with a real `href`. Choosing the right element gives focus, Tab order, Enter and Space, and the correct role for free.
+- Tests 30 -> 37, including a negative suite asserting a real `href`, a real `<button>` and a correctly retrofitted `<div>` produce zero findings, and that the remediation text actually names the `button` element.
+
+### Fixed
+
+- A corrupted comment in `scripts/aegis_scan.py` contained literal backspace characters instead of `secret`, introduced by an earlier editing mistake. Cosmetic only - the code was unaffected - but it was wrong text in a public repository.
+
 ## [2.1.0] - 2026-10-18
 
 Expands Vibe Aegis into a 10-stage First-to-Last safeguard across 8 domains. Everything in 2.0.0 is retained; all flags behave identically.

@@ -13,6 +13,18 @@ Audit frontend code and live rendered pages to catch the visual, interaction, st
 
 - Scan all `<button>`, `<a>`, `<form>`, dropdowns, and action cards across every page/route.
 - Flag any control with `href="#"`, missing `onClick` / `type="submit"`, or stubbed handlers (`() => {}` or `console.log`).
+
+**Separate three distinct bugs - they have three different fixes:**
+
+| Pattern | Rule | Why it is wrong | Fix |
+| :--- | :--- | :--- | :--- |
+| `<a href="#">Terms</a>` | `UX-01` | Goes nowhere | Give it a real destination |
+| `<a href="#" onClick={del}>` | `UX-11` | Announced as "link" so the user expects navigation; Space does not activate it; `#` jumps to top and pollutes history | `<button type="button" onClick={del}>` |
+| `<div onClick={go}>` | `UX-12` | Not focusable, not keyboard operable, announced as plain text | `<button type="button">` |
+
+The principle: **if it performs an action it is a button; if it navigates it is a link with a real `href`.** Choose the right element and the browser gives you focus, Tab order, Enter *and* Space, and the correct role for free. Retrofitting a `<div>` requires `role="button"` **and** `tabIndex={0}` **and** an `onKeyDown` handling both Enter and Space - three things to get right instead of zero, which is why the real button is the better answer.
+
+Do not flag a `<div>` that already carries `role`, `tabIndex` and a key handler - that is a correct retrofit.
 - Verify every modal, drawer, and dialog has a working close button, `Escape` key dismissal, and cleans up body scroll locks on unmount.
 
 ### 2. Async State Matrix Completeness (`HIGH` / `MEDIUM`)

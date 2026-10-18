@@ -219,9 +219,13 @@ Also honoured: a `.aegis-ignore` file in the repo root, one entry per line — e
 
 ### B. UI/UX Design & Frontend QA Bug Finder
 
+**The element must match the behaviour.** If it performs an action it is a `<button>`; if it navigates it is an `<a>` with a real `href`. Get that right and the browser supplies focus, Tab order, Enter *and* Space, and the correct screen-reader role for free — no `role`, `tabIndex` or `onKeyDown` needed. These three rules are separated because each has a different fix.
+
 | ID | Category | Severity | What Vibe Aegis Catches |
 | :--- | :--- | :--- | :--- |
-| `UX-01` | **Dead Buttons & Placeholder Links** | High | `<button>` without `onClick`/`type="submit"`, `<a href="#">`, or `onClick={() => console.log(...)}` stubs left by AI |
+| `UX-01` | **Dead Buttons & Placeholder Links** | High | A control that does nothing: `<a href="#">` with no handler, or `onClick={() => {}}` / `console.log` stubs |
+| `UX-11` | **Action Rendered As A Link** | High | `<a href="#" onClick={...}>` or `href="javascript:"` — works with a mouse, but screen readers announce "link", Space does not activate it, and the page jumps to top. Use `<button>` |
+| `UX-12` | **Clickable `div` / `span`** | High | An `onClick` on a non-interactive element with no `role` or `tabIndex` — unreachable by Tab, unusable by keyboard, announced as plain text |
 | `UX-02` | **Missing Async Loading / Disabled State** | High | Async form submissions or mutation buttons that don't disable during flight, allowing duplicate charges or duplicate records |
 | `UX-03` | **Silent Catch & Missing Error Feedback** | High | `catch (err) {}` blocks that swallow API failures without showing a toast, inline error message, or fallback UI |
 | `UX-04` | **Missing Empty & Skeleton States** | Medium | `.map()` list renders that show a blank screen when the array is empty (`length === 0`) or loading |

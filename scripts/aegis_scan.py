@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-SCANNER_VERSION = "2.1.0"
+SCANNER_VERSION = "2.2.0"
 
 IGNORE_DIRS: Set[str] = {
     ".git", "node_modules", ".next", "dist", "build", "out", ".vercel",
@@ -250,11 +250,51 @@ UIUX_PATTERNS: List[Tuple[str, str, str, re.Pattern, str, str, Optional[Set[str]
         "UX-01",
         "HIGH",
         "Dead Placeholder Link or No-Op Click Handler Left by AI",
+        # Only a genuinely dead control: href="#" with no handler at all, or a
+        # handler that does nothing. An href="#" that DOES have a handler is a
+        # different bug with a different fix - see UX-11.
         re.compile(
-            r"(?:<a\s+[^>]*href=[\"']#[\"'][^>]*>|onClick=\{\s*\(\)\s*=>\s*\{\s*(?:console\.log\([^)]*\)\s*;?\s*)?\}\s*\})"
+            r"""(?:<a(?![^>]*\bonClick)[^>]*\bhref=["']#["'][^>]*>"""
+            r"""|onClick=\{\s*\(\)\s*=>\s*\{\s*(?:console\.log\([^)]*\)\s*;?\s*)?\}\s*\})"""
         ),
-        "UI/UX Functional Completeness",
-        "Replace placeholder href=\"#\" or no-op onClick handlers with a real route, modal trigger, or functional action handler.",
+        "WCAG 2.2 AA - 2.4.4 Link Purpose / UI Functional Completeness",
+        "This control does nothing when activated. Give the link a real destination, or wire the "
+        "handler to the action it is supposed to perform.",
+        FRONTEND_EXTENSIONS,
+    ),
+    (
+        "UX-11",
+        "HIGH",
+        "Action Rendered As A Link Instead Of A Button",
+        # Works with a mouse, broken for everyone else.
+        re.compile(
+            r"""<a(?=[^>]*\bhref=["']#["'])(?=[^>]*\bonClick)[^>]*>"""
+            r"""|<a(?=[^>]*\bhref=["']javascript:)[^>]*>""",
+            re.IGNORECASE,
+        ),
+        "WCAG 2.2 AA - 4.1.2 Name, Role, Value",
+        'This performs an action but is marked up as a link, so a screen reader announces "link" '
+        "and the user expects navigation. Space does not activate it, and the \"#\" jumps the page "
+        "to the top and pollutes browser history. Use `<button type=\"button\" onClick={...}>` - "
+        "the browser then supplies focus, Enter AND Space, and the correct role for free. Keep "
+        '`<a href="/real/path">` only when it genuinely navigates somewhere.',
+        FRONTEND_EXTENSIONS,
+    ),
+    (
+        "UX-12",
+        "HIGH",
+        "Clickable div or span That Keyboard Users Cannot Reach",
+        # A div with onClick and no role/tabIndex is invisible to keyboard and AT.
+        re.compile(
+            r"""<(?:div|span|li|td)(?![^>]*\brole=)(?![^>]*\btabIndex)[^>]*\bonClick=\{""",
+            re.IGNORECASE,
+        ),
+        "WCAG 2.2 AA - 2.1.1 Keyboard, 4.1.2 Name, Role, Value",
+        "A div or span with an onClick cannot be reached by Tab, cannot be activated by Enter or "
+        "Space, and is announced as plain text by a screen reader - the control is invisible to "
+        'anyone not using a mouse. Use `<button type="button">`. If the element truly cannot be '
+        'changed, it needs ALL of `role="button"`, `tabIndex={0}` and an `onKeyDown` handling '
+        "Enter and Space - which is why the real button is simpler.",
         FRONTEND_EXTENSIONS,
     ),
     (
@@ -968,7 +1008,7 @@ def scan_secrets_in_text(rel_path: str, text: str, origin: str = "source") -> Li
         for m in SECRET_ASSIGNMENT.finditer(line):
             name = m.group("name")
             value = m.group("value")
-            # "_" is a word character, so secret can never match inside
+            # "_" is a word character, so \bsecret\b can never match inside
             # NEXT_PUBLIC_API_SECRET. Normalise separators before testing.
             if not SENSITIVE_NAME.search(re.sub(r"[_\-.]+", " ", name)):
                 continue

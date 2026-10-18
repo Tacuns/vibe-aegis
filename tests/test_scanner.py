@@ -423,5 +423,89 @@ class TestPaymentsAndReliability(unittest.TestCase):
         self.assertEqual(globs, ["legacy/**"])
 
 
+class TestInteractiveSemantics(unittest.TestCase):
+    """UX-01 / UX-11 / UX-12: the element must match the behaviour.
+
+    An action marked up as a link, or a div with an onClick, works with a mouse
+    and is broken for keyboards and screen readers. These are three different
+    bugs with three different fixes, so they must not collapse into one rule.
+    """
+
+    MARKUP = """
+    export function Demo() {
+      return (
+        <div>
+          <a href="#" onClick={handleDelete}>Delete account</a>
+          <div onClick={goToSettings}>Open settings</div>
+          <span onClick={save}>Save</span>
+          <a href="#">Terms</a>
+          <a href="/settings">Settings</a>
+          <button onClick={save}>Save</button>
+          <div onClick={pick} role="button" tabIndex={0} onKeyDown={onKey}>Pick</div>
+        </div>
+      );
+    }
+    """
+
+    def _scan(self, markup=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "Demo.jsx", markup if markup is not None else self.MARKUP)
+            findings, _ = aegis_scan.scan_repository(root)
+            return findings
+
+    def test_action_as_link_is_flagged_as_wrong_element(self):
+        """<a href="#" onClick=...> is UX-11, not a dead link."""
+        ids = {f.rule_id for f in self._scan()}
+        self.assertIn("UX-11", ids)
+
+    def test_dead_link_and_action_link_are_separate_rules(self):
+        """They need different fixes, so they must not share a rule id."""
+        by_rule = {}
+        for f in self._scan():
+            by_rule.setdefault(f.rule_id, []).append(f.snippet)
+        self.assertIn("UX-01", by_rule)   # <a href="#">Terms</a>  -> needs a real URL
+        self.assertIn("UX-11", by_rule)   # <a href="#" onClick>   -> needs <button>
+        self.assertTrue(any("Terms" in s for s in by_rule["UX-01"]))
+        self.assertTrue(any("handleDelete" in s for s in by_rule["UX-11"]))
+
+    def test_clickable_div_and_span_are_flagged(self):
+        """Not focusable, not keyboard operable, announced as plain text."""
+        lines = [f.line for f in self._scan() if f.rule_id == "UX-12"]
+        self.assertEqual(len(lines), 2, "both the div and the span should fire")
+
+    def test_correct_markup_produces_no_findings(self):
+        """A real href, a real button, and a properly retrofitted div must stay silent."""
+        clean = """
+        export function Ok() {
+          return (
+            <div>
+              <a href="/settings">Settings</a>
+              <button type="button" onClick={save}>Save</button>
+              <div onClick={pick} role="button" tabIndex={0} onKeyDown={onKey}>Pick</div>
+            </div>
+          );
+        }
+        """
+        noisy = [f.rule_id for f in self._scan(clean)
+                 if f.rule_id in ("UX-01", "UX-11", "UX-12")]
+        self.assertEqual(noisy, [], f"false positives on correct markup: {noisy}")
+
+    def test_javascript_url_is_flagged(self):
+        ids = {f.rule_id for f in self._scan('<a href="javascript:void(0)" onClick={go}>Go</a>')}
+        self.assertIn("UX-11", ids)
+
+    def test_rules_cite_a_real_wcag_criterion(self):
+        """'UI/UX Functional Completeness' is not a standard. These must cite WCAG."""
+        for f in self._scan():
+            if f.rule_id in ("UX-11", "UX-12"):
+                self.assertIn("WCAG", f.cwe_or_standard)
+
+    def test_remediation_names_the_button_element(self):
+        """The fix is semantic. The advice has to say so, not 'add a route'."""
+        for f in self._scan():
+            if f.rule_id in ("UX-11", "UX-12"):
+                self.assertIn("button", f.remediation.lower())
+
 if __name__ == "__main__":
     unittest.main()
