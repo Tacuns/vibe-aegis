@@ -18,10 +18,26 @@ if (subcommand === "setup" || subcommand === "install") {
   process.exit(res.status ?? 0);
 } else if (subcommand === "scan") {
   const forwardArgs = args.slice(1);
-  const res = spawnSync("python3", [resolve(repoRoot, "scripts/aegis_scan.py"), ...forwardArgs], {
-    stdio: "inherit",
-  });
-  process.exit(res.status ?? 0);
+  // "python3" does not exist on a default Windows install; try the common names
+  // in order and report clearly rather than failing with ENOENT.
+  const candidates = process.platform === "win32"
+    ? ["python", "python3", "py"]
+    : ["python3", "python"];
+  const scanner = resolve(repoRoot, "scripts/aegis_scan.py");
+  let res = null;
+  for (const bin of candidates) {
+    res = spawnSync(bin, [scanner, ...forwardArgs], { stdio: "inherit" });
+    if (!res.error) break;
+  }
+  if (res && res.error) {
+    console.error(
+      `vibe-aegis: could not find a Python interpreter (tried: ${candidates.join(", ")}).
+` +
+      "Install Python 3.8+ and ensure it is on your PATH."
+    );
+    process.exit(127);
+  }
+  process.exit(res?.status ?? 0);
 } else {
   console.log("Usage:");
   console.log("  npx vibe-aegis setup [--target <dir>] [--agent all|claude-code|vscode|codex|cursor]");

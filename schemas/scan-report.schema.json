@@ -72,9 +72,16 @@
       "maximum": 100
     },
     "release_verdict": {
-      "description": "Release gate decision. BLOCKED when any CRITICAL/HIGH is open; INCOMPLETE when any check did not run; READY TO PUBLISH only when the audit was complete and scored >= 90.",
+      "description": "Fail-closed release gate. One of: 'INCOMPLETE_SCAN (...)' when no source files were scanned; 'BLOCKED (...)' when any CRITICAL/HIGH is open; 'VERIFIED_PARTIAL - INCOMPLETE_SCAN (...)' when any check was skipped or errored; 'NEEDS REVIEW (...)' below 90; 'READY TO PUBLISH' only when files were scanned, nothing was skipped, there are no CRITICAL/HIGH findings and the score is >= 90.",
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "examples": [
+        "READY TO PUBLISH",
+        "NEEDS REVIEW (Address Medium/Low polish items)",
+        "BLOCKED (Fix Critical/High findings before publishing)",
+        "VERIFIED_PARTIAL - INCOMPLETE_SCAN (1 check skipped/offline: ...)",
+        "INCOMPLETE_SCAN (0 source files scanned - cannot certify readiness)"
+      ]
     },
     "summary_counts": {
       "description": "Finding tallies by severity and by domain.",
@@ -217,13 +224,14 @@
         "remediation",
         "confidence",
         "fingerprint",
-        "kind"
+        "kind",
+        "status"
       ],
       "properties": {
         "rule_id": {
-          "description": "Stable rule identifier. SEC/UX/LIVE are source and live-posture rules; PAY is payments and business logic; REL is backend reliability and scale; FLOW is data-flow (taint) analysis; DEP is dependency vulnerabilities; ART is build-artifact and mobile-package findings; HIST is git-history forensics.",
+          "description": "Stable rule identifier. SEC/UX/LIVE are source and live-posture rules; PAY is payments and business logic; REL is backend reliability and scale; FLOW is data-flow (taint) analysis; DEP is dependency vulnerabilities; ART is build-artifact and mobile-package findings; HIST is git-history forensics. A rule id ending in -00 is always a coverage gap, never a defect.",
           "type": "string",
-          "pattern": "^(SEC|UX|LIVE|DEP|ART|HIST|FLOW|PAY|REL)-[0-9]{2}[A-Z]?$"
+          "pattern": "^(SEC|UX|LIVE|DEP|ART|HIST|GIT|FLOW|PAY|REL)-[0-9]{2}[A-Z]?$"
         },
         "domain": {
           "description": "Which analysis stage produced this finding.",
@@ -297,6 +305,15 @@
             "skipped_check"
           ],
           "default": "finding"
+        },
+        "status": {
+          "description": "VULNERABILITY is a real defect that counts toward the score. SKIPPED and SCAN_ERROR are coverage gaps: they never affect the score and they force release_verdict away from READY TO PUBLISH.",
+          "enum": [
+            "VULNERABILITY",
+            "SKIPPED",
+            "SCAN_ERROR"
+          ],
+          "default": "VULNERABILITY"
         }
       }
     }

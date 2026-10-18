@@ -212,6 +212,7 @@ python3 scripts/aegis_scan.py /path/to/your/app --fail-on-high
 | :--- | :--- |
 | `--fail-on-high` | Exit `1` if any `CRITICAL` or `HIGH` finding exists |
 | `--fail-on <level>` | Exit `1` at or above `critical`/`high`/`medium`/`low` |
+| `--include-tests` | Also audit test and fixture files (excluded by default — they contain deliberately insecure code) |
 | `--fail-on-incomplete` | Exit `1` if any check could not run — use when a green pipeline must mean *fully audited*, not merely *nothing found* |
 
 **Scope — how you adopt this on a real codebase**
@@ -346,7 +347,7 @@ Some rules have narrower sub-variants, reported with their own id so you can sup
 | `SEC-02B` | Permissive Firebase / Firestore rule (`allow read, write: if true`) |
 | `SEC-10B` | Auth token stored in `localStorage` rather than an HttpOnly cookie |
 | `SEC-17B` | `/.env` or `/.git/config` publicly reachable on the live server |
-| `DEP-00`, `LIVE-00`, `ART-10` | **Coverage gaps**, not defects — a check that could not run |
+| `DEP-00`, `LIVE-00`, `GIT-00`, `ART-10` | **Coverage gaps**, not defects — a check that could not run. Any id ending `-00` is always a gap |
 
 ### Secret Detection Precision
 
@@ -354,9 +355,21 @@ A noisy scanner gets uninstalled. Credential rules only fire on real provider ke
 
 **Every credential in every report is redacted** to its first 6 and last 4 characters, so `.aegis/scan-report.json` is safe to commit, attach to an issue, or hand to an agent.
 
-### Coverage Is Not Severity
+### Fail-Closed: Coverage Is Not Severity
 
-A check that **could not run** is an unknown, not a pass. Skipped checks (offline mode, an unreachable URL or OSV, an unopenable package) are reported separately in `skipped_checks`, never counted in the score, and they force the verdict to `INCOMPLETE`:
+A check that **could not run** is an unknown, not a pass. The gate fails closed:
+
+| Condition | Verdict |
+| :--- | :--- |
+| 0 source files scanned | `INCOMPLETE_SCAN` — score forced to 0 |
+| Any `CRITICAL` / `HIGH` open | `BLOCKED` |
+| Any check skipped or errored | `VERIFIED_PARTIAL - INCOMPLETE_SCAN` |
+| Score < 90, nothing skipped | `NEEDS REVIEW` |
+| Files scanned · nothing skipped · no `CRITICAL`/`HIGH` · score ≥ 90 | **`READY TO PUBLISH`** |
+
+`READY TO PUBLISH` requires **all four** conditions. Pass `allow_skipped=True` to `compute_readiness_score()` to override deliberately.
+
+Called in isolation, `compute_readiness_score([DEP-00])` also fails closed — any rule id ending `-00` is treated as a coverage gap regardless of how the `Finding` was built. Skipped checks (offline mode, an unreachable URL or OSV, an unopenable package) are reported separately in `skipped_checks`, never counted in the score, and they force the verdict to `INCOMPLETE`:
 
 ```text
 Readiness Score  : 100/100 - INCOMPLETE (1 check did not run: Dependency
@@ -1052,9 +1065,16 @@ Findings arrive pre-sorted: severity first (CRITICAL to LOW), then domain, file,
       "maximum": 100
     },
     "release_verdict": {
-      "description": "Release gate decision. BLOCKED when any CRITICAL/HIGH is open; INCOMPLETE when any check did not run; READY TO PUBLISH only when the audit was complete and scored >= 90.",
+      "description": "Fail-closed release gate. One of: 'INCOMPLETE_SCAN (...)' when no source files were scanned; 'BLOCKED (...)' when any CRITICAL/HIGH is open; 'VERIFIED_PARTIAL - INCOMPLETE_SCAN (...)' when any check was skipped or errored; 'NEEDS REVIEW (...)' below 90; 'READY TO PUBLISH' only when files were scanned, nothing was skipped, there are no CRITICAL/HIGH findings and the score is >= 90.",
       "type": "string",
-      "minLength": 1
+      "minLength": 1,
+      "examples": [
+        "READY TO PUBLISH",
+        "NEEDS REVIEW (Address Medium/Low polish items)",
+        "BLOCKED (Fix Critical/High findings before publishing)",
+        "VERIFIED_PARTIAL - INCOMPLETE_SCAN (1 check skipped/offline: ...)",
+        "INCOMPLETE_SCAN (0 source files scanned - cannot certify readiness)"
+      ]
     },
     "summary_counts": {
       "description": "Finding tallies by severity and by domain.",
@@ -1197,13 +1217,14 @@ Findings arrive pre-sorted: severity first (CRITICAL to LOW), then domain, file,
         "remediation",
         "confidence",
         "fingerprint",
-        "kind"
+        "kind",
+        "status"
       ],
       "properties": {
         "rule_id": {
-          "description": "Stable rule identifier. SEC/UX/LIVE are source and live-posture rules; PAY is payments and business logic; REL is backend reliability and scale; FLOW is data-flow (taint) analysis; DEP is dependency vulnerabilities; ART is build-artifact and mobile-package findings; HIST is git-history forensics.",
+          "description": "Stable rule identifier. SEC/UX/LIVE are source and live-posture rules; PAY is payments and business logic; REL is backend reliability and scale; FLOW is data-flow (taint) analysis; DEP is dependency vulnerabilities; ART is build-artifact and mobile-package findings; HIST is git-history forensics. A rule id ending in -00 is always a coverage gap, never a defect.",
           "type": "string",
-          "pattern": "^(SEC|UX|LIVE|DEP|ART|HIST|FLOW|PAY|REL)-[0-9]{2}[A-Z]?$"
+          "pattern": "^(SEC|UX|LIVE|DEP|ART|HIST|GIT|FLOW|PAY|REL)-[0-9]{2}[A-Z]?$"
         },
         "domain": {
           "description": "Which analysis stage produced this finding.",
@@ -1277,6 +1298,15 @@ Findings arrive pre-sorted: severity first (CRITICAL to LOW), then domain, file,
             "skipped_check"
           ],
           "default": "finding"
+        },
+        "status": {
+          "description": "VULNERABILITY is a real defect that counts toward the score. SKIPPED and SCAN_ERROR are coverage gaps: they never affect the score and they force release_verdict away from READY TO PUBLISH.",
+          "enum": [
+            "VULNERABILITY",
+            "SKIPPED",
+            "SCAN_ERROR"
+          ],
+          "default": "VULNERABILITY"
         }
       }
     }

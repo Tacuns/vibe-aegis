@@ -1,7 +1,7 @@
 {
   "name": "vibe-aegis",
   "description": "10-stage First-to-Last full-stack safeguard across 8 domains: architecture and threat model, security, payments and race conditions, AI/LLM, backend reliability, UI/UX and accessibility, shipped-artifact verification, and the production pre-flight gate.",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "author": {
     "name": "Tacuns",
     "url": "https://github.com/Tacuns"

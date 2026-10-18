@@ -4,6 +4,35 @@ All notable changes to Vibe Aegis are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0] - 2026-10-19
+
+Adversarial self-audit prompted by the fail-open report. Every function was re-tested in isolation, not only through the full audit.
+
+### Fixed - fail-closed readiness contract
+
+- `compute_readiness_score(findings, skipped_checks=None, scanned_files=None, allow_skipped=False)`.
+- **0 source files scanned** now returns `(0, "INCOMPLETE_SCAN ...")`. Previously an empty directory scored **100/100 READY TO PUBLISH** - the worst fail-open in the tool.
+- A coverage gap is detected three independent ways - `status in {SKIPPED, SCAN_ERROR}`, `kind == "skipped_check"`, or a rule id ending `-00` - so a caller constructing a `Finding` by hand still cannot obtain a passing verdict. This is what the original report did.
+- `READY TO PUBLISH` now requires all four: files scanned, no `CRITICAL`/`HIGH`, nothing skipped, score >= 90. `allow_skipped=True` is an explicit opt-in.
+- New `GIT-00`: a missing `.git`, a missing git binary or a timeout previously returned an empty list, reporting "no credentials in history" for a check that never ran.
+- `Finding` gains `status` (`VULNERABILITY` / `SKIPPED` / `SCAN_ERROR`) alongside the existing `kind`.
+
+### Fixed - false positives
+
+- **Commented-out code is no longer scanned.** `// eval(req.body.code)` and `# cursor.execute(f"...")` were producing findings a developer cannot act on. Comment masking preserves string literals, so `https://` inside a string is not mistaken for a comment, and `href="#"` in JSX is not mistaken for a `#` comment. Offsets are preserved, so line numbers and evidence snippets are unaffected.
+- **Test and fixture files are excluded by default** (`*.test.*`, `*.spec.*`, `tests/`, `__tests__/`, `fixtures/`, `e2e/`, `conftest`). Fixtures contain deliberately insecure code; judging production readiness by them is meaningless. `--include-tests` audits them anyway.
+- **Framework auth guards are recognised**: `passport.authenticate`, Clerk `auth.protect()`, `withApiAuth`, `Depends(...)`, `@login_required`, `@jwt_required`, `getServerAuthSession`, `isAuthenticated` and others. Protected routes were being reported as unauthenticated.
+
+### Fixed - installer and CLI
+
+- `install.sh` is now idempotent. Re-running it created a new `.aegis/AGENTS.vibe-aegis.md` on every run; it now compares content first. Paths containing spaces were already handled correctly and are covered by a test.
+- `bin/vibe-aegis.mjs` hard-coded `python3`, which does not exist on a default Windows install. It now tries `python`, `python3` and `py` in a platform-appropriate order and prints a clear message instead of failing with `ENOENT`.
+
+### Changed
+
+- Schema: `status` added to findings, `GIT` added to the rule-id pattern, `release_verdict` documents all five states with examples.
+- `--include-tests` added. Tests 50 -> 68.
+
 ## [2.3.0] - 2026-10-19
 
 Two community reports, plus a full line-by-line audit they prompted.

@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-SCANNER_VERSION = "2.3.0"
+SCANNER_VERSION = "2.4.0"
 
 IGNORE_DIRS: Set[str] = {
     ".git", "node_modules", ".next", "dist", "build", "out", ".vercel",
@@ -60,7 +60,8 @@ class Finding:
     remediation: str
     confidence: str = "HIGH"
     fingerprint: str = ""      # stable id for baseline suppression + SARIF dedupe
-    kind: str = "finding"      # "finding" = a real defect; "skipped_check" = a check that could not run
+    kind: str = "finding"      # legacy 2-value alias of `status`
+    status: str = "VULNERABILITY"  # VULNERABILITY | SKIPPED | SCAN_ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +387,113 @@ UIUX_PATTERNS: List[Tuple[str, str, str, re.Pattern, str, str, Optional[Set[str]
 ]
 
 
+COMMENT_SYNTAX: Dict[str, Tuple[Tuple[str, ...], Optional[Tuple[str, str]]]] = {
+    # ext-family -> (line-comment tokens, (block open, block close) or None)
+    "c_like": (("//",), ("/*", "*/")),
+    "hash": (("#",), None),
+    "sql": (("--",), ("/*", "*/")),
+}
+
+_EXT_FAMILY: Dict[str, str] = {
+    **{e: "c_like" for e in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".java",
+                             ".kt", ".swift", ".go", ".rs", ".php", ".dart", ".scss", ".css")},
+    **{e: "hash" for e in (".py", ".rb", ".sh", ".yaml", ".yml", ".toml", ".env")},
+    ".sql": "sql",
+    ".prisma": "c_like",
+    ".graphql": "hash",
+    ".vue": "c_like",
+    ".svelte": "c_like",
+}
+
+
+def mask_comments(text: str, ext: str) -> str:
+    """Blank out comment bodies, preserving length so line/column offsets still line up.
+
+    Commented-out code is not running code. Matching it produces findings a
+    developer cannot act on, and noise is what gets a scanner uninstalled.
+
+    String literals are tracked so that a `//` inside "https://example.com", or a
+    `#` inside href="#", is never mistaken for the start of a comment. Returns a
+    string of identical length with comment characters replaced by spaces, so
+    every existing offset-based line calculation keeps working untouched.
+    """
+    family = _EXT_FAMILY.get(ext)
+    if not family:
+        return text
+    line_tokens, block = COMMENT_SYNTAX[family]
+
+    out = list(text)
+    i = 0
+    n = len(text)
+    quote: Optional[str] = None
+    in_block = False
+
+    while i < n:
+        ch = text[i]
+
+        if in_block and block:
+            if text.startswith(block[1], i):
+                out[i] = out[i + 1] = " "
+                i += 2
+                in_block = False
+                continue
+            if ch != "\n":
+                out[i] = " "
+            i += 1
+            continue
+
+        if quote:
+            # Skip escaped characters inside the literal.
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+
+        if ch in "\"'`":
+            quote = ch
+            i += 1
+            continue
+
+        if block and text.startswith(block[0], i):
+            out[i] = out[i + 1] = " "
+            i += 2
+            in_block = True
+            continue
+
+        token = next((t for t in line_tokens if text.startswith(t, i)), None)
+        if token:
+            while i < n and text[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+
+        i += 1
+
+    return "".join(out)
+
+
+def is_test_path(rel_path: str) -> bool:
+    """Test fixtures deliberately contain insecure code. Judging production
+    readiness by them is meaningless, so they are excluded unless --include-tests."""
+    low = rel_path.lower()
+    if any(seg in low for seg in (
+        "/test/", "/tests/", "/__tests__/", "/__mocks__/", "/fixtures/", "/fixture/",
+        "/spec/", "/specs/", "/e2e/", "/cypress/", "/playwright/", "/testdata/",
+    )):
+        return True
+    if low.startswith(("test/", "tests/", "__tests__/", "fixtures/", "spec/", "e2e/")):
+        return True
+    base = low.rsplit("/", 1)[-1]
+    return (
+        ".test." in base or ".spec." in base
+        or base.startswith(("test_", "conftest"))
+        or base.endswith(("_test.py", "_test.go", "_spec.rb"))
+    )
+
+
 def detect_tech_stack(root: Path) -> Dict[str, List[str]]:
     stack: Dict[str, Set[str]] = {
         "frameworks": set(),
@@ -489,7 +597,13 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
         )
         has_auth_call = bool(
             re.search(
-                r"(?:getServerSession|auth\(\)|getUser\(|currentUser\(|verifyToken|jwt\.verify|jwtVerify|supabase\.auth\.getUser|requireAuth|getAuth\(|createServerClient)",
+                r"(?:getServerSession|auth\(\)|getUser\(|currentUser\(|verifyToken|jwt\.verify|"
+                r"jwtVerify|supabase\.auth\.getUser|requireAuth|getAuth\(|createServerClient|"
+                # Framework-idiomatic guards - absent before, causing false positives
+                r"passport\.authenticate|auth\.protect|requireSession|withApiAuth|"
+                r"ensureAuthenticated|isAuthenticated|Depends\(|Security\(|"
+                r"@login_required|@jwt_required|authGuard|AuthGuard|verifySession|"
+                r"getServerAuthSession|clerkClient|currentUser|withAuth)",
                 text,
             )
         )
@@ -736,7 +850,8 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
     return findings
 
 
-def scan_repository(root: Path, only_files: Optional[Set[str]] = None) -> Tuple[List[Finding], int]:
+def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
+                    include_tests: bool = False) -> Tuple[List[Finding], int]:
     findings: List[Finding] = []
     scanned_files = 0
 
@@ -780,8 +895,14 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None) -> Tuple[
             if only_files is not None and rel_path not in only_files:
                 continue  # diff mode: review only what this branch changed
 
+            if is_test_path(rel_path) and not include_tests:
+                continue  # fixtures are deliberately insecure; --include-tests to audit them
+
             scanned_files += 1
             lines = text.splitlines()
+            # Match against code only. Commented-out code is not running code,
+            # and `lines` still holds the original text for evidence snippets.
+            text = mask_comments(text, ext)
 
             # Phase 2: high-confidence credential detection (provider formats + entropy)
             findings.extend(scan_secrets_in_text(rel_path, text))
@@ -891,6 +1012,7 @@ def check_live_url_posture(target_url: str) -> List[Finding]:
                 cwe_or_standard="Live Deployment Check",
                 remediation="Verify the local or staging server is running before executing `--url` posture checks.",
                 kind="skipped_check",
+                    status="SKIPPED",
             )
         )
         return findings
@@ -1258,6 +1380,8 @@ def redact(value: str) -> str:
 # compromised. Deleting the line is not a fix; rotating the key is.
 
 def run_git(root: Path, args: List[str], timeout: int = 60) -> Optional[str]:
+    """Run git with no shell and a hard timeout. Returns None on any failure;
+    callers must treat None as UNKNOWN, never as 'nothing found'."""
     import subprocess
     try:
         proc = subprocess.run(
@@ -1283,11 +1407,25 @@ def run_git(root: Path, args: List[str], timeout: int = 60) -> Optional[str]:
 def scan_git_history(root: Path, max_commits: int = 300) -> List[Finding]:
     """Hunt for credentials that were committed at any point, even if later removed."""
     findings: List[Finding] = []
+
+    def gap(reason: str) -> List[Finding]:
+        return [Finding(
+            rule_id="GIT-00", domain="HISTORY", severity="LOW",
+            title="Git History Check Could Not Run",
+            file="git", line=0, snippet=reason,
+            cwe_or_standard="Coverage Gap",
+            remediation=("Credentials committed in the past stay readable even after the file is "
+                         "deleted. Re-run inside a git working tree with git on PATH to check."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED",
+        )]
+
     if not (root / ".git").exists():
-        return findings
+        return gap("No .git directory found - history was not inspected.")
 
     log = run_git(root, ["log", f"--max-count={max_commits}", "--format=%H%x1f%an%x1f%ad%x1f%s", "--date=short"])
-    if not log:
+    if log is None:
+        return gap("git could not be executed (missing binary, timeout, or not a repository).")
+    if not log.strip():
         return findings
 
     reported: Set[str] = set()
@@ -1417,6 +1555,7 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
                 remediation="Re-run without --offline to query the OSV vulnerability database.",
                 confidence="HIGH",
                     kind="skipped_check",
+                    status="SKIPPED",
             )
         )
         return findings
@@ -1444,6 +1583,7 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
                 remediation="Check network access, or run with --offline to skip this stage deliberately.",
                 confidence="HIGH",
                     kind="skipped_check",
+                    status="SKIPPED",
             )
         )
         return findings
@@ -1652,6 +1792,7 @@ def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
                 remediation="Confirm the file is a valid APK/AAB/IPA archive.",
                 confidence="HIGH",
                     kind="skipped_check",
+                    status="SKIPPED",
             )
         )
         return findings
@@ -2030,31 +2171,61 @@ def build_sarif(findings: List[Finding], root: Path) -> Dict:
     }
 
 
-def compute_readiness_score(findings: List[Finding]) -> Tuple[int, str]:
-    """Score real findings only, and never certify an audit that did not finish.
+def _is_incomplete(f: "Finding") -> bool:
+    """Is this entry a coverage gap rather than a real defect?
 
-    A check that could not run is NOT evidence of safety. Counting it as a 1-point
-    LOW finding meant an offline run with every deep stage skipped still scored
-    99/100 and returned "READY TO PUBLISH". Coverage and severity are different
-    axes, so they are tracked separately: skipped checks never affect the score,
-    and their presence downgrades the verdict to INCOMPLETE.
+    Checked three independent ways on purpose. Fail-closed means a caller must
+    not be able to get a passing verdict by constructing a Finding that happens
+    to miss one of our internal markers - which is exactly how the original bug
+    was found, by calling these functions in isolation.
     """
-    real = [f for f in findings if f.kind != "skipped_check"]
-    skipped = [f for f in findings if f.kind == "skipped_check"]
+    return (
+        getattr(f, "status", "VULNERABILITY") in {"SKIPPED", "SCAN_ERROR"}
+        or getattr(f, "kind", "finding") == "skipped_check"
+        or f.rule_id.endswith("-00")          # DEP-00 / LIVE-00 / GIT-00 / ART-00
+    )
+
+
+def compute_readiness_score(
+    findings: List[Finding],
+    skipped_checks: Optional[List[Finding]] = None,
+    scanned_files: Optional[int] = None,
+    allow_skipped: bool = False,
+) -> Tuple[int, str]:
+    """Score real defects only, and refuse to certify an audit that did not run.
+
+    Fail-closed contract:
+      * `scanned_files == 0`                -> INCOMPLETE_SCAN, score 0.
+      * any skipped / errored check         -> never READY (unless allow_skipped).
+      * READY TO PUBLISH requires ALL of    -> files were scanned, no CRITICAL/HIGH,
+                                               nothing skipped, score >= 90.
+
+    A check that could not run is an UNKNOWN, not a clean result. Counting one as
+    a 1-point LOW meant an offline run with every deep stage skipped still scored
+    99/100 and returned "READY TO PUBLISH". Coverage and severity are different
+    axes and are kept apart here.
+    """
+    pool = list(findings) + list(skipped_checks or [])
+    real = [f for f in pool if not _is_incomplete(f)]
+    incomplete = [f for f in pool if _is_incomplete(f)]
+
+    # Nothing was inspected: there is no evidence either way.
+    if scanned_files is not None and scanned_files <= 0:
+        return 0, "INCOMPLETE_SCAN (0 source files scanned - cannot certify readiness)"
 
     weights = {"CRITICAL": 25, "HIGH": 10, "MEDIUM": 4, "LOW": 1}
-    penalty = sum(weights.get(f.severity, 1) for f in real)
-    score = max(0, 100 - penalty)
+    score = max(0, 100 - sum(weights.get(f.severity, 1) for f in real))
 
+    # A live defect outranks a coverage gap.
     if any(f.severity in {"CRITICAL", "HIGH"} for f in real):
         return score, "BLOCKED (Fix Critical/High findings before publishing)"
 
-    if skipped:
-        n = len(skipped)
-        names = ", ".join(sorted({f.title for f in skipped}))
+    if incomplete and not allow_skipped:
+        n = len(incomplete)
+        names = ", ".join(sorted({f.title for f in incomplete})[:3])
         return score, (
-            f"INCOMPLETE ({n} check{'s' if n != 1 else ''} did not run: {names}). "
-            "Not certified - re-run with the missing checks before publishing."
+            f"VERIFIED_PARTIAL - INCOMPLETE_SCAN ({n} check{'s' if n != 1 else ''} "
+            f"skipped/offline: {names}; run a full online scan before publishing)"
         )
 
     if score >= 90:
@@ -2121,6 +2292,9 @@ def main() -> int:
     scope = parser.add_argument_group("scope")
     scope.add_argument("--diff", metavar="REF", nargs="?", const="origin/main",
                        help="Only scan files changed vs REF (default origin/main). Ideal for pull requests.")
+    scope.add_argument("--include-tests", action="store_true",
+                       help="Also audit test and fixture files. They deliberately contain "
+                            "insecure code, so they are excluded by default.")
     scope.add_argument("--baseline", metavar="PATH", help="Suppress findings recorded in this baseline file")
     scope.add_argument("--write-baseline", metavar="PATH",
                        help="Record every current finding as accepted, so future scans show only new issues")
@@ -2162,7 +2336,8 @@ def main() -> int:
 
     # ---- Stage 1: static source analysis ---------------------------------
     stack = detect_tech_stack(root)
-    static_findings, scanned_files = scan_repository(root, only_files=only_files)
+    static_findings, scanned_files = scan_repository(
+        root, only_files=only_files, include_tests=args.include_tests)
     findings.extend(static_findings)
 
     # ---- Deep stages ------------------------------------------------------
@@ -2225,7 +2400,7 @@ def main() -> int:
     sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     findings.sort(key=lambda f: (sev_rank.get(f.severity, 9), f.domain, f.file, f.line))
 
-    score, verdict = compute_readiness_score(findings)
+    score, verdict = compute_readiness_score(findings, scanned_files=scanned_files)
 
     # Coverage is a separate axis from severity: a check that did not run is not
     # a small defect, it is an unknown. Keep the two apart in the report.

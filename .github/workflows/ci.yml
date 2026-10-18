@@ -156,6 +156,57 @@ jobs:
             *) echo "::error::baseline did not suppress known findings: $out"; exit 1 ;;
           esac
 
+
+      - name: Verify the fail-closed readiness contract
+        run: |
+          set -e
+          python3 - <<'PY'
+          import sys, tempfile
+          from pathlib import Path
+          sys.path.insert(0, "scripts")
+          import aegis_scan as a
+
+          # 1. An empty directory must never certify.
+          with tempfile.TemporaryDirectory() as t:
+              f, n = a.scan_repository(Path(t))
+          score, verdict = a.compute_readiness_score(f, scanned_files=n)
+          assert n == 0 and score == 0 and verdict.startswith("INCOMPLETE_SCAN"), verdict
+
+          # 2. The reported isolation call must never certify.
+          f = a.check_dependency_vulnerabilities([("PyPI", "Django", "2.2.0")], offline=True)
+          assert a.compute_readiness_score(f)[1] != "READY TO PUBLISH"
+
+          # 3. A hand-built -00 with no markers must never certify.
+          bare = a.Finding("DEP-00", "SUPPLY_CHAIN", "LOW", "Skipped", "deps", 0,
+                           "x", "Informational", "re-run")
+          assert a.compute_readiness_score([bare])[1] != "READY TO PUBLISH"
+
+          # 4. A genuinely clean repo must still pass, or the gate is useless.
+          with tempfile.TemporaryDirectory() as t:
+              (Path(t) / "ok.js").write_text("export const add=(a,b)=>a+b;
+", encoding="utf-8")
+              f, n = a.scan_repository(Path(t))
+          assert a.compute_readiness_score(f, scanned_files=n) == (100, "READY TO PUBLISH")
+          print("Fail-closed contract holds on all four paths.")
+          PY
+
+      - name: Verify the installer is idempotent
+        run: |
+          set -e
+          rm -rf /tmp/idem
+          bash install.sh --target /tmp/idem --agent all > /dev/null
+          a=$(find /tmp/idem -type f | wc -l)
+          bash install.sh --target /tmp/idem --agent all > /dev/null
+          b=$(find /tmp/idem -type f | wc -l)
+          if [ "$a" != "$b" ]; then
+            echo "::error::install.sh is not idempotent ($a -> $b files)"; exit 1
+          fi
+          # and a target path containing spaces
+          rm -rf "/tmp/my app dir"
+          bash install.sh --target "/tmp/my app dir" --agent claude-code > /dev/null
+          test -f "/tmp/my app dir/.aegis/scripts/aegis_scan.py"             || { echo "::error::install.sh broke on a path with spaces"; exit 1; }
+          echo "Installer is idempotent and space-safe ($a files)."
+
       - name: Validate JSON report against schema
         run: |
           set -e

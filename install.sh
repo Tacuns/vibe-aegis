@@ -88,8 +88,13 @@ mkdir -p "$TARGET_DIR/.aegis/scripts"
 cp "$SCRIPT_DIR/scripts/aegis_scan.py" "$TARGET_DIR/.aegis/scripts/aegis_scan.py"
 chmod +x "$TARGET_DIR/.aegis/scripts/aegis_scan.py"
 
+# Idempotent: if the project has no AGENTS.md we own it and keep it current.
+# If one already exists we never clobber it - but we also must not create a
+# second artefact on every re-run, so the side copy is written in place.
 if [[ ! -f "$TARGET_DIR/AGENTS.md" ]]; then
   cp "$SCRIPT_DIR/AGENTS.md" "$TARGET_DIR/AGENTS.md"
+elif cmp -s "$SCRIPT_DIR/AGENTS.md" "$TARGET_DIR/AGENTS.md"; then
+  : # already ours and identical - nothing to do
 else
   cp "$SCRIPT_DIR/AGENTS.md" "$TARGET_DIR/.aegis/AGENTS.vibe-aegis.md"
 fi

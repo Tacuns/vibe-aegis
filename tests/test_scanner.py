@@ -536,7 +536,7 @@ class TestCoverageVersusSeverity(unittest.TestCase):
 
         score, verdict = aegis_scan.compute_readiness_score(findings)
         self.assertFalse(verdict.startswith("READY"), f"still certifies an unrun audit: {verdict}")
-        self.assertTrue(verdict.startswith("INCOMPLETE"), verdict)
+        self.assertIn("INCOMPLETE_SCAN", verdict)
 
     def test_skipped_checks_do_not_change_the_score(self):
         """Coverage is not a severity. Ten skipped checks must not cost 10 points."""
@@ -573,14 +573,15 @@ class TestCoverageVersusSeverity(unittest.TestCase):
     def test_ready_requires_a_complete_audit(self):
         """READY only when nothing was skipped."""
         self.assertTrue(aegis_scan.compute_readiness_score([])[1].startswith("READY"))
-        self.assertTrue(
-            aegis_scan.compute_readiness_score([self._skipped()])[1].startswith("INCOMPLETE"))
+        self.assertIn("INCOMPLETE_SCAN",
+                      aegis_scan.compute_readiness_score([self._skipped()])[1])
 
     def test_verdict_names_the_check_that_was_missed(self):
         """Telling someone the audit is incomplete is useless without saying which part."""
         _, verdict = aegis_scan.compute_readiness_score(
             [self._skipped(title="Dependency Vulnerability Check Skipped")])
         self.assertIn("Dependency Vulnerability Check Skipped", verdict)
+        self.assertNotIn("READY TO PUBLISH", verdict)
 
     def test_report_separates_skipped_from_findings(self):
         """End-to-end: the JSON must not bury a coverage gap in the findings list."""
@@ -721,6 +722,157 @@ class TestDocumentedRulesActuallyExist(unittest.TestCase):
                 "export async function DELETE(req){ return db.order.delete({where:{id:req.body.id}}); }"
         })
         self.assertIn("SEC-03", {f.rule_id for f in findings})
+
+class TestFailClosedIsolation(unittest.TestCase):
+    """Every function must be safe when called on its own.
+
+    The original report came from testing functions in isolation rather than
+    through the full audit, so isolation is exactly what these assert.
+    """
+
+    def test_isolated_offline_dep_check_never_returns_ready_to_publish(self):
+        findings = aegis_scan.check_dependency_vulnerabilities(
+            [("PyPI", "Django", "2.2.0")], offline=True)
+        self.assertEqual([f.rule_id for f in findings], ["DEP-00"])
+        self.assertEqual(findings[0].status, "SKIPPED")
+
+        _, verdict = aegis_scan.compute_readiness_score(findings)
+        self.assertNotEqual(verdict, "READY TO PUBLISH")
+        self.assertIn("INCOMPLETE_SCAN", verdict)
+
+    def test_bare_dep00_without_markers_still_fails_closed(self):
+        """A caller constructing the Finding by hand must not get a pass.
+
+        Belt and braces: the -00 suffix alone is enough, even when `status`
+        and `kind` are left at their defaults.
+        """
+        bare = aegis_scan.Finding("DEP-00", "SUPPLY_CHAIN", "LOW", "Skipped",
+                                  "dependencies", 0, "x", "Informational", "re-run")
+        self.assertEqual(bare.status, "VULNERABILITY")   # no marker set
+        _, verdict = aegis_scan.compute_readiness_score([bare])
+        self.assertNotEqual(verdict, "READY TO PUBLISH")
+
+    def test_live00_also_fails_closed(self):
+        bare = aegis_scan.Finding("LIVE-00", "SECURITY", "LOW", "Unreachable",
+                                  "http://x", 0, "x", "Live Deployment Check", "start the server")
+        _, verdict = aegis_scan.compute_readiness_score([bare])
+        self.assertNotEqual(verdict, "READY TO PUBLISH")
+
+    def test_git00_emitted_when_history_cannot_be_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            findings = aegis_scan.scan_git_history(Path(tmp), 10)
+        self.assertEqual([f.rule_id for f in findings], ["GIT-00"])
+        self.assertEqual(findings[0].status, "SKIPPED")
+        _, verdict = aegis_scan.compute_readiness_score(findings)
+        self.assertNotEqual(verdict, "READY TO PUBLISH")
+
+    def test_zero_scanned_files_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            findings, scanned = aegis_scan.scan_repository(Path(tmp))
+        self.assertEqual(scanned, 0)
+        score, verdict = aegis_scan.compute_readiness_score(findings, scanned_files=scanned)
+        self.assertEqual(score, 0)
+        self.assertTrue(verdict.startswith("INCOMPLETE_SCAN"), verdict)
+
+    def test_clean_scanned_repo_with_all_checks_completed_is_ready(self):
+        """The gate must not be so tight that a genuinely clean repo cannot pass."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "src/math.js", "export const add = (a, b) => a + b;\n")
+            findings, scanned = aegis_scan.scan_repository(root)
+        self.assertGreater(scanned, 0)
+        score, verdict = aegis_scan.compute_readiness_score(findings, scanned_files=scanned)
+        self.assertEqual(score, 100)
+        self.assertEqual(verdict, "READY TO PUBLISH")
+
+    def test_allow_skipped_is_an_explicit_opt_in(self):
+        findings = aegis_scan.check_dependency_vulnerabilities([("PyPI", "x", "1.0")], offline=True)
+        self.assertNotEqual(aegis_scan.compute_readiness_score(findings)[1], "READY TO PUBLISH")
+        self.assertEqual(
+            aegis_scan.compute_readiness_score(findings, allow_skipped=True)[1], "READY TO PUBLISH")
+
+    def test_skipped_checks_argument_is_honoured(self):
+        skipped = [aegis_scan.Finding("DEP-00", "SUPPLY_CHAIN", "LOW", "Skipped", "deps", 0,
+                                      "x", "Informational", "re-run",
+                                      kind="skipped_check", status="SKIPPED")]
+        _, verdict = aegis_scan.compute_readiness_score([], skipped_checks=skipped)
+        self.assertIn("INCOMPLETE_SCAN", verdict)
+
+
+class TestScannerEdgeCases(unittest.TestCase):
+    """Comment handling, path normalisation, test isolation and domain coverage."""
+
+    def _scan(self, rel, body, **kw):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, rel, body)
+            findings, _ = aegis_scan.scan_repository(root, **kw)
+            return {f.rule_id for f in findings}
+
+    def test_commented_out_vulnerable_code_is_ignored(self):
+        self.assertEqual(self._scan("a.js", "// eval(req.body.code)\n"), set())
+        self.assertEqual(self._scan("b.js", "/* eval(userInput) */\n"), set())
+        self.assertEqual(self._scan("c.py", '# cursor.execute(f"SELECT {x}")\n'), set())
+
+    def test_real_code_still_fires_after_comment_masking(self):
+        """Masking must not blunt the scanner."""
+        self.assertIn("SEC-08", self._scan("d.js", "eval(req.body.code);\n"))
+
+    def test_double_slash_inside_a_string_is_not_a_comment(self):
+        """`https://` must not swallow the rest of the line."""
+        self.assertIn("SEC-08", self._scan("e.js", 'const u = "https://x.com"; eval(bad);\n'))
+
+    def test_hash_in_jsx_href_is_not_treated_as_a_comment(self):
+        """Masking # in JSX would silently kill the dead-link rules."""
+        self.assertIn("UX-01", self._scan("f.jsx", '<a href="#">Terms</a>\n'))
+
+    def test_test_fixtures_excluded_unless_opted_in(self):
+        vulnerable = "eval(req.body.code);\n"
+        self.assertEqual(self._scan("tests/x.test.js", vulnerable), set())
+        self.assertIn("SEC-08", self._scan("tests/x.test.js", vulnerable, include_tests=True))
+
+    def test_windows_backslash_paths_normalized(self):
+        """app\\api\\... must be audited exactly like app/api/..."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "app/api/checkout/route.ts",
+                  "export async function POST(req){ return db.order.create(req.body); }\n")
+            findings, _ = aegis_scan.scan_repository(root)
+        self.assertTrue(all("\\" not in f.file for f in findings), "paths must use / separators")
+        self.assertIn("app/api/checkout/route.ts", {f.file for f in findings})
+        self.assertIn("SEC-03", {f.rule_id for f in findings})
+
+    def test_framework_auth_guards_are_recognised(self):
+        """Protected routes must not be reported as unauthenticated."""
+        for guard in ("passport.authenticate('jwt')", "auth.protect()", "withApiAuth(handler)"):
+            ids = self._scan("app/api/x/route.ts",
+                             f"export async function POST(req){{ {guard}; return db.del(); }}\n")
+            self.assertNotIn("SEC-03", ids, f"false positive with guard: {guard}")
+
+    def test_unprotected_route_still_fires(self):
+        ids = self._scan("app/api/x/route.ts",
+                         "export async function POST(req){ return db.del(); }\n")
+        self.assertIn("SEC-03", ids)
+
+    def test_findings_sort_deterministically_by_severity(self):
+        def f(rule, sev, line):
+            return aegis_scan.Finding(rule, "SECURITY", sev, "t", "a.ts", line, "e", "c", "r")
+        unsorted = [f("SEC-09", "LOW", 3), f("SEC-01", "CRITICAL", 2), f("SEC-07", "HIGH", 1)]
+        rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+        ordered = sorted(unsorted, key=lambda x: (rank[x.severity], x.domain, x.file, x.line))
+        self.assertEqual([x.severity for x in ordered], ["CRITICAL", "HIGH", "LOW"])
+
+    def test_all_domains_are_reachable(self):
+        """Every domain the schema declares must be produced by some rule."""
+        import re
+        src = (Path(__file__).resolve().parent.parent / "scripts" / "aegis_scan.py").read_text(encoding="utf-8")
+        produced = set(re.findall(r'domain="([A-Z_]+)"', src)) | set(
+            re.findall(r'"(PAYMENTS|RELIABILITY)"', src))
+        schema = json.loads((Path(__file__).resolve().parent.parent
+                             / "schemas" / "scan-report.schema.json").read_text(encoding="utf-8"))
+        declared = set(schema["$defs"]["finding"]["properties"]["domain"]["enum"])
+        unreachable = sorted(declared - produced)
+        self.assertEqual(unreachable, [], f"schema declares domains no rule emits: {unreachable}")
 
 if __name__ == "__main__":
     unittest.main()
