@@ -183,8 +183,7 @@ jobs:
 
           # 4. A genuinely clean repo must still pass, or the gate is useless.
           with tempfile.TemporaryDirectory() as t:
-              (Path(t) / "ok.js").write_text("export const add=(a,b)=>a+b;
-", encoding="utf-8")
+              (Path(t) / "ok.js").write_text("export const add=(a,b)=>a+b;\n", encoding="utf-8")
               f, n = a.scan_repository(Path(t))
           assert a.compute_readiness_score(f, scanned_files=n) == (100, "READY TO PUBLISH")
           print("Fail-closed contract holds on all four paths.")
