@@ -169,6 +169,7 @@ python3 scripts/aegis_scan.py /path/to/your/app --fail-on-high
 | :--- | :--- |
 | `--fail-on-high` | Exit `1` if any `CRITICAL` or `HIGH` finding exists |
 | `--fail-on <level>` | Exit `1` at or above `critical`/`high`/`medium`/`low` |
+| `--fail-on-incomplete` | Exit `1` if any check could not run — use when a green pipeline must mean *fully audited*, not merely *nothing found* |
 
 **Scope — how you adopt this on a real codebase**
 
@@ -291,11 +292,38 @@ Source code says what you wrote. The build output says what ships. Because the s
 | `DEP-01` | Known dependency vulnerability | Medium | Package versions with OSV advisories (npm, PyPI, crates.io, Go) |
 | `HIST-01` | Credential in git history | Critical–Medium | A key committed at any point — **even if deleted later**, it is still readable and still compromised |
 
+### Rule Variants
+
+Some rules have narrower sub-variants, reported with their own id so you can suppress them individually:
+
+| ID | Covers |
+| :--- | :--- |
+| `SEC-01B` | Secret-named value exposed through a client-bundled env prefix |
+| `SEC-01C` | `.env` present in the project root but not in `.gitignore` |
+| `SEC-02B` | Permissive Firebase / Firestore rule (`allow read, write: if true`) |
+| `SEC-10B` | Auth token stored in `localStorage` rather than an HttpOnly cookie |
+| `SEC-17B` | `/.env` or `/.git/config` publicly reachable on the live server |
+| `DEP-00`, `LIVE-00`, `ART-10` | **Coverage gaps**, not defects — a check that could not run |
+
 ### Secret Detection Precision
 
 A noisy scanner gets uninstalled. Credential rules only fire on real provider key shapes (AWS, Stripe, GitHub, Google, Slack, OpenAI, Anthropic, SendGrid, Twilio, Razorpay, npm, PEM private keys, Supabase service-role JWTs, database URLs with inline credentials) or on secret-named variables holding high-entropy values. Placeholders such as `your-api-key-here`, `changeme`, `${process.env.X}` and AWS's own documentation key `AKIAIOSFODNN7EXAMPLE` are rejected.
 
 **Every credential in every report is redacted** to its first 6 and last 4 characters, so `.aegis/scan-report.json` is safe to commit, attach to an issue, or hand to an agent.
+
+### Coverage Is Not Severity
+
+A check that **could not run** is an unknown, not a pass. Skipped checks (offline mode, an unreachable URL or OSV, an unopenable package) are reported separately in `skipped_checks`, never counted in the score, and they force the verdict to `INCOMPLETE`:
+
+```text
+Readiness Score  : 100/100 - INCOMPLETE (1 check did not run: Dependency
+                   Vulnerability Check Skipped). Not certified.
+
+CHECKS THAT DID NOT RUN (1) - result UNKNOWN, not clean:
+  - Dependency Vulnerability Check Skipped (offline mode)
+```
+
+`READY TO PUBLISH` is only ever issued for a **complete** audit. Use `--fail-on-incomplete` to enforce that in CI.
 
 ### Release Readiness Score
 

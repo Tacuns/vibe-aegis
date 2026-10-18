@@ -4,6 +4,49 @@ All notable changes to Vibe Aegis are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-10-19
+
+Two community reports, plus a full line-by-line audit they prompted.
+
+### Fixed - a skipped check was being treated as a passing check
+
+Reported: `check_dependency_vulnerabilities(deps, offline=True)` returned a `LOW` `DEP-00`, and passing that alone to `compute_readiness_score` gave 99/100 and `READY TO PUBLISH`. An audit where nothing ran could certify itself.
+
+The answer to "is READY intended to cover only completed checks?" is yes, and it is now enforced:
+
+- `Finding` gains `kind`: `finding` (a real defect) or `skipped_check` (a check that could not run).
+- Coverage and severity are separate axes. Skipped checks never affect `readiness_score` or `summary_counts`.
+- Any skipped check forces `release_verdict` to `INCOMPLETE`, naming which check was missed. `READY TO PUBLISH` is issued only for a complete audit.
+- Report gains `coverage` and a separate `skipped_checks` array; the terminal output prints a "CHECKS THAT DID NOT RUN - result UNKNOWN, not clean" section.
+- New `--fail-on-incomplete` so a green pipeline can be made to mean *fully audited* rather than *nothing found*.
+- All four sites that mean "did not run" are marked: `DEP-00` (offline and OSV unreachable), `LIVE-00` (unreachable URL), `ART-10` (unopenable package).
+
+### Fixed - the README promised six rules that did not exist
+
+An audit of documented-versus-implemented rule ids found `PAY-03`, `SEC-04`, `SEC-14`, `SEC-15`, `UX-04` and `UX-06` listed in the coverage matrix but absent from the scanner - a silent false negative for anyone who trusted the table. All six are now implemented:
+
+- `PAY-03` Critical: payment webhook route with no signature verification (`constructEvent` / HMAC) anywhere in the file.
+- `SEC-04` Critical: a record addressed by a request-supplied id with no owner scoping in the WHERE clause (IDOR).
+- `SEC-14` Medium: login, OTP, reset-password, signup and invite endpoints with no rate limiter.
+- `SEC-15` Medium: upload handling with no MIME allowlist and no size limit.
+- `UX-04` Medium: a `.map()` list render with no zero-length branch - the user sees a blank screen.
+- `UX-06` Medium: form control with no accessible name. A `placeholder` is not a label.
+
+A new test parses the README matrix and fails if any documented rule is missing from the scanner, so this cannot regress.
+
+### Fixed - SEC-03 false positive on authentication routes
+
+`SEC-03` flagged login, signup, OTP, callback and password-reset routes for "missing authentication". Authenticating is what those routes are for. The exclusion list now covers them, and a test confirms a genuinely unprotected mutation route still fires.
+
+### Fixed - corrupted regex literals
+
+Three regexes in `aegis_scan.py` contained literal control characters instead of `` word boundaries, introduced by earlier editing mistakes. The affected patterns could not match what they claimed to.
+
+### Changed
+
+- Schema: `coverage` and `skipped_checks` added; `kind` added to findings; `release_verdict` documents the `INCOMPLETE` state.
+- Tests 37 -> 50, including negative fixtures proving all six restored rules stay silent on correct implementations.
+
 ## [2.2.0] - 2026-10-19
 
 Acts on community feedback: an action rendered as a link is an accessibility bug, and the fix is to use the right element, not a better `href`.

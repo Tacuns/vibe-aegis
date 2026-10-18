@@ -507,5 +507,220 @@ class TestInteractiveSemantics(unittest.TestCase):
             if f.rule_id in ("UX-11", "UX-12"):
                 self.assertIn("button", f.remediation.lower())
 
+class TestCoverageVersusSeverity(unittest.TestCase):
+    """A check that did not run is an UNKNOWN, never a pass.
+
+    Regression for the reported edge case: calling
+    check_dependency_vulnerabilities(deps, offline=True) returned a LOW DEP-00,
+    and passing that alone to compute_readiness_score gave 99/100 and
+    "READY TO PUBLISH". Coverage and severity are separate axes.
+    """
+
+    def _skipped(self, rule_id="DEP-00", title="Check Skipped"):
+        return aegis_scan.Finding(
+            rule_id=rule_id, domain="SUPPLY_CHAIN", severity="LOW", title=title,
+            file="dependencies", line=0, snippet="not run", cwe_or_standard="Informational",
+            remediation="re-run", kind="skipped_check")
+
+    def _real(self, severity="LOW"):
+        return aegis_scan.Finding(
+            rule_id="SEC-01", domain="SECURITY", severity=severity, title="t",
+            file="a.ts", line=1, snippet="e", cwe_or_standard="c", remediation="r")
+
+    def test_reported_repro_no_longer_returns_ready(self):
+        """The exact call from the bug report."""
+        findings = aegis_scan.check_dependency_vulnerabilities(
+            [("PyPI", "Django", "2.2.0")], offline=True)
+        self.assertEqual([f.rule_id for f in findings], ["DEP-00"])
+        self.assertEqual(findings[0].kind, "skipped_check")
+
+        score, verdict = aegis_scan.compute_readiness_score(findings)
+        self.assertFalse(verdict.startswith("READY"), f"still certifies an unrun audit: {verdict}")
+        self.assertTrue(verdict.startswith("INCOMPLETE"), verdict)
+
+    def test_skipped_checks_do_not_change_the_score(self):
+        """Coverage is not a severity. Ten skipped checks must not cost 10 points."""
+        self.assertEqual(aegis_scan.compute_readiness_score([self._skipped()] * 10)[0], 100)
+
+    def test_every_skipped_check_variant_is_marked(self):
+        """All four 'could not run' sites must use kind=skipped_check."""
+        offline = aegis_scan.check_dependency_vulnerabilities([("PyPI", "x", "1.0")], offline=True)
+        self.assertTrue(all(f.kind == "skipped_check" for f in offline))
+
+        unreachable = aegis_scan.check_live_url_posture("http://127.0.0.1:9/nope")
+        live00 = [f for f in unreachable if f.rule_id == "LIVE-00"]
+        if live00:
+            self.assertEqual(live00[0].kind, "skipped_check")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bad = root / "broken.apk"
+            bad.write_text("not a zip", encoding="utf-8")
+            art = aegis_scan.scan_mobile_package(root, bad)
+            self.assertEqual([f.kind for f in art], ["skipped_check"])
+
+    def test_real_findings_still_score_and_block(self):
+        """The fix must not weaken the gate for genuine defects."""
+        self.assertEqual(aegis_scan.compute_readiness_score([self._real("CRITICAL")])[0], 75)
+        self.assertTrue(
+            aegis_scan.compute_readiness_score([self._real("HIGH")])[1].startswith("BLOCKED"))
+
+    def test_blocked_takes_precedence_over_incomplete(self):
+        """A real blocker is more urgent than a coverage gap."""
+        _, verdict = aegis_scan.compute_readiness_score([self._real("CRITICAL"), self._skipped()])
+        self.assertTrue(verdict.startswith("BLOCKED"), verdict)
+
+    def test_ready_requires_a_complete_audit(self):
+        """READY only when nothing was skipped."""
+        self.assertTrue(aegis_scan.compute_readiness_score([])[1].startswith("READY"))
+        self.assertTrue(
+            aegis_scan.compute_readiness_score([self._skipped()])[1].startswith("INCOMPLETE"))
+
+    def test_verdict_names_the_check_that_was_missed(self):
+        """Telling someone the audit is incomplete is useless without saying which part."""
+        _, verdict = aegis_scan.compute_readiness_score(
+            [self._skipped(title="Dependency Vulnerability Check Skipped")])
+        self.assertIn("Dependency Vulnerability Check Skipped", verdict)
+
+    def test_report_separates_skipped_from_findings(self):
+        """End-to-end: the JSON must not bury a coverage gap in the findings list."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "requirements.txt", "Django==2.2.0\n")
+            out = root / "r.json"
+            scanner = Path(__file__).resolve().parent.parent / "scripts" / "aegis_scan.py"
+            subprocess.run([sys.executable, "-B", str(scanner), str(root),
+                            "--offline", "--deps", "--output", str(out)],
+                           capture_output=True, check=False)
+            if not out.exists():
+                self.skipTest("scanner did not produce a report")
+            r = json.loads(out.read_text(encoding="utf-8"))
+
+        self.assertFalse(r["coverage"]["complete"])
+        self.assertEqual(r["coverage"]["checks_skipped"], 1)
+        self.assertEqual(len(r["skipped_checks"]), 1)
+        self.assertTrue(all(f["kind"] == "finding" for f in r["findings"]))
+        self.assertTrue(r["release_verdict"].startswith("INCOMPLETE"))
+        # A coverage gap must not inflate the severity tallies.
+        self.assertEqual(r["summary_counts"]["LOW"], 0)
+
+class TestDocumentedRulesActuallyExist(unittest.TestCase):
+    """The README coverage matrix is a promise. Every rule in it must run.
+
+    Audit finding: PAY-03, SEC-14, SEC-15, UX-04 and UX-06 were listed in the
+    README but had never been implemented - a silent false negative for anyone
+    who trusted the table. This test fails if that regresses.
+    """
+
+    VULNERABLE = {
+        "app/api/stripe-webhook/route.ts": """
+            export async function POST(req: Request) {
+              const body = await req.json();
+              await grantSubscription(body.data.object.customer);
+            }
+        """,
+        "app/api/login/route.ts": """
+            export async function POST(req: Request) {
+              const { email, password } = await req.json();
+              return signIn(email, password);
+            }
+        """,
+        "app/api/upload.ts": """
+            export async function POST(req: Request) {
+              const file = (await req.formData()).get("file");
+              await put(file.name, file);
+            }
+        """,
+        "components/List.jsx": """
+            export function List({ items }) {
+              return (<div>
+                {items.map(i => <Row key={i.id} {...i} />)}
+                <input type="text" placeholder="Search" />
+              </div>);
+            }
+        """,
+    }
+
+    CORRECT = {
+        "app/api/stripe-webhook/route.ts": """
+            export async function POST(req: Request) {
+              const raw = await req.text();
+              const event = stripe.webhooks.constructEvent(raw, sig, SECRET);
+              await db.processed.create({ data: { id: event.id } });
+            }
+        """,
+        "app/api/login/route.ts": """
+            import { Ratelimit } from "@upstash/ratelimit";
+            const limiter = new Ratelimit({ limiter: Ratelimit.slidingWindow(5, "60 s") });
+            export async function POST(req: Request) {
+              const { success } = await limiter.limit(ip);
+              if (!success) return new Response("rate limited", { status: 429 });
+            }
+        """,
+        "app/api/upload.ts": """
+            const ALLOWED_TYPES = ["image/png"];
+            export async function POST(req: Request) {
+              const file = (await req.formData()).get("file");
+              if (!ALLOWED_TYPES.includes(file.type)) return bad();
+              if (file.size > 5000000) return bad();
+            }
+        """,
+        "components/List.jsx": """
+            export function List({ items }) {
+              if (items.length === 0) return <EmptyState />;
+              return (<div>
+                {items.map(i => <Row key={i.id} {...i} />)}
+                <label htmlFor="q">Search</label>
+                <input id="q" type="text" />
+              </div>);
+            }
+        """,
+    }
+
+    RESTORED = {"PAY-03", "SEC-14", "SEC-15", "UX-04", "UX-06"}
+
+    def _scan(self, files):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel, body in files.items():
+                write(root, rel, body)
+            findings, _ = aegis_scan.scan_repository(root)
+            return findings
+
+    def test_every_readme_rule_is_implemented(self):
+        """Parse the README matrix and confirm each rule id exists in the scanner."""
+        import re
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        source = (Path(__file__).resolve().parent.parent / "scripts" / "aegis_scan.py").read_text(encoding="utf-8")
+        documented = set(re.findall(r"^\| `((?:SEC|UX|PAY|REL|FLOW|ART|DEP|HIST|LIVE)-\d\d[A-Z]?)`",
+                                    readme, re.M))
+        implemented = set(re.findall(r'"((?:SEC|UX|PAY|REL|FLOW|ART|DEP|HIST|LIVE)-\d\d[A-Z]?)"',
+                                     source))
+        missing = sorted(documented - implemented)
+        self.assertEqual(missing, [], f"README promises rules the scanner does not implement: {missing}")
+
+    def test_restored_rules_fire_on_vulnerable_code(self):
+        got = {f.rule_id for f in self._scan(self.VULNERABLE)}
+        missing = sorted(self.RESTORED - got)
+        self.assertEqual(missing, [], f"restored rules did not fire: {missing}")
+
+    def test_restored_rules_are_silent_on_correct_code(self):
+        noisy = sorted({f.rule_id for f in self._scan(self.CORRECT)} & self.RESTORED)
+        self.assertEqual(noisy, [], f"false positives on correct code: {noisy}")
+
+    def test_login_route_is_not_flagged_for_missing_authentication(self):
+        """Authenticating is what a login route is FOR - SEC-03 must skip it."""
+        findings = self._scan({"app/api/login/route.ts": self.CORRECT["app/api/login/route.ts"]})
+        self.assertNotIn("SEC-03", {f.rule_id for f in findings})
+
+    def test_genuinely_unprotected_mutation_route_still_fires(self):
+        """Widening the SEC-03 exclusions must not blunt the rule."""
+        findings = self._scan({
+            "app/api/orders/route.ts":
+                "export async function DELETE(req){ return db.order.delete({where:{id:req.body.id}}); }"
+        })
+        self.assertIn("SEC-03", {f.rule_id for f in findings})
+
 if __name__ == "__main__":
     unittest.main()

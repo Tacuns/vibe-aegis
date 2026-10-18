@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-SCANNER_VERSION = "2.2.0"
+SCANNER_VERSION = "2.3.0"
 
 IGNORE_DIRS: Set[str] = {
     ".git", "node_modules", ".next", "dist", "build", "out", ".vercel",
@@ -60,6 +60,7 @@ class Finding:
     remediation: str
     confidence: str = "HIGH"
     fingerprint: str = ""      # stable id for baseline suppression + SARIF dedupe
+    kind: str = "finding"      # "finding" = a real defect; "skipped_check" = a check that could not run
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +322,22 @@ UIUX_PATTERNS: List[Tuple[str, str, str, re.Pattern, str, str, Optional[Set[str]
         STYLE_EXTENSIONS,
     ),
     (
+        "UX-06",
+        "MEDIUM",
+        "Form Control Without An Accessible Name",
+        # A placeholder is not a label: it vanishes on focus and many screen
+        # readers ignore it. aria-labelledby / an id tied to <label for> count.
+        re.compile(
+            r"""<(?:input|select|textarea)(?![^>]*\b(?:aria-label|aria-labelledby|id)=)(?![^>]*type=["'](?:hidden|submit|button)["'])[^>]*>""",
+            re.IGNORECASE,
+        ),
+        "WCAG 2.2 AA - 3.3.2 Labels or Instructions, 4.1.2 Name, Role, Value",
+        "This control has no accessible name, so a screen reader announces only its type. "
+        "Add a visible `<label for=...>` tied to the control' + chr(39) + 's `id`, or an `aria-label`. "
+        "A `placeholder` is not a label - it disappears as soon as the user types.",
+        FRONTEND_EXTENSIONS,
+    ),
+    (
         "UX-07",
         "MEDIUM",
         "Image Element Missing `alt` Attribute",
@@ -452,9 +469,17 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
     is_api_route = (
         ("app/api/" in rel_path or "pages/api/" in rel_path)
         and ext in {".ts", ".js", ".tsx", ".jsx"}
-        and "auth" not in rel_path.lower()
-        and "webhook" not in rel_path.lower()
-        and "health" not in rel_path.lower()
+        # Routes that legitimately have no prior session. Flagging a login
+        # endpoint for "missing authentication" is a guaranteed false positive -
+        # authenticating is what it is for.
+        and not any(
+            token in rel_path.lower()
+            for token in (
+                "auth", "webhook", "health", "login", "signin", "sign-in",
+                "signup", "sign-up", "register", "callback", "public",
+                "forgot-password", "reset-password", "magic-link", "otp",
+            )
+        )
     )
     has_use_server = '"use server"' in text or "'use server'" in text
     if is_api_route or has_use_server:
@@ -536,6 +561,174 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
                     snippet="Form with network mutation lacks a `disabled=` attribute on its submit button",
                     cwe_or_standard="UI/UX State Completeness & Idempotency",
                     remediation="Track submission state (`isSubmitting` / `isPending`) and set `disabled={isSubmitting}` on the submit button with a visible loading indicator.",
+                    confidence="MEDIUM",
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # Rules that need whole-file context (the defect is an ABSENCE, which a
+    # single-line regex cannot see). These were listed in the README coverage
+    # matrix but had never been implemented - a silent false negative for
+    # anyone who trusted the table.
+    # ------------------------------------------------------------------
+
+    is_js = ext in {".ts", ".tsx", ".js", ".jsx", ".mjs"}
+    low_path = rel_path.lower()
+
+    # PAY-03: a webhook endpoint that never verifies the signature.
+    # The route is a public URL that grants entitlements; without verification
+    # anyone who can POST to it can grant themselves anything.
+    if "webhook" in low_path and is_js:
+        haystack = low_path + " " + text.lower()
+        provider = next((p for p in ("stripe", "razorpay", "paddle", "lemonsqueezy", "paypal")
+                         if p in haystack), None)
+        verified = any(tok in text for tok in (
+            "constructEvent", "constructEventAsync", "webhooks.verify", "verifyWebhook",
+            "createHmac", "timingSafeEqual", "verify_header", "validateWebhookSignature",
+        ))
+        if provider and not verified:
+            findings.append(
+                Finding(
+                    rule_id="PAY-03",
+                    domain="PAYMENTS",
+                    severity="CRITICAL",
+                    title=f"{provider.title()} Webhook Route Without Signature Verification",
+                    file=rel_path,
+                    line=1,
+                    snippet=(f"Handles {provider} webhooks but no signature verification "
+                             "(constructEvent / HMAC) was found in this file."),
+                    cwe_or_standard="CWE-345 Insufficient Verification of Data Authenticity / OWASP A08",
+                    remediation=(
+                        "Read the RAW body (`await req.text()`, never `req.json()` - parsing breaks "
+                        "the signature) and verify it with `stripe.webhooks.constructEvent()` or an "
+                        "HMAC comparison using `timingSafeEqual`. Also store each processed "
+                        "`event.id` under a unique constraint, or a captured payload can be replayed."
+                    ),
+                    confidence="MEDIUM",
+                )
+            )
+
+
+    # SEC-04: a record addressed by a request-supplied id with no owner scoping.
+    # The single most common catastrophic flaw in vibe-coded apps, because the
+    # happy path works perfectly - you only ever test with one account.
+    if is_js and re.search(r"(?i)\b(findUnique|findFirst|findOne|update|delete|deleteOne)\s*\(", text):
+        for m in re.finditer(
+            r"(?i)\.(?:findUnique|findFirst|findOne|update|delete|deleteOne)\s*\(\s*\{[^}]{0,200}?"
+            r"\bwhere\s*:\s*\{([^}]{0,200})\}",
+            text,
+        ):
+            where = m.group(1)
+            # Addressed by an id that came from the request?
+            from_request = re.search(
+                r"(?i)(req(?:uest)?\.(?:body|query|params)|params\.|searchParams|body\.|input\.)", where
+            )
+            # Scoped to the authenticated owner anywhere in the same clause?
+            owner_scoped = re.search(
+                r"(?i)(user[_-]?id|userId|owner[_-]?id|ownerId|tenant[_-]?id|tenantId|org[_-]?id|"
+                r"orgId|account[_-]?id|accountId|auth\.uid|session\.|authorId|createdBy)", where
+            )
+            if from_request and not owner_scoped:
+                findings.append(
+                    Finding(
+                        rule_id="SEC-04",
+                        domain="SECURITY",
+                        severity="CRITICAL",
+                        title="Record Addressed By Request-Supplied ID Without Owner Scoping (IDOR)",
+                        file=rel_path,
+                        line=text[:m.start()].count("\n") + 1,
+                        snippet=f"where: {{{where.strip()[:100]}}}",
+                        cwe_or_standard="CWE-639 Authorization Bypass Through User-Controlled Key / OWASP A01",
+                        remediation=(
+                            "Add the authenticated owner to the WHERE clause so another user's id "
+                            "cannot match - for example `where: { id, userId: session.user.id }`. "
+                            "Verify by taking a record id from account A and requesting it while "
+                            "signed in as account B; if it returns, this is confirmed."
+                        ),
+                        confidence="MEDIUM",
+                    )
+                )
+
+    # SEC-14: abuse-prone endpoints with no rate limiting anywhere in the file.
+    if is_js and ("app/api/" in rel_path or "pages/api/" in rel_path or has_use_server):
+        abuse_prone = re.search(
+            r"(?i)\b(login|signin|signup|register|otp|verify|reset[-_]?password|"
+            r"forgot[-_]?password|magic[-_]?link|invite|contact|subscribe)\b", rel_path
+        )
+        limited = re.search(
+            r"(?i)(ratelimit|rate_limit|rateLimiter|@upstash/ratelimit|express-rate-limit|"
+            r"limiter\.|throttle|slowDown|checkRateLimit|Ratelimit\.)", text
+        )
+        if abuse_prone and not limited:
+            findings.append(
+                Finding(
+                    rule_id="SEC-14",
+                    domain="SECURITY",
+                    severity="MEDIUM",
+                    title="Abuse-Prone Endpoint Without Rate Limiting",
+                    file=rel_path,
+                    line=1,
+                    snippet=f"`{abuse_prone.group(0)}` endpoint with no rate limiter found in this file.",
+                    cwe_or_standard="CWE-307 Improper Restriction of Excessive Authentication Attempts / OWASP A07",
+                    remediation=(
+                        "Add a per-IP and per-account rate limit. Without one this endpoint allows "
+                        "credential stuffing, OTP brute force, and email/SMS flooding billed to you."
+                    ),
+                    confidence="MEDIUM",
+                )
+            )
+
+    # SEC-15: upload handler with no type or size restriction.
+    if is_js and re.search(r"(?i)(upload|multer|formidable|busboy|createPresignedPost|getSignedUrl)",
+                           low_path + " " + text):
+        if re.search(r"(?i)(formData\.get\(|req\.file|multer\(|busboy|presigned|\bput\()", text):
+            guarded = re.search(
+                r"(?i)(maxFileSize|fileSize|limits\s*:|MAX_FILE|allowedMimeTypes|ALLOWED_TYPES|"
+                r"\.type\s*===|\.mimetype\s*===|contentLengthRange|accept\s*:)", text
+            )
+            if not guarded:
+                findings.append(
+                    Finding(
+                        rule_id="SEC-15",
+                        domain="SECURITY",
+                        severity="MEDIUM",
+                        title="File Upload Without Type Or Size Restriction",
+                        file=rel_path,
+                        line=1,
+                        snippet="Upload handling found with no MIME allowlist and no size limit in this file.",
+                        cwe_or_standard="CWE-434 Unrestricted Upload of File with Dangerous Type / OWASP A04",
+                        remediation=(
+                            "Enforce a MIME allowlist and a maximum size on the SERVER (a client "
+                            "`accept=` attribute is not a control), and generate the storage path "
+                            "yourself - never build it from the user-supplied filename (path traversal)."
+                        ),
+                        confidence="MEDIUM",
+                    )
+                )
+
+    # UX-04: a list render with no empty state - the user sees a blank screen.
+    if ext in FRONTEND_EXTENSIONS and ".map(" in text:
+        renders_list = re.search(r"\{\s*\w+(?:\.\w+)*\s*\.map\(", text)
+        has_empty_state = re.search(
+            r"(?i)(\.length\s*===\s*0|\.length\s*<\s*1|!\w+\.length|\.length\s*\?|"
+            r"isEmpty|EmptyState|no[-_ ]?results|nothing[-_ ]?here|length\s*>\s*0\s*\?)", text
+        )
+        if renders_list and not has_empty_state:
+            findings.append(
+                Finding(
+                    rule_id="UX-04",
+                    domain="UI_UX",
+                    severity="MEDIUM",
+                    title="List Rendered Without An Empty State",
+                    file=rel_path,
+                    line=text[:renders_list.start()].count("\n") + 1,
+                    snippet="`.map()` renders a list but no zero-length branch was found in this file.",
+                    cwe_or_standard="NN/g Heuristic 1 - Visibility of System Status",
+                    remediation=(
+                        "When the array is empty the user sees a blank screen and cannot tell "
+                        "whether it is loading, broken, or genuinely empty. Render an explicit "
+                        "empty state with a clear next action."
+                    ),
                     confidence="MEDIUM",
                 )
             )
@@ -697,6 +890,7 @@ def check_live_url_posture(target_url: str) -> List[Finding]:
                 snippet=str(exc)[:140],
                 cwe_or_standard="Live Deployment Check",
                 remediation="Verify the local or staging server is running before executing `--url` posture checks.",
+                kind="skipped_check",
             )
         )
         return findings
@@ -1222,6 +1416,7 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
                 cwe_or_standard="Informational",
                 remediation="Re-run without --offline to query the OSV vulnerability database.",
                 confidence="HIGH",
+                    kind="skipped_check",
             )
         )
         return findings
@@ -1248,6 +1443,7 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
                 cwe_or_standard="Informational",
                 remediation="Check network access, or run with --offline to skip this stage deliberately.",
                 confidence="HIGH",
+                    kind="skipped_check",
             )
         )
         return findings
@@ -1455,6 +1651,7 @@ def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
                 snippet=str(exc)[:140], cwe_or_standard="Informational",
                 remediation="Confirm the file is a valid APK/AAB/IPA archive.",
                 confidence="HIGH",
+                    kind="skipped_check",
             )
         )
         return findings
@@ -1834,17 +2031,35 @@ def build_sarif(findings: List[Finding], root: Path) -> Dict:
 
 
 def compute_readiness_score(findings: List[Finding]) -> Tuple[int, str]:
+    """Score real findings only, and never certify an audit that did not finish.
+
+    A check that could not run is NOT evidence of safety. Counting it as a 1-point
+    LOW finding meant an offline run with every deep stage skipped still scored
+    99/100 and returned "READY TO PUBLISH". Coverage and severity are different
+    axes, so they are tracked separately: skipped checks never affect the score,
+    and their presence downgrades the verdict to INCOMPLETE.
+    """
+    real = [f for f in findings if f.kind != "skipped_check"]
+    skipped = [f for f in findings if f.kind == "skipped_check"]
+
     weights = {"CRITICAL": 25, "HIGH": 10, "MEDIUM": 4, "LOW": 1}
-    penalty = sum(weights.get(f.severity, 1) for f in findings)
+    penalty = sum(weights.get(f.severity, 1) for f in real)
     score = max(0, 100 - penalty)
-    has_blocker = any(f.severity in {"CRITICAL", "HIGH"} for f in findings)
-    if has_blocker:
-        verdict = "BLOCKED (Fix Critical/High findings before publishing)"
-    elif score >= 90:
-        verdict = "READY TO PUBLISH"
-    else:
-        verdict = "NEEDS REVIEW (Address Medium/Low polish items)"
-    return score, verdict
+
+    if any(f.severity in {"CRITICAL", "HIGH"} for f in real):
+        return score, "BLOCKED (Fix Critical/High findings before publishing)"
+
+    if skipped:
+        n = len(skipped)
+        names = ", ".join(sorted({f.title for f in skipped}))
+        return score, (
+            f"INCOMPLETE ({n} check{'s' if n != 1 else ''} did not run: {names}). "
+            "Not certified - re-run with the missing checks before publishing."
+        )
+
+    if score >= 90:
+        return score, "READY TO PUBLISH"
+    return score, "NEEDS REVIEW (Address Medium/Low polish items)"
 
 
 def redact_findings(findings: List[Finding]) -> None:
@@ -1899,6 +2114,9 @@ def main() -> int:
     gate.add_argument("--fail-on-high", action="store_true", help="Exit 1 if CRITICAL or HIGH issues exist")
     gate.add_argument("--fail-on", choices=["critical", "high", "medium", "low"],
                       help="Exit 1 if any finding at or above this severity exists")
+    gate.add_argument("--fail-on-incomplete", action="store_true",
+                      help="Exit 1 if any check could not run. Use this when a green pipeline "
+                           "must mean 'fully audited', not merely 'nothing found'.")
 
     scope = parser.add_argument_group("scope")
     scope.add_argument("--diff", metavar="REF", nargs="?", const="origin/main",
@@ -2008,6 +2226,11 @@ def main() -> int:
     findings.sort(key=lambda f: (sev_rank.get(f.severity, 9), f.domain, f.file, f.line))
 
     score, verdict = compute_readiness_score(findings)
+
+    # Coverage is a separate axis from severity: a check that did not run is not
+    # a small defect, it is an unknown. Keep the two apart in the report.
+    skipped_checks = [f for f in findings if f.kind == "skipped_check"]
+    findings = [f for f in findings if f.kind != "skipped_check"]
     counts = {
         "CRITICAL": sum(1 for f in findings if f.severity == "CRITICAL"),
         "HIGH": sum(1 for f in findings if f.severity == "HIGH"),
@@ -2037,6 +2260,16 @@ def main() -> int:
         "readiness_score": score,
         "release_verdict": verdict,
         "summary_counts": counts,
+        "coverage": {
+            "complete": not skipped_checks,
+            "checks_skipped": len(skipped_checks),
+            "note": (
+                "All requested checks ran." if not skipped_checks else
+                "Some checks could not run. Their result is UNKNOWN, not clean - "
+                "the score reflects only what was actually inspected."
+            ),
+        },
+        "skipped_checks": [asdict(f) for f in skipped_checks],
         "findings": [asdict(f) for f in findings],
     }
 
@@ -2104,6 +2337,14 @@ def main() -> int:
                 print(f"    Evidence    : {f.snippet}")
                 print(f"    Remediation : {f.remediation}")
                 print()
+        if skipped_checks:
+            print("-" * 76)
+            print(f"CHECKS THAT DID NOT RUN ({len(skipped_checks)}) - result UNKNOWN, not clean:")
+            for sc in skipped_checks:
+                print(f"  - {sc.title}")
+                print(f"      {sc.snippet}")
+                print(f"      {sc.remediation}")
+            print()
         written = [p for p in (args.output, args.sarif, args.sbom) if p]
         if written:
             print("Reports written : " + ", ".join(written))
@@ -2115,6 +2356,8 @@ def main() -> int:
         limit = sev_rank[threshold.upper()]
         if any(sev_rank.get(f.severity, 9) <= limit for f in findings):
             return 1
+    if args.fail_on_incomplete and skipped_checks:
+        return 1
     return 0
 
 

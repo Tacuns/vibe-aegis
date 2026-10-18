@@ -18,7 +18,9 @@
     "readiness_score",
     "release_verdict",
     "summary_counts",
-    "findings"
+    "findings",
+    "coverage",
+    "skipped_checks"
   ],
   "properties": {
     "scanner": {
@@ -70,7 +72,7 @@
       "maximum": 100
     },
     "release_verdict": {
-      "description": "Human-readable release gate decision. Begins with BLOCKED when any CRITICAL or HIGH finding is open.",
+      "description": "Release gate decision. BLOCKED when any CRITICAL/HIGH is open; INCOMPLETE when any check did not run; READY TO PUBLISH only when the audit was complete and scored >= 90.",
       "type": "string",
       "minLength": 1
     },
@@ -167,6 +169,36 @@
       "description": "Number of dependencies parsed from lockfiles and manifests (0 when the dependency stage did not run).",
       "type": "integer",
       "minimum": 0
+    },
+    "coverage": {
+      "description": "Audit completeness, tracked separately from severity. A check that could not run is an UNKNOWN, not a clean result, and never contributes to the score.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "complete",
+        "checks_skipped",
+        "note"
+      ],
+      "properties": {
+        "complete": {
+          "description": "True only when every requested check ran.",
+          "type": "boolean"
+        },
+        "checks_skipped": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "note": {
+          "type": "string"
+        }
+      }
+    },
+    "skipped_checks": {
+      "description": "Checks that could not run (offline mode, unreachable URL or database, unopenable package). Same shape as a finding, but these are coverage gaps: they are excluded from readiness_score and summary_counts, and their presence forces release_verdict to INCOMPLETE.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
     }
   },
   "$defs": {
@@ -184,7 +216,8 @@
         "cwe_or_standard",
         "remediation",
         "confidence",
-        "fingerprint"
+        "fingerprint",
+        "kind"
       ],
       "properties": {
         "rule_id": {
@@ -256,6 +289,14 @@
           "description": "Stable 16-hex-character id derived from rule, file and normalised evidence. Used for baseline suppression and SARIF partialFingerprints; survives line-number shifts.",
           "type": "string",
           "pattern": "^[0-9a-f]{16}$"
+        },
+        "kind": {
+          "description": "'finding' is a real defect that counts toward the score. 'skipped_check' is a check that could not run - it never affects the score and forces an INCOMPLETE verdict.",
+          "enum": [
+            "finding",
+            "skipped_check"
+          ],
+          "default": "finding"
         }
       }
     }
