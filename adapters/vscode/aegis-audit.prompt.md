@@ -1,5 +1,5 @@
 mode: agent
-description: Run the Vibe Aegis 6-Stage Security & UI/UX Audit Loop
+description: Run the Vibe Aegis 10-Stage Security & UI/UX Audit Loop
 
 Run a complete pre-launch **Vibe Aegis** audit on this workspace:
 1. Run `python3 .aegis/scripts/aegis_scan.py . --output .aegis/scan-report.json` in the terminal.

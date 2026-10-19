@@ -3,7 +3,7 @@ name: vibe-aegis
 description: Master 10-stage First-to-Last full-stack safeguard loop for vibe-coded apps across 8 domains. Orchestrates deterministic triage, deep Low-to-Critical security auditing, UI/UX design & browser bug finding, adversarial false-positive filtering (Skeptic), evidence grading (Referee), and guarded branch auto-fixing. Use whenever the user asks to audit, secure, test UI/UX, or prepare an app for production.
 ---
 
-# Vibe Aegis — Master 6-Stage Pre-Launch Audit & Hardening Loop
+# Vibe Aegis — Master 10-Stage Pre-Launch Audit & Hardening Loop
 
 Run a complete, adversarial pre-publication audit across both **Application Security (Low to Critical)** and **UI/UX Design & Functional Completeness** before any vibe-coded application ships to production.
 

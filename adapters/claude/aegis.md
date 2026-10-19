@@ -1,7 +1,9 @@
-description: Run the Vibe Aegis 6-stage pre-launch Security & UI/UX audit loop on this repository
+description: Run the Vibe Aegis pre-launch Security & UI/UX audit loop on this repository
 argument-hint: [--fix] [--url <live-url>]
 
-Execute the **Vibe Aegis 6-Stage Pre-Launch Safeguard Loop** for this repository.
+Execute the **Vibe Aegis Pre-Launch Safeguard Loop** for this repository - the condensed
+form of the 10-stage protocol in `.claude/skills/vibe-aegis/SKILL.md`, which is the
+authoritative description.
 Arguments provided by user: `$ARGUMENTS`
 
 1. **Stage 1 (Deterministic Recon)**:

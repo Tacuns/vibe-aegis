@@ -874,5 +874,225 @@ class TestScannerEdgeCases(unittest.TestCase):
         unreachable = sorted(declared - produced)
         self.assertEqual(unreachable, [], f"schema declares domains no rule emits: {unreachable}")
 
+
+class TestCredentialsNeverLeakIntoReports(unittest.TestCase):
+    """A report gets committed, attached to issues and uploaded as a CI artifact.
+
+    Regression suite for a real leak: a second regex table (`SEC-01B` in
+    SECURITY_PATTERNS) detected provider keys and used the RAW SOURCE LINE as its
+    snippet, while `redact_findings()` only consulted `PROVIDER_SECRETS`. The two
+    tables used different length thresholds, so every key in the gap between them was
+    written verbatim into `.aegis/scan-report.json`.
+    """
+
+    # Keys sized to land in the gap the two tables used to disagree about.
+    SHORT_STRIPE = "sk_live_" + "4eC39HqLyjWDarjt"          # 16 body chars
+    SHORT_GH = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5"    # 30 body chars
+    SHORT_OPENAI = "sk-proj-" + "A1b2C3d4E5f6G7h8I9j0K1"    # 22 body chars
+
+    def _snippets(self, source):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "src/keys.js", source)
+            findings, _ = aegis_scan.scan_repository(root)
+            aegis_scan.redact_findings(findings)
+            return findings
+
+    def _assert_no_key_in_report(self, findings, *secrets):
+        blob = json.dumps([f.__dict__ for f in findings])
+        for secret in secrets:
+            self.assertNotIn(secret, blob,
+                             "a live credential reached the report verbatim")
+
+    def test_short_keys_are_detected_at_all(self):
+        """The gap must be closed by widening detection, not by dropping it."""
+        findings = self._snippets(
+            'const a = "%s";\nconst b = "%s";\nconst c = "%s";\n'
+            % (self.SHORT_STRIPE, self.SHORT_GH, self.SHORT_OPENAI))
+        self.assertGreaterEqual(len([f for f in findings if f.rule_id.startswith("SEC-01")]), 3)
+
+    def test_short_keys_are_redacted_in_the_report(self):
+        findings = self._snippets(
+            'const a = "%s";\nconst b = "%s";\nconst c = "%s";\n'
+            % (self.SHORT_STRIPE, self.SHORT_GH, self.SHORT_OPENAI))
+        self._assert_no_key_in_report(findings, self.SHORT_STRIPE, self.SHORT_GH,
+                                      self.SHORT_OPENAI)
+
+    def test_redaction_survives_an_ellipsis_on_the_line(self):
+        """A JS spread used to switch redaction off for the whole snippet."""
+        key = "sk_live_" + "51QzAbCdEfGhIjKlMnOpQrStUv0123456789wxyz"
+        f = aegis_scan.Finding(
+            rule_id="SEC-01", domain="SECURITY", severity="CRITICAL", title="t",
+            file="x.js", line=1, snippet='new Stripe("%s", { ...opts })' % key,
+            cwe_or_standard="c", remediation="r")
+        aegis_scan.redact_findings([f])
+        self.assertNotIn(key, f.snippet)
+
+    def test_every_key_on_a_line_is_redacted_not_just_the_first(self):
+        a = "sk_live_" + "51QzAbCdEfGhIjKlMnOpQrStUv0123456789wxyz"
+        b = "sk_live_" + "99ZzYyXxWwVvUuTtSsRrQqPpOoNnMmLlKkJjIiHh"
+        f = aegis_scan.Finding(
+            rule_id="SEC-01", domain="SECURITY", severity="CRITICAL", title="t",
+            file="x.js", line=1, snippet='A="%s" B="%s"' % (a, b),
+            cwe_or_standard="c", remediation="r")
+        aegis_scan.redact_findings([f])
+        self.assertNotIn(a, f.snippet)
+        self.assertNotIn(b, f.snippet)
+
+    def test_no_rule_outside_scan_secrets_quotes_a_provider_key(self):
+        """Detection of provider credentials must live in exactly ONE place.
+
+        If a future rule starts matching raw key text again, its snippet will be the
+        source line and this guard fires before the leak ships.
+        """
+        key = "sk_live_" + "51QzAbCdEfGhIjKlMnOpQrStUv0123456789wxyz"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "src/keys.js", 'const stripe = new Stripe("%s", {...o});\n' % key)
+            findings, _ = aegis_scan.scan_repository(root)
+            # Before redaction runs at all: nothing may be holding the raw key.
+            holding = [f.rule_id for f in findings if key in f.snippet]
+            self.assertEqual(holding, [],
+                             "these rules build snippets from unredacted source: %s" % holding)
+
+
+class TestJsxAttributeOrderDoesNotChangeTheVerdict(unittest.TestCase):
+    """`[^>]*` cannot scan a JSX tag, because `=>` contains `>`.
+
+    The lookaheads stopped at the first arrow function, so an `aria-label` written
+    AFTER an `onChange` was invisible and identical, correct code was flagged or not
+    depending purely on attribute order.
+    """
+
+    def _rules(self, jsx):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "src/C.jsx", jsx)
+            findings, _ = aegis_scan.scan_repository(root)
+            return {f.rule_id for f in findings}
+
+    def test_accessible_name_after_an_arrow_handler_is_seen(self):
+        self.assertNotIn("UX-06", self._rules(
+            '<input onChange={(e) => setName(e.target.value)} aria-label="Full name" />'))
+
+    def test_accessible_name_before_an_arrow_handler_is_seen(self):
+        self.assertNotIn("UX-06", self._rules(
+            '<input aria-label="Full name" onChange={(e) => setName(e.target.value)} />'))
+
+    def test_alt_after_an_arrow_handler_is_seen(self):
+        self.assertNotIn("UX-07", self._rules(
+            '<img onLoad={(e) => done(e)} alt="Revenue chart" src="/c.png" />'))
+
+    def test_role_and_tabindex_after_an_arrow_handler_are_seen(self):
+        self.assertNotIn("UX-12", self._rules(
+            '<div onClick={(e) => pick(e)} role="button" tabIndex={0} onKeyDown={k}>x</div>'))
+
+    def test_genuinely_inaccessible_controls_still_fire(self):
+        """Widening the scan must not blunt the rules."""
+        rules = self._rules(
+            '<input placeholder="Email" onChange={(e) => setEmail(e.target.value)} />\n'
+            '<img src="/a.png" onLoad={(e) => done(e)} />\n'
+            '<div onClick={(e) => pick(e)}>click</div>\n'
+            '<a href="#" onClick={(e) => del(e)}>Delete</a>\n'
+            '<a href="#">Terms</a>\n')
+        for expected in ("UX-06", "UX-07", "UX-12", "UX-11", "UX-01"):
+            self.assertIn(expected, rules, "%s stopped firing" % expected)
+
+
+class TestFormControlLabelResolution(unittest.TestCase):
+    """`UX-06` is a whole-file question, not a per-element one."""
+
+    def _rules(self, jsx):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "src/F.jsx", jsx)
+            findings, _ = aegis_scan.scan_repository(root)
+            return {f.rule_id for f in findings}
+
+    def test_input_with_a_label_pointing_at_its_id_is_accepted(self):
+        self.assertNotIn("UX-06", self._rules(
+            '<label htmlFor="city">City</label><input id="city" />'))
+
+    def test_input_with_an_id_nothing_points_at_is_flagged(self):
+        """The old rule treated any `id=` as an accessible name and passed this."""
+        self.assertIn("UX-06", self._rules('<input id="ghost" />'))
+
+    def test_placeholder_is_not_an_accessible_name(self):
+        self.assertIn("UX-06", self._rules('<input placeholder="Email" />'))
+
+    def test_hidden_and_submit_inputs_need_no_name(self):
+        self.assertNotIn("UX-06", self._rules(
+            '<input type="hidden" name="csrf" /><input type="submit" value="Go" />'))
+
+
+class TestAuthGuardRecognition(unittest.TestCase):
+    """Most projects wrap their auth check in a local helper."""
+
+    def _rules(self, ts):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "app/api/items/route.ts", ts)
+            findings, _ = aegis_scan.scan_repository(root)
+            return {f.rule_id for f in findings}
+
+    def test_hand_rolled_guard_counts_as_authentication(self):
+        self.assertNotIn("SEC-03", self._rules(
+            'import { requireUser } from "@/lib/guard";\n'
+            'export async function DELETE(req: Request) {\n'
+            '  const user = await requireUser(req);\n'
+            '  return Response.json({ ok: user.id });\n}\n'))
+
+    def test_route_with_no_guard_at_all_still_fires(self):
+        self.assertIn("SEC-03", self._rules(
+            'export async function DELETE(req){ return db.order.delete({where:{id:req.body.id}}); }'))
+
+
+class TestArrayFormExecIsNotCommandInjection(unittest.TestCase):
+    """`FLOW-02` flagged the very fix its own remediation recommends.
+
+    `spawn`/`execFile` given an argument ARRAY start no shell, so the arguments reach
+    execve() as separate strings and cannot be reparsed as commands. Reporting that as a
+    CRITICAL command injection was a false positive - and it was the single finding
+    blocking this repository's own release gate.
+    """
+
+    SAFE_SPAWN = (
+        'const args = process.argv.slice(2);\n'
+        'const res = spawnSync("bash", [script, ...args], { stdio: "inherit" });\n'
+    )
+    SAFE_EXECFILE = (
+        'const args = process.argv.slice(2);\n'
+        'execFileSync("git", ["log", ...args]);\n'
+    )
+    UNSAFE_STRING = (
+        'const args = process.argv.slice(2);\n'
+        'execSync("git log " + args);\n'
+    )
+    UNSAFE_SHELL_TRUE = (
+        'const args = process.argv.slice(2);\n'
+        'spawnSync("bash", [script, ...args], { shell: true });\n'
+    )
+
+    def _rules(self, js):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "bin/cli.mjs", js)
+            findings, _ = aegis_scan.scan_repository(root)
+            return {f.rule_id for f in findings}
+
+    def test_argv_into_array_form_spawn_is_safe(self):
+        self.assertNotIn("FLOW-02", self._rules(self.SAFE_SPAWN))
+
+    def test_argv_into_execfile_is_safe(self):
+        self.assertNotIn("FLOW-02", self._rules(self.SAFE_EXECFILE))
+
+    def test_argv_into_a_shell_string_still_fires(self):
+        self.assertIn("FLOW-02", self._rules(self.UNSAFE_STRING))
+
+    def test_array_form_with_shell_true_still_fires(self):
+        """`shell: true` re-introduces the shell; the array no longer protects you."""
+        self.assertIn("FLOW-02", self._rules(self.UNSAFE_SHELL_TRUE))
+
+
 if __name__ == "__main__":
     unittest.main()

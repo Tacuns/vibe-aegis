@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-SCANNER_VERSION = "2.4.0"
+SCANNER_VERSION = "2.5.0"
 
 IGNORE_DIRS: Set[str] = {
     ".git", "node_modules", ".next", "dist", "build", "out", ".vercel",
@@ -80,17 +80,14 @@ SECURITY_PATTERNS: List[Tuple[str, str, str, re.Pattern, str, str, Optional[Set[
         "Move sensitive keys to server-only environment variables (remove NEXT_PUBLIC_/VITE_/EXPO_PUBLIC_ prefix) and access them only inside server routes.",
         None,
     ),
-    (
-        "SEC-01B",
-        "CRITICAL",
-        "Hardcoded Live API Key or Private Secret",
-        re.compile(
-            r"(?:sk_live_[0-9a-zA-Z]{16,}|rk_live_[0-9a-zA-Z]{16,}|sk-proj-[0-9a-zA-Z\-_]{20,}|ghp_[0-9a-zA-Z]{30,}|xox[baprs]-[0-9a-zA-Z\-]{10,}|AIza[0-9A-Za-z\-_]{35}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)"
-        ),
-        "CWE-798 / OWASP A02",
-        "Revoke the exposed credential immediately, load it from process.env / os.environ, and add secret files to .gitignore.",
-        None,
-    ),
+    # NOTE: there is deliberately no raw-regex rule for hardcoded provider keys here.
+    # One existed, and it was a credential leak. Its snippet was the raw source line,
+    # while `redact_findings()` only knows the `PROVIDER_SECRETS` table - so any key the
+    # two tables disagreed about (they used different length thresholds) was written
+    # verbatim into `.aegis/scan-report.json`, which the shipped CI adapter uploads as a
+    # build artifact. Provider-format credentials are detected in exactly one place,
+    # `scan_secrets_in_text()`, which redacts at construction time. Keep it that way:
+    # a credential must never exist unredacted inside a Finding.
     (
         "SEC-02",
         "CRITICAL",
@@ -247,6 +244,22 @@ SECURITY_PATTERNS: List[Tuple[str, str, str, re.Pattern, str, str, Optional[Set[
 # ---------------------------------------------------------------------------
 # Regex Pattern Definitions: UI/UX Design & Frontend Bugs
 # ---------------------------------------------------------------------------
+
+# The inside of a JSX/HTML opening tag.
+#
+# `[^>]*` is the obvious spelling and it is wrong, because an arrow function is an
+# attribute value and `=>` contains `>`. The scan stopped at the first handler, so a
+# lookahead for `aria-label` never saw an `aria-label` written after an `onChange`, and
+# the verdict depended on attribute ORDER:
+#
+#     <input aria-label="Email" onChange={(e) => f(e)} />   passed
+#     <input onChange={(e) => f(e)} aria-label="Email" />   flagged, identically correct
+#
+# A `>` is therefore allowed when it is preceded by `=`. Every character position has
+# exactly one way to match - `[^>]` and `(?<==)>` cannot both apply - so the group stays
+# unambiguous and cannot backtrack exponentially on a long unclosed tag.
+_IN_TAG = r"(?:[^>]|(?<==)>)*"
+
 UIUX_PATTERNS: List[Tuple[str, str, str, re.Pattern, str, str, Optional[Set[str]]]] = [
     (
         "UX-01",
@@ -256,7 +269,7 @@ UIUX_PATTERNS: List[Tuple[str, str, str, re.Pattern, str, str, Optional[Set[str]
         # handler that does nothing. An href="#" that DOES have a handler is a
         # different bug with a different fix - see UX-11.
         re.compile(
-            r"""(?:<a(?![^>]*\bonClick)[^>]*\bhref=["']#["'][^>]*>"""
+            r"""(?:<a(?!""" + _IN_TAG + r"""\bonClick)""" + _IN_TAG + r"""\bhref=["']#["']""" + _IN_TAG + r""">"""
             r"""|onClick=\{\s*\(\)\s*=>\s*\{\s*(?:console\.log\([^)]*\)\s*;?\s*)?\}\s*\})"""
         ),
         "WCAG 2.2 AA - 2.4.4 Link Purpose / UI Functional Completeness",
@@ -270,8 +283,8 @@ UIUX_PATTERNS: List[Tuple[str, str, str, re.Pattern, str, str, Optional[Set[str]
         "Action Rendered As A Link Instead Of A Button",
         # Works with a mouse, broken for everyone else.
         re.compile(
-            r"""<a(?=[^>]*\bhref=["']#["'])(?=[^>]*\bonClick)[^>]*>"""
-            r"""|<a(?=[^>]*\bhref=["']javascript:)[^>]*>""",
+            r"""<a(?=""" + _IN_TAG + r"""\bhref=["']#["'])(?=""" + _IN_TAG + r"""\bonClick)""" + _IN_TAG + r""">"""
+            r"""|<a(?=""" + _IN_TAG + r"""\bhref=["']javascript:)""" + _IN_TAG + r""">""",
             re.IGNORECASE,
         ),
         "WCAG 2.2 AA - 4.1.2 Name, Role, Value",
@@ -288,7 +301,8 @@ UIUX_PATTERNS: List[Tuple[str, str, str, re.Pattern, str, str, Optional[Set[str]
         "Clickable div or span That Keyboard Users Cannot Reach",
         # A div with onClick and no role/tabIndex is invisible to keyboard and AT.
         re.compile(
-            r"""<(?:div|span|li|td)(?![^>]*\brole=)(?![^>]*\btabIndex)[^>]*\bonClick=\{""",
+            r"""<(?:div|span|li|td)(?!""" + _IN_TAG + r"""\brole=)(?!""" + _IN_TAG + r"""\btabIndex)"""
+            + _IN_TAG + r"""\bonClick=\{""",
             re.IGNORECASE,
         ),
         "WCAG 2.2 AA - 2.1.1 Keyboard, 4.1.2 Name, Role, Value",
@@ -322,28 +336,17 @@ UIUX_PATTERNS: List[Tuple[str, str, str, re.Pattern, str, str, Optional[Set[str]
         "Use fluid widths (w-full max-w-[...]) or responsive breakpoint prefixes (md:w-[...]) so layouts do not overflow on 320px–375px mobile screens.",
         STYLE_EXTENSIONS,
     ),
-    (
-        "UX-06",
-        "MEDIUM",
-        "Form Control Without An Accessible Name",
-        # A placeholder is not a label: it vanishes on focus and many screen
-        # readers ignore it. aria-labelledby / an id tied to <label for> count.
-        re.compile(
-            r"""<(?:input|select|textarea)(?![^>]*\b(?:aria-label|aria-labelledby|id)=)(?![^>]*type=["'](?:hidden|submit|button)["'])[^>]*>""",
-            re.IGNORECASE,
-        ),
-        "WCAG 2.2 AA - 3.3.2 Labels or Instructions, 4.1.2 Name, Role, Value",
-        "This control has no accessible name, so a screen reader announces only its type. "
-        "Add a visible `<label for=...>` tied to the control' + chr(39) + 's `id`, or an `aria-label`. "
-        "A `placeholder` is not a label - it disappears as soon as the user types.",
-        FRONTEND_EXTENSIONS,
-    ),
+    # UX-06 is NOT here. An accessible name cannot be decided from one element in
+    # isolation: `<input id="city">` is correct if and only if some `<label for="city">`
+    # exists elsewhere in the file. Treating a bare `id=` as a name (as this rule once
+    # did) silently passes every unlabelled control that happens to have an id. See
+    # `check_form_control_labels()`.
     (
         "UX-07",
         "MEDIUM",
         "Image Element Missing `alt` Attribute",
         re.compile(
-            r"<img\b(?![^>]*\balt=)[^>]*>",
+            r"<img\b(?!" + _IN_TAG + r"\balt=)" + _IN_TAG + r">",
             re.IGNORECASE,
         ),
         "WCAG 2.2 AA (1.1.1 Non-text Content)",
@@ -475,6 +478,61 @@ def mask_comments(text: str, ext: str) -> str:
     return "".join(out)
 
 
+_FORM_CONTROL = re.compile(r"<(?:input|select|textarea)\b" + _IN_TAG + r">", re.IGNORECASE)
+_LABEL_TARGET = re.compile(r"""\b(?:htmlFor|for)\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_CONTROL_ID = re.compile(r"""\bid\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_SELF_NAMED = re.compile(r"""\b(?:aria-label|aria-labelledby|title)\s*=""", re.IGNORECASE)
+_NEEDS_NO_NAME = re.compile(r"""\btype\s*=\s*["'](?:hidden|submit|button|reset|image)["']""", re.IGNORECASE)
+
+
+def check_form_control_labels(rel_path: str, text: str) -> List[Finding]:
+    """`UX-06` - a form control a screen reader cannot announce.
+
+    Resolved across the whole file rather than per element, because the two correct
+    spellings put the name somewhere else:
+
+        <label htmlFor="city">City</label><input id="city" />     correct
+        <input aria-label="City" />                               correct
+        <input id="city" />            (no label points at it)    flagged
+        <input placeholder="City" />   placeholder is not a name  flagged
+
+    A `placeholder` deliberately does not count: it disappears the moment the user
+    types, and several screen readers ignore it outright.
+    """
+    findings: List[Finding] = []
+    labelled_ids = {m.group(1) for m in _LABEL_TARGET.finditer(text)}
+    lines = text.splitlines()
+
+    for m in _FORM_CONTROL.finditer(text):
+        tag = m.group(0)
+        if _NEEDS_NO_NAME.search(tag) or _SELF_NAMED.search(tag):
+            continue
+        id_match = _CONTROL_ID.search(tag)
+        if id_match and id_match.group(1) in labelled_ids:
+            continue
+        line_no = text[:m.start()].count("\n") + 1
+        findings.append(
+            Finding(
+                rule_id="UX-06",
+                domain="UI_UX",
+                severity="MEDIUM",
+                title="Form Control Without An Accessible Name",
+                file=rel_path,
+                line=line_no,
+                snippet=lines[line_no - 1].strip()[:140] if line_no <= len(lines) else tag[:140],
+                cwe_or_standard="WCAG 2.2 AA - 3.3.2 Labels or Instructions, 4.1.2 Name, Role, Value",
+                remediation=(
+                    "This control has no accessible name, so a screen reader announces only its "
+                    "type. Add a visible `<label htmlFor=\"...\">` tied to the control's `id`, or "
+                    "an `aria-label`. A `placeholder` is not a label - it disappears as soon as "
+                    "the user types."
+                ),
+                confidence="MEDIUM",
+            )
+        )
+    return findings
+
+
 def is_test_path(rel_path: str) -> bool:
     """Test fixtures deliberately contain insecure code. Judging production
     readiness by them is meaningless, so they are excluded unless --include-tests."""
@@ -603,7 +661,12 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
                 r"passport\.authenticate|auth\.protect|requireSession|withApiAuth|"
                 r"ensureAuthenticated|isAuthenticated|Depends\(|Security\(|"
                 r"@login_required|@jwt_required|authGuard|AuthGuard|verifySession|"
-                r"getServerAuthSession|clerkClient|currentUser|withAuth)",
+                r"getServerAuthSession|clerkClient|currentUser|withAuth|"
+                # Hand-rolled guards. Most projects wrap their auth check in a local
+                # helper, and an allowlist that only knows vendor SDK names reports
+                # every one of those routes as unauthenticated.
+                r"require(?:User|Session|Auth|Admin|Login)|assert(?:User|Auth|Session)|"
+                r"get(?:Current)?User\(|getSession\(|checkAuth|ensureUser|authenticate\()",
                 text,
             )
         )
@@ -973,6 +1036,9 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
                         )
                     )
 
+            if ext in FRONTEND_EXTENSIONS:
+                findings.extend(check_form_control_labels(rel_path, text))
+
             findings.extend(check_contextual_file_rules(rel_path, ext, text))
 
     return findings, scanned_files
@@ -1201,14 +1267,20 @@ DOMAIN_PATTERNS: List[Tuple[str, str, str, str, re.Pattern, str, str, Optional[S
 
 PROVIDER_SECRETS: List[Tuple[str, str, re.Pattern]] = [
     ("AWS Access Key ID", "CRITICAL", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
-    ("Stripe Live Secret Key", "CRITICAL", re.compile(r"\b(?:sk|rk)_live_[0-9a-zA-Z]{20,}")),
-    ("Stripe Test Secret Key", "MEDIUM", re.compile(r"\b(?:sk|rk)_test_[0-9a-zA-Z]{20,}")),
-    ("GitHub Personal Access Token", "CRITICAL", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z]{36,}")),
+    # Length thresholds are deliberately permissive. These patterns are the ONLY place a
+    # provider credential is recognised, and `redact_findings()` reuses this exact table,
+    # so anything these miss is both undetected AND unredactable if some other rule
+    # happens to quote the line. Err on the side of catching a short key.
+    ("Stripe Live Secret Key", "CRITICAL", re.compile(r"\b(?:sk|rk)_live_[0-9a-zA-Z]{16,}")),
+    ("Stripe Test Secret Key", "MEDIUM", re.compile(r"\b(?:sk|rk)_test_[0-9a-zA-Z]{16,}")),
+    ("GitHub Personal Access Token", "CRITICAL", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[0-9A-Za-z]{30,}")),
     ("GitHub Fine-Grained Token", "CRITICAL", re.compile(r"\bgithub_pat_[0-9A-Za-z_]{40,}")),
-    ("Google API Key", "HIGH", re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b")),
+    # No trailing \b: the character class is fixed-width, so a 36-character key would
+    # fail the boundary and slip through entirely.
+    ("Google API Key", "HIGH", re.compile(r"\bAIza[0-9A-Za-z\-_]{35}")),
     ("Slack Token", "HIGH", re.compile(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}")),
     ("Slack Webhook URL", "HIGH", re.compile(r"https://hooks\.slack\.com/services/T[0-9A-Za-z_\-/]{20,}")),
-    ("OpenAI API Key", "CRITICAL", re.compile(r"\bsk-(?:proj-)?[0-9A-Za-z\-_]{32,}")),
+    ("OpenAI API Key", "CRITICAL", re.compile(r"\bsk-proj-[0-9A-Za-z\-_]{20,}|\bsk-[0-9A-Za-z\-_]{32,}")),
     ("Anthropic API Key", "CRITICAL", re.compile(r"\bsk-ant-[0-9A-Za-z\-_]{32,}")),
     ("SendGrid API Key", "HIGH", re.compile(r"\bSG\.[0-9A-Za-z\-_]{20,}\.[0-9A-Za-z\-_]{20,}")),
     ("Twilio Account SID", "HIGH", re.compile(r"\bAC[0-9a-fA-F]{32}\b")),
@@ -1852,15 +1924,29 @@ def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
                     )
                 )
             if "debuggable" in decoded:
+                # Binary AndroidManifest stores booleans as integers in a separate value
+                # array, so the string pool proves only that the ATTRIBUTE is present -
+                # `android:debuggable="false"`, which is the correct hardening, leaves the
+                # same string behind. Reporting this HIGH failed `--fail-on-high` on
+                # properly configured release builds. It is a prompt to verify, not a
+                # defect we can demonstrate, so it is graded accordingly.
                 findings.append(
                     Finding(
-                        rule_id="ART-14", domain="ARTIFACT", severity="HIGH",
-                        title="Manifest May Mark The App Debuggable",
+                        rule_id="ART-14", domain="ARTIFACT", severity="MEDIUM",
+                        title="Manifest References The `debuggable` Attribute - Verify It Is False",
                         file=f"{rel}!{manifest_name}", line=0,
-                        snippet="`debuggable` appears in the manifest of a packaged build.",
+                        snippet=(
+                            "`debuggable` appears in the manifest string pool. Its VALUE cannot be "
+                            "read from a binary manifest without full decoding, so this may be the "
+                            "correct `android:debuggable=\"false\"`."
+                        ),
                         cwe_or_standard="CWE-489 Active Debug Code / OWASP MASVS-RESILIENCE",
-                        remediation="Ensure `android:debuggable` is false (or absent) in release builds - a debuggable app lets anyone inspect its memory and data.",
-                        confidence="MEDIUM",
+                        remediation=(
+                            "Confirm with `aapt dump badging <pkg> | grep debuggable` (or `apkanalyzer "
+                            "manifest debuggable`) that the release build is not debuggable - a "
+                            "debuggable app lets anyone inspect its memory and data."
+                        ),
+                        confidence="LOW",
                     )
                 )
 
@@ -1939,7 +2025,7 @@ TAINT_SINKS: List[Tuple[str, str, str, str, re.Pattern]] = [
      re.compile(r"(?:\$queryRawUnsafe|\$executeRawUnsafe|\.query\(|execute\(|cursor\.execute\()")),
     ("FLOW-02", "CRITICAL", "Untrusted Input Reaches A Shell Or Code Execution Sink",
      "CWE-78 Command Injection / CWE-94 Code Injection / OWASP A03",
-     re.compile(r"(?:child_process\.)?exec(?:Sync)?\(|spawn(?:Sync)?\(|\beval\(|new\s+Function\(|os\.system\(|subprocess\.")),
+     re.compile(r"(?:child_process\.)?exec(?:Sync)?\(|spawn(?:Sync)?\(|execFile(?:Sync)?\(|\beval\(|new\s+Function\(|os\.system\(|subprocess\.")),
     ("FLOW-03", "HIGH", "Untrusted Input Reaches An HTML Rendering Sink",
      "CWE-79 Cross-Site Scripting / OWASP A03",
      re.compile(r"dangerouslySetInnerHTML|\.innerHTML\s*=|v-html|document\.write\(")),
@@ -1950,6 +2036,14 @@ TAINT_SINKS: List[Tuple[str, str, str, str, re.Pattern]] = [
      "CWE-22 Path Traversal / OWASP A01",
      re.compile(r"readFile(?:Sync)?\(|writeFile(?:Sync)?\(|createReadStream\(|open\(|unlink\(|path\.join\(")),
 ]
+
+# `spawn`/`execFile` given an ARGUMENT ARRAY start no shell, so the arguments are passed
+# to execve() as separate strings and cannot be reinterpreted as commands. That is the
+# fix FLOW-02's own remediation tells you to apply - flagging it reported correct code as
+# a CRITICAL command injection, and it was the single finding blocking this repo's own
+# release gate. `exec`/`execSync` still take a command STRING and remain sinks.
+_SAFE_ARGV_EXEC = re.compile(r"\b(?:spawn|spawnSync|execFile|execFileSync)\s*\([^)]*,\s*\[")
+_SHELL_TRUE = re.compile(r"shell\s*:\s*true|shell\s*=\s*True")
 
 FUNCTION_SPLIT = re.compile(
     r"(?m)^(?=\s*(?:export\s+)?(?:async\s+)?function\s|\s*(?:export\s+)?const\s+\w+\s*=\s*(?:async\s*)?\(|\s*(?:public|private|protected)?\s*async\s+\w+\s*\()"
@@ -2014,6 +2108,9 @@ def analyze_data_flow(rel_path: str, ext: str, text: str) -> List[Finding]:
             for rule_id, severity, title, standard, sink in TAINT_SINKS:
                 if not sink.search(line):
                     continue
+                if (rule_id == "FLOW-02" and _SAFE_ARGV_EXEC.search(line)
+                        and not _SHELL_TRUE.search(line)):
+                    continue  # array-form exec, no shell - this is the correct pattern
                 if SANITIZERS.search(line):
                     continue
                 # Name the variable that CARRIES the taint, not the one being assigned here.
@@ -2234,12 +2331,31 @@ def compute_readiness_score(
 
 
 def redact_findings(findings: List[Finding]) -> None:
-    """A report gets committed and shared. It must never carry a live credential."""
+    """A report gets committed and shared. It must never carry a live credential.
+
+    This is the last line of defence, so it takes no shortcuts:
+
+      * EVERY match of EVERY pattern is redacted, not just the first. Two keys on one
+        line used to mean the second one shipped in the clear.
+      * There is no "already looks redacted" bail-out. Skipping the whole snippet when
+        it merely CONTAINED "..." meant a JS spread (`{...opts}`) or a Python ellipsis
+        anywhere on the line switched redaction off for the real credential beside it.
+      * Title and remediation are swept too - a title interpolates `rel_path`, and a
+        credential in a filename is still a credential.
+
+    Redacting an already-redacted value is harmless: `redact()` output does not match
+    any provider pattern, so a second pass is a no-op.
+    """
     for f in findings:
         for _label, _sev, pattern in PROVIDER_SECRETS:
-            m = pattern.search(f.snippet)
-            if m and "..." not in f.snippet:
-                f.snippet = f.snippet.replace(m.group(0), redact(m.group(0)))
+            for field in ("snippet", "title", "remediation"):
+                text = getattr(f, field, "") or ""
+                # Longest first, so a short match inside a longer one cannot corrupt it.
+                hits = sorted({m.group(0) for m in pattern.finditer(text)},
+                              key=len, reverse=True)
+                for hit in hits:
+                    text = text.replace(hit, redact(hit))
+                setattr(f, field, text)
 
 
 def dedupe(findings: List[Finding]) -> List[Finding]:

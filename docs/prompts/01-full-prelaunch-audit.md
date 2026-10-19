@@ -1,6 +1,6 @@
 # Prompt 01 - Full Pre-Launch Audit (Security + UI/UX)
 
-Runs the complete 6-stage adversarial loop and writes `.aegis/AUDIT_REPORT.md` with a 0-100 Release Readiness Score.
+Runs the complete 10-stage adversarial loop and writes `.aegis/AUDIT_REPORT.md` with a 0-100 Release Readiness Score.
 
 Works in: **Claude Code, VS Code Copilot Chat, OpenAI Codex, Cursor, Windsurf, Cline, Gemini CLI, ChatGPT, Claude, Gemini, Perplexity, Grok.**
 
@@ -12,7 +12,7 @@ Paste this into any AI chat or terminal agent while your project is open:
 
 ```text
 Read https://raw.githubusercontent.com/Tacuns/vibe-aegis/main/llms-full.txt
-Then run the complete Vibe Aegis 6-stage pre-launch audit on this project and write .aegis/AUDIT_REPORT.md.
+Then run the complete Vibe Aegis 10-stage pre-launch audit on this project and write .aegis/AUDIT_REPORT.md.
 ```
 
 If your agent cannot fetch URLs, clone first and point it at the local copy:

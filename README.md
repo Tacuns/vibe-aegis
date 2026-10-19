@@ -17,7 +17,7 @@
 Open your project in **Claude Code, VS Code Copilot, OpenAI Codex, Cursor, Windsurf, Cline, Gemini CLI**, ChatGPT, Claude, Gemini, Perplexity or Grok — and paste this. Nothing to clone, nothing to install first:
 
 ```text
-Read https://raw.githubusercontent.com/Tacuns/vibe-aegis/main/llms.txt and run the Vibe Aegis setup and 6-stage Security + UI/UX audit in this project.
+Read https://raw.githubusercontent.com/Tacuns/vibe-aegis/main/llms.txt and run the Vibe Aegis setup and 10-stage Security + UI/UX audit in this project.
 ```
 
 That single URL teaches the agent the whole framework. For everything in one fetch, point it at [`llms-full.txt`](llms-full.txt) instead.
@@ -191,6 +191,22 @@ python3 scripts/aegis_scan.py /path/to/your/app --fail-on-high
 | `--all` | Enable artifacts + git history + dependencies |
 | `--offline` | Never make a network request |
 
+**What leaves your machine.** The scanner is offline by default and sends nothing anywhere —
+there is no telemetry, ever. Exactly two flags make a network request, and both are opt-in:
+
+| Flag | Request | What is disclosed |
+| :--- | :--- | :--- |
+| `--deps` (also via `--all`) | `POST https://api.osv.dev/v1/querybatch` | Your dependency **names and versions** — not your source, not your file names |
+| `--url <URL>` | `GET` against the URL you supply | Nothing of yours; it reads your own deployment's headers |
+
+`--offline` hard-disables both. A stage that could not reach the network is recorded as a
+coverage gap (`DEP-00` / `LIVE-00`) and **blocks** a `READY TO PUBLISH` verdict rather than
+silently passing.
+
+**Credentials in reports are redacted** to first 6 + last 4 characters before anything is
+written, so `.aegis/scan-report.json` is safe to commit, attach to an issue, or upload as a
+CI artifact.
+
 **Exit codes:** `0` success · `1` blocking findings with a gate flag · `2` target path does not exist.
 
 Also honoured: a `.aegis-ignore` file in the repo root, one entry per line — either a rule id (`SEC-03`) or a path glob (`src/legacy/**`).
@@ -283,7 +299,7 @@ Source code says what you wrote. The build output says what ships. Because the s
 | `ART-11` | Unsigned package | High | No signature block under `META-INF/` |
 | `ART-12` | Config bundled in app | Critical | `.env`, `id_rsa` or `service-account.json` inside the `.apk`/`.aab`/`.ipa` |
 | `ART-13` | Cleartext traffic | Medium | Manifest references cleartext HTTP |
-| `ART-14` | Debuggable release | High | Manifest may mark the app debuggable |
+| `ART-14` | Debuggable release | Medium | The `debuggable` attribute appears in the manifest. A binary manifest stores the *value* separately, so correct `debuggable="false"` hardening looks identical — verify with `aapt dump badging` |
 | `ART-15` | Credential in package | Critical–Medium | A key embedded in packaged assets, resources or code |
 
 ### G. Supply Chain & Git History
@@ -394,7 +410,7 @@ vibe-aegis/
 │   └── scan-report.schema.json                # JSON Schema (Draft 2020-12) for .aegis/scan-report.json
 ├── skills/
 │   ├── vibe-aegis/
-│   │   ├── SKILL.md                           # Master 6-stage orchestrator skill
+│   │   ├── SKILL.md                           # Master 10-stage orchestrator skill
 │   │   └── agents/openai.yaml                 # OpenAI/Codex workspace skill metadata
 │   ├── security-redteam-loop/
 │   │   ├── SKILL.md                           # Deep security auditor skill (OWASP, RLS, Auth, Payments, AI/LLM)
@@ -407,7 +423,7 @@ vibe-aegis/
 │       └── agents/openai.yaml                 # OpenAI/Codex workspace skill metadata
 ├── docs/
 │   └── prompts/
-│       ├── 01-full-prelaunch-audit.md         # Full 6-stage Security + UI/UX audit prompt
+│       ├── 01-full-prelaunch-audit.md         # Full 10-stage Security + UI/UX audit prompt
 │       ├── 02-security-redteam-loop.md        # Security-only deep red-team prompt
 │       └── 03-ui-ux-and-browser-qa.md         # UI/UX & accessibility browser QA prompt
 ├── adapters/

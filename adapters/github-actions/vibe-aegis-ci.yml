@@ -6,6 +6,11 @@ on:
   push:
     branches: [main, master]
 
+# The gate only ever reads your code. Least privilege is the default here so that a
+# compromised dependency in a scanned PR cannot push, comment, or mint a package token.
+permissions:
+  contents: read
+
 jobs:
   aegis-gate:
     name: Security & UI/UX Safeguard Scan
@@ -27,9 +32,13 @@ jobs:
             python3 scripts/aegis_scan.py . --output .aegis/scan-report.json --fail-on-high
           fi
 
+      # Every credential in the report is redacted to first 6 + last 4 characters
+      # before it is written. On a PUBLIC repository a build artifact is downloadable
+      # by anyone, so if you extend this workflow to emit anything else, redact it too.
       - name: Upload Audit Report Artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: vibe-aegis-scan-report
           path: .aegis/scan-report.json
+          retention-days: 14

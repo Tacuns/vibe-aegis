@@ -48,7 +48,7 @@ You are operating in a repository protected by **Vibe Aegis**. Every code change
 4. **Zero Synthetic Placeholders in Production Views (`UX-09`)**:
    - Never ship `"Lorem ipsum"`, `"TODO"`, `"john@example.com"`, or hardcoded fake metrics in user-facing components.
 
-## 3. Running the Vibe Aegis 6-Stage Pre-Publish Audit Loop
+## 3. Running the Vibe Aegis 10-Stage Pre-Publish Audit Loop
 
 Before publishing or merging major features, run the full Vibe Aegis loop:
 

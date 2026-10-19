@@ -1,4 +1,4 @@
-description: Vibe Aegis Always-On Security & UI/UX Safeguard Rules and 6-Stage Audit Protocol
+description: Vibe Aegis Always-On Security & UI/UX Safeguard Rules and 10-Stage Audit Protocol
 globs: "**/*"
 alwaysApply: true
 
@@ -8,4 +8,4 @@ Follow all security and UI/UX engineering standards in `AGENTS.md`:
 3. Never trust client-submitted prices in payment checkouts; always verify webhook signatures.
 4. Every UI button/link must be wired to a real action (no `href="#"` or empty `onClick`), disable during async flight (`disabled={isLoading}`), and handle loading, empty, and error states.
 5. Ensure mobile responsiveness (`320px–375px` without horizontal overflow) and WCAG 2.2 AA accessibility.
-6. When asked to audit or prepare for production, run `python3 .aegis/scripts/aegis_scan.py . --output .aegis/scan-report.json` and execute the 6-stage Hunter -> Skeptic -> Referee loop in `.agents/skills/vibe-aegis/SKILL.md`.
+6. When asked to audit or prepare for production, run `python3 .aegis/scripts/aegis_scan.py . --output .aegis/scan-report.json` and execute the 10-stage Hunter -> Skeptic -> Referee loop in `.agents/skills/vibe-aegis/SKILL.md`.

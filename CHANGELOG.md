@@ -4,6 +4,103 @@ All notable changes to Vibe Aegis are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-10-19
+
+Second adversarial self-audit. The scanner was run against its own output, and against
+correct code rather than only vulnerable code. Two defects were found that made the tool
+actively harmful to the projects installing it.
+
+### Fixed - the scanner leaked the credentials it found (CRITICAL)
+
+Provider credentials were detected in **two** independent regex tables: `SEC-01B` in
+`SECURITY_PATTERNS`, whose snippet was the **raw source line**, and `PROVIDER_SECRETS`,
+which redacts at construction. `redact_findings()` consulted only the second table, and the
+two used different length thresholds (`sk_live_` 16 vs 20, `ghp_` 30 vs 36, `sk-proj-` 20 vs
+32, and a trailing `\b` on `AIza` that a 36-character key could never satisfy). Every key in
+the gap was written **verbatim** into `.aegis/scan-report.json` - which the shipped CI
+adapter uploads as a build artifact, downloadable by anyone on a public repository.
+
+This only looked safe because `dedupe()` happened to prefer the already-redacted twin as
+"better evidence". Redaction was being performed by a deduplication heuristic.
+
+- Provider credentials are now detected in exactly one place, `scan_secrets_in_text()`,
+  which redacts at construction. The duplicate raw-regex rule is gone, and a test asserts
+  that no rule anywhere holds an unredacted key before `redact_findings()` even runs.
+- `PROVIDER_SECRETS` thresholds were widened to cover everything the removed rule caught, so
+  closing the leak costs no detection coverage.
+- `redact_findings()` no longer bails out when the snippet merely **contains** `"..."`. A JS
+  spread (`{ ...opts }`) or a Python ellipsis anywhere on the line switched redaction off for
+  the real credential beside it.
+- It now redacts **every** match of every pattern, not just the first. Two keys on one line
+  meant the second shipped in the clear.
+- `title` and `remediation` are swept alongside `snippet`.
+
+### Fixed - correct, accessible code was reported as broken (HIGH)
+
+The JSX rules scanned a tag with `[^>]*`, but **an arrow function contains `>`**. The scan
+stopped at the first handler, so an attribute written after an `onChange` was invisible and
+the verdict depended purely on attribute **order**:
+
+```jsx
+<input aria-label="Email" onChange={(e) => f(e)} />   // passed
+<input onChange={(e) => f(e)} aria-label="Email" />   // flagged, identically correct
+```
+
+`UX-12` flagged the exact accessible-div pattern its own remediation text recommends. With
+`--fail-on-high` this turned correct code into a red pipeline.
+
+- New `_IN_TAG` matches a tag body and permits `>` when preceded by `=`. Every position has
+  exactly one way to match, so it cannot backtrack exponentially.
+- Applied to `UX-01`, `UX-06`, `UX-07`, `UX-11`, `UX-12`.
+
+### Changed - `UX-06` resolves labels across the file
+
+An accessible name cannot be decided from one element: `<input id="city">` is correct if and
+only if a `<label htmlFor="city">` exists. The old rule accepted **any** `id=` as a name,
+silently passing every unlabelled control that happened to have an id. It is now
+`check_form_control_labels()`, which collects label targets per file. `placeholder` still
+does not count as a name.
+
+- `FLOW-02` no longer treats array-form `spawn` / `spawnSync` / `execFile` / `execFileSync`
+  as command injection. Passing arguments as an array starts no shell - it is precisely the
+  fix the rule's own remediation recommends - so the rule was reporting correct code as
+  CRITICAL. It was the single finding blocking this repository's own release gate
+  (`bin/vibe-aegis.mjs`). An explicit `shell: true` still fires, as does any `exec`/`execSync`
+  taking a command string.
+
+### Changed - findings that could not be proven are graded honestly
+
+- `ART-14` (debuggable release) `HIGH` -> `MEDIUM`, confidence `LOW`. A binary
+  `AndroidManifest.xml` stores boolean values outside the string pool, so correct
+  `android:debuggable="false"` hardening is indistinguishable from a debuggable build. The
+  finding now says so and points at `aapt dump badging`.
+- `SEC-03` recognises hand-rolled guards (`requireUser`, `assertUser`, `getSession`,
+  `checkAuth`, ...). An allowlist that knew only vendor SDK names reported every project
+  with a local auth wrapper as unauthenticated.
+
+### Security - hardening the workflow shipped to users
+
+- `adapters/github-actions/vibe-aegis-ci.yml` now sets `permissions: contents: read`. It
+  previously inherited the repository default, often write-all. Report artifacts get a
+  14-day retention.
+
+### Documentation
+
+- README now states **what leaves your machine**: no telemetry; `--deps` discloses dependency
+  names and versions to `api.osv.dev`; `--url` touches only the URL you supply; `--offline`
+  disables both.
+- Stage count normalised to **10** across README, `AGENTS.md`, all four adapters, the skill
+  and `package.json`. Half the project said 6, half said 10.
+- `UX-06`'s remediation contained the literal text `' + chr(39) + '` - a string
+  concatenation that was written out as prose and shipped to every user.
+
+### Tests
+
+68 -> 84. New suites: `TestCredentialsNeverLeakIntoReports`,
+`TestJsxAttributeOrderDoesNotChangeTheVerdict`, `TestFormControlLabelResolution`,
+`TestAuthGuardRecognition`. Each closed bug has a positive test proving the rule still fires
+and a negative test proving it stays silent on correct code.
+
 ## [2.4.0] - 2026-10-19
 
 Adversarial self-audit prompted by the fail-open report. Every function was re-tested in isolation, not only through the full audit.
