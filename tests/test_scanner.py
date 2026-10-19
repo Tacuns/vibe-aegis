@@ -2564,7 +2564,11 @@ class TestPostgresPrivilegeRules(unittest.TestCase):
 
 def _find_postgres_bin():
     import glob
-    for d in sorted(glob.glob("/usr/lib/postgresql/*/bin"), reverse=True) + [""]:
+    # Newest first, numerically: as text, "9.6" sorts above "16".
+    def major(d):
+        m = re.search(r"/postgresql/(\d+)", d)
+        return int(m.group(1)) if m else 0
+    for d in sorted(glob.glob("/usr/lib/postgresql/*/bin"), key=major, reverse=True) + [""]:
         initdb = os.path.join(d, "initdb") if d else shutil.which("initdb")
         if initdb and os.path.exists(initdb):
             return os.path.dirname(initdb)
@@ -2590,6 +2594,13 @@ class TestPostgresPrivilegeRulesAgainstARealDatabase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        version = subprocess.run([os.path.join(_PG_BIN, "postgres"), "--version"],
+                                 capture_output=True, text=True).stdout
+        found = re.search(r"(\d+)(?:\.\d+)?", version)
+        if not found or int(found.group(1)) < 15:
+            # The documented fix for SEC-19/SEC-20 is `security_invoker`, which only
+            # exists from PostgreSQL 15. On 14 the fixture cannot even create the fix.
+            raise unittest.SkipTest("security_invoker needs PostgreSQL 15+, found: %s" % version.strip())
         cls._tmp = tempfile.TemporaryDirectory()
         data, sock = Path(cls._tmp.name) / "data", Path(cls._tmp.name) / "s"
         sock.mkdir()
