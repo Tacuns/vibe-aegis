@@ -94,7 +94,14 @@ with every stage in `RELEASE_STAGES` actually completed, returns `RELEASE_AUDIT_
 
 ---
 
-## Remaining work, in priority order
+## Remaining work
+
+> **Start with item 5 (documentation).** This branch cannot be merged until it is done.
+> The scanner here can never emit `READY TO PUBLISH`, yet `README.md` still promises it
+> six times, and `--profile`, `--engine` and the new verdict names are undocumented.
+> Shipping that to `main` would mean the docs describe a tool that no longer exists —
+> the same defect `test_every_readme_rule_is_implemented` exists to prevent. Items 1–4
+> then follow in the order given.
 
 Do **one item per session**. Finish it completely, with tests and docs, before starting
 the next. `aegis_scan.py` is a single large file, so parallel branches will conflict
@@ -122,11 +129,28 @@ magic. `.aab` and `.ipa` use different signing models. Never report a signature 
 absent or invalid without platform-correct verification — emit `ART-10` (coverage gap)
 when the format cannot be verified.
 
-### 5. Documentation
-`README.md` and `AGENTS.md` still describe the older model. Document the three axes, the
-four profiles, the five verdicts, the engine adapters with their licences, and what
-leaves the machine (`--deps` queries `api.osv.dev`; `--url` touches only the supplied
-URL; `--offline` disables both). Regenerate `llms-full.txt` afterwards.
+### 5. Documentation — DO THIS FIRST, it is what blocks the merge
+`README.md` and `AGENTS.md` still describe the older model. Required:
+
+- **Remove every stale `READY TO PUBLISH`.** It appears in `README.md` (6×),
+  `skills/vibe-aegis/SKILL.md`, `docs/prompts/01-full-prelaunch-audit.md` and
+  `schemas/scan-report.schema.json`. That verdict no longer exists.
+- Document the **three axes** (coverage, severity, confidence) and the gate flag for each.
+- Document the **four profiles** (`--profile quick|code|full|release`) and state plainly
+  that only `release` can return `RELEASE_AUDIT_PASSED`.
+- Document the **five verdicts**, including that `STATIC_CHECKS_PASSED` is not a
+  release-readiness claim.
+- Document `--engine`, `--list-engines`, `--authorize-network-scan`, `--max-file-size`,
+  and each engine's licence. Say that engines are never auto-installed and that a
+  missing engine is a coverage gap.
+- Document what leaves the machine: `--deps` queries `api.osv.dev`; `--url` touches only
+  the supplied URL; `--offline` disables both; there is no telemetry.
+- Add a **migration note to `CHANGELOG.md`**: any CI that greps `release_verdict` for
+  `READY TO PUBLISH` breaks. Tell users what to match instead.
+- Bump `SCANNER_VERSION`, `package.json` and both `.claude-plugin/*.json` **together**.
+  Leaving `main` and this branch both on `2.6.0` with different behaviour is not an
+  option.
+- Regenerate `llms-full.txt` (`python scripts/build_llms_full.py .`) last.
 
 ---
 
