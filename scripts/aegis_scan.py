@@ -824,6 +824,131 @@ def check_postgres_privilege_rules(rel_path: str, text: str) -> List[Finding]:
     return findings
 
 
+# Calls that establish WHO the caller is. Client constructors (`createServerClient`,
+# `createClient`, `clerkClient`) are deliberately absent: building a client is setup,
+# and a route that builds one and never asks it for the user is unauthenticated.
+_AUTH_CALL = re.compile(
+    r"(?:getServerSession|\bauth\(\)|getUser\(|currentUser\(|verifyToken|jwt\.verify|"
+    r"jwtVerify|\.auth\.getUser|\.auth\.getClaims|requireAuth|getAuth\(|"
+    r"passport\.authenticate|auth\.protect|requireSession|withApiAuth|"
+    r"ensureAuthenticated|isAuthenticated|"
+    r"authGuard|AuthGuard|verifySession|getServerAuthSession|withAuth|"
+    r"require(?:User|Session|Auth|Admin|Login)|assert(?:User|Auth|Session)|"
+    r"get(?:Current)?User\(|getSession\(|checkAuth|ensureUser|authenticate\()"
+)
+
+_USE_SERVER_FILE = re.compile(
+    r"\A(?:\s|//[^\n]*\n|/\*.*?\*/)*['\"]use server['\"]\s*;?\s*(?:\n|$)", re.DOTALL)
+_HANDLER_START = re.compile(
+    r"(?m)^[ \t]*export\s+(?:async\s+function\s+(\w+)\b|function\s+(\w+)\b|"
+    r"const\s+(\w+)\s*=)")
+_MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
+_LOCAL_FUNCTION = re.compile(
+    r"(?m)^[ \t]*(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(|"
+    r"^[ \t]*(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>")
+
+
+def _mutating_handlers(text: str, server_actions: bool) -> List[Tuple[str, int, str]]:
+    """(name, line, body) for each exported handler that can change state.
+
+    A route file's POST/PUT/PATCH/DELETE, or every exported function of a "use server"
+    file. A body runs to the next top-level export - a heuristic split, not a parse.
+    """
+    starts = list(_HANDLER_START.finditer(text))
+    out: List[Tuple[str, int, str]] = []
+    for i, m in enumerate(starts):
+        name = m.group(1) or m.group(2) or m.group(3)
+        if not (name in _MUTATING or server_actions):
+            continue
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(text)
+        out.append((name, text[:m.start()].count("\n") + 1, text[m.start():end]))
+    return out
+
+
+_USE_SERVER_LINE = re.compile(r"(?m)^[ \t]*['\"]use server['\"]\s*;?\s*$")
+
+
+def _inline_server_actions(text: str) -> List[Tuple[str, int, str]]:
+    """Functions whose body opens with the `'use server'` directive (inline actions)."""
+    defs = list(_LOCAL_FUNCTION.finditer(text))
+    out: List[Tuple[str, int, str]] = []
+    for i, m in enumerate(defs):
+        end = defs[i + 1].start() if i + 1 < len(defs) else len(text)
+        body = text[m.start():end]
+        first = re.search(r"\{\s*(?://[^\n]*\n\s*)*(['\"]use server['\"])", body)
+        if first and _USE_SERVER_LINE.search(body):
+            out.append((m.group(1) or m.group(2), text[:m.start()].count("\n") + 1, body))
+    return out
+
+
+def _calls_local_guard(body: str, text: str) -> bool:
+    """Does the handler call a helper, defined in this file, that checks the caller?"""
+    defs = list(_LOCAL_FUNCTION.finditer(text))
+    for i, m in enumerate(defs):
+        name = m.group(1) or m.group(2)
+        end = defs[i + 1].start() if i + 1 < len(defs) else len(text)
+        if (_AUTH_CALL.search(text[m.start():end])
+                and re.search(r"(?<![\w.])" + re.escape(name) + r"\s*\(", body)):
+            return True
+    return False
+
+
+_ID_KEY = re.compile(r"(?i)\s*(?:id|\w*Id|\w*_id|uuid)\b")
+_OWNER_KEY = (r"user[_-]?id|userId|owner[_-]?id|ownerId|tenant[_-]?id|tenantId|org[_-]?id|"
+              r"orgId|account[_-]?id|accountId|authorId|createdBy")
+_OWNER_PAIR = re.compile(r"(?i)\b(" + _OWNER_KEY + r")\b\s*(?::\s*([^,}]+))?")
+_REQUEST_VALUE = re.compile(
+    r"(?i)(req(?:uest)?\.(?:body|query|params|headers|json|formData)|\bparams\.|"
+    r"searchParams|\bbody\.|\binput\.|formData\.get|\bquery\.)")
+
+
+def _owner_values(where: str) -> List[str]:
+    """The value expression of each owner field: `userId: x` -> `x`, shorthand -> name."""
+    out = []
+    for m in _OWNER_PAIR.finditer(where):
+        out.append((m.group(2) or m.group(1)).strip())
+    return out
+
+
+def _request_derived_names(text: str) -> Set[str]:
+    """Identifiers assigned from the request anywhere in the file, to a fixed point."""
+    names: Set[str] = set()
+    assigns = []
+    for line in text.splitlines():
+        m = ASSIGNMENT.search(line)
+        if m:
+            targets = [m.group(2)] if m.group(2) else [
+                n.split(":")[-1].strip() for n in (m.group(1) or "").split(",")]
+            assigns.append(([t for t in targets if t and t.isidentifier()], m.group(3)))
+    changed = True
+    while changed:
+        changed = False
+        for targets, rhs in assigns:
+            # An auth call turns a request token INTO an identity: `getUser(body.token)`
+            # is the trusted side, not the attacker's.
+            if _AUTH_CALL.search(rhs):
+                continue
+            if (_REQUEST_VALUE.search(rhs) or TAINT_SOURCES.search(rhs)
+                    or any(_names_variable(n, rhs) for n in names)):
+                for t in targets:
+                    if t not in names:
+                        names.add(t)
+                        changed = True
+    return names
+
+
+def _names_variable(name: str, expr: str) -> bool:
+    """`name` used as a variable in `expr` - not as a property (`session.user.id`)."""
+    return re.search(r"(?:(?<=\.\.\.)|(?<![\w$.]))" + re.escape(name) + r"\b", expr) is not None
+
+
+def _from_request(value: str, request_names: Set[str]) -> bool:
+    if _REQUEST_VALUE.search(value) or TAINT_SOURCES.search(value):
+        return True
+    head = re.match(r"\s*([A-Za-z_$][\w$]*)", value)
+    return bool(head and head.group(1) in request_names)
+
+
 def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Finding]:
     findings: List[Finding] = []
     lines = text.splitlines()
@@ -872,41 +997,33 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
             )
         )
     )
-    has_use_server = '"use server"' in text or "'use server'" in text
-    if is_api_route or has_use_server:
-        has_mutation = bool(
-            re.search(r"export\s+async\s+function\s+(?:POST|PUT|PATCH|DELETE)\b", text)
-            or has_use_server
-        )
-        has_auth_call = bool(
-            re.search(
-                r"(?:getServerSession|auth\(\)|getUser\(|currentUser\(|verifyToken|jwt\.verify|"
-                r"jwtVerify|supabase\.auth\.getUser|requireAuth|getAuth\(|createServerClient|"
-                # Framework-idiomatic guards - absent before, causing false positives
-                r"passport\.authenticate|auth\.protect|requireSession|withApiAuth|"
-                r"ensureAuthenticated|isAuthenticated|Depends\(|Security\(|"
-                r"@login_required|@jwt_required|authGuard|AuthGuard|verifySession|"
-                r"getServerAuthSession|clerkClient|currentUser|withAuth|"
-                # Hand-rolled guards. Most projects wrap their auth check in a local
-                # helper, and an allowlist that only knows vendor SDK names reports
-                # every one of those routes as unauthenticated.
-                r"require(?:User|Session|Auth|Admin|Login)|assert(?:User|Auth|Session)|"
-                r"get(?:Current)?User\(|getSession\(|checkAuth|ensureUser|authenticate\()",
-                text,
-            )
-        )
-        if has_mutation and not has_auth_call:
+    # A directive only at the top of a file (React: before any import), and only in
+    # JavaScript - a Python test quoting the string once made its samples "actions".
+    has_use_server = (ext in {".ts", ".tsx", ".js", ".jsx", ".mjs"}
+                      and bool(_USE_SERVER_FILE.match(text)))
+    inline_actions = (_inline_server_actions(text)
+                      if ext in {".ts", ".tsx", ".js", ".jsx", ".mjs"} and not has_use_server else [])
+    if is_api_route or has_use_server or inline_actions:
+        # Each mutating handler must check its caller itself. This was one search of
+        # the whole file, so an auth call in GET protected an unauthenticated DELETE
+        # beside it, and `createServerClient` - which builds a database client and
+        # proves nothing about who is calling - counted as authentication.
+        handlers = (_mutating_handlers(text, has_use_server)
+                    if (is_api_route or has_use_server) else []) + inline_actions
+        for name, line_no, body in handlers:
+            if _AUTH_CALL.search(body) or _calls_local_guard(body, text):
+                continue
             findings.append(
                 Finding(
                     rule_id="SEC-03",
                     domain="SECURITY",
                     severity="CRITICAL",
-                    title="Server Mutation Route / Server Action Appears to Lack Authentication Check",
+                    title=(f"Server Mutation `{name}` Appears to Lack Authentication Check"),
                     file=rel_path,
-                    line=1,
-                    snippet=evidence(lines[0] if lines else rel_path),
+                    line=line_no,
+                    snippet=evidence(lines[line_no - 1] if 0 < line_no <= len(lines) else rel_path),
                     cwe_or_standard="CWE-306 / OWASP A01 Broken Access Control",
-                    remediation="Verify the caller's session on the server (e.g., `const { data: { user } } = await supabase.auth.getUser()` or `await auth()`) before executing mutations.",
+                    remediation="Verify the caller's session on the server inside this handler (e.g., `const { data: { user } } = await supabase.auth.getUser()` or `await auth()`) before executing the mutation. Creating a client is not a check.",
                     confidence="MEDIUM",
                 )
             )
@@ -1015,6 +1132,7 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
     # The single most common catastrophic flaw in vibe-coded apps, because the
     # happy path works perfectly - you only ever test with one account.
     if is_js and re.search(r"(?i)\b(findUnique|findFirst|findOne|update|delete|deleteOne)\s*\(", text):
+        request_names = _request_derived_names(text)
         for m in re.finditer(
             r"(?i)\.(?:findUnique|findFirst|findOne|update|delete|deleteOne)\s*\(\s*\{[^}]{0,200}?"
             r"\bwhere\s*:\s*\{([^}]{0,200})\}",
@@ -1024,12 +1142,41 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
             # Addressed by an id that came from the request?
             from_request = re.search(
                 r"(?i)(req(?:uest)?\.(?:body|query|params)|params\.|searchParams|body\.|input\.)", where
-            )
-            # Scoped to the authenticated owner anywhere in the same clause?
-            owner_scoped = re.search(
-                r"(?i)(user[_-]?id|userId|owner[_-]?id|ownerId|tenant[_-]?id|tenantId|org[_-]?id|"
-                r"orgId|account[_-]?id|accountId|auth\.uid|session\.|authorId|createdBy)", where
-            )
+            ) or any(_from_request(v, request_names)
+                     for v in re.findall(r"[A-Za-z_$][\w$]*\s*(?::\s*[^,}]+)?", where)
+                     if _ID_KEY.match(v) and not _OWNER_PAIR.match(v))
+            # Scoped to the authenticated owner? An owner FIELD is not enough: this once
+            # accepted `userId: body.userId`, which the attacker simply sets to the
+            # victim's id. The owner value must not come from the request.
+            owner_values = _owner_values(where)
+            trusted = [v for v in owner_values if not _from_request(v, request_names)]
+            if from_request and owner_values and not trusted:
+                # `req.body.UserId` may be written by server middleware from the token
+                # (one file cannot see that), unlike a body parsed from `req.json()`.
+                mutable = all(re.match(r"\s*req(?:uest)?\.(?:body|params|query)\.", v)
+                              for v in owner_values)
+                findings.append(
+                    Finding(
+                        rule_id="SEC-04",
+                        domain="SECURITY",
+                        severity="CRITICAL",
+                        title="Owner Check Uses A Request-Supplied Value (IDOR)",
+                        file=rel_path,
+                        line=text[:m.start()].count("\n") + 1,
+                        snippet=evidence(f"where: {{{where.strip()}}}"),
+                        cwe_or_standard="CWE-639 Authorization Bypass Through User-Controlled Key / OWASP A01",
+                        remediation=(
+                            "Take the owner from the server-side session, never from the request - "
+                            "for example `where: { id, userId: session.user.id }`. If middleware "
+                            "overwrites this field from the verified token, confirm every route that "
+                            "reaches this query runs it. Verify by sending account B's id in the "
+                            "request while signed in as account A."
+                        ),
+                        confidence="LOW" if mutable else "MEDIUM",
+                    )
+                )
+                continue
+            owner_scoped = bool(trusted) or re.search(r"(?i)(auth\.uid|session\.)", where)
             if from_request and not owner_scoped:
                 findings.append(
                     Finding(
@@ -3093,22 +3240,40 @@ TAINT_SOURCES = re.compile(
     | formData\.get\(
     | process\.argv\b
     | \bctx\.(?:query|params|request)\b
+    # Python: Flask (Request.args/form/values/json/get_json/files/cookies/data), Django
+    # (HttpRequest.GET/POST/COOKIES/FILES/body/headers), DRF (Request.data/query_params) -
+    # attribute names checked against Flask 3.1, Django 6.1 and DRF. `.py` files were
+    # analysed with only Express-style sources, so no Python view ever produced a finding.
+    | \brequest\.(?:args|form|values|json|files|cookies|data|GET|POST|COOKIES|FILES|query_params)\b
+    | \brequest\.get_json\(
     """
 )
 
-SANITIZERS = re.compile(
+# What makes a value safe depends on where it goes. One list for every sink meant
+# `encodeURIComponent()` cleared a value for SQL, `Number()` cleared it for a fetch
+# destination, and any `validateX()` cleared it for everything. Schema validation is
+# the only thing accepted for every sink; the rest is sink-specific, and a generic
+# `validate*` / `sanitize*` call - which may or may not do the right thing - no longer
+# clears anything: the finding stays, at LOW confidence.
+UNIVERSAL_SANITIZERS = re.compile(
     r"""(?x)
-    \.(?:parse|safeParse)\(          # zod / valibot schema validation
-    | \bparseInt\( | \bparseFloat\( | \bNumber\(
-    | \bencodeURIComponent\(
-    | \bescape(?:Html|Identifier)?\(
-    | \bsanitize\w*\(
-    | \bvalidate\w*\(
+    (?<!JSON)(?<!\burl)(?<!\bqs)(?<!Date)\.(?:parse|safeParse|parseAsync)\(   # zod / valibot
     | \bz\.[A-Za-z]+\(
-    | \ballowlist\b | \bwhitelist\b
-    | \bUUID\b | \bisUUID\(
+    | \bisUUID\( | \bisUuid\( | \buuidValidate\(
     """
 )
+_NUMERIC = r"\bparseInt\( | \bparseFloat\( | \bNumber\( | \bMath\.(?:floor|trunc|round)\( | \bint\("
+SINK_SANITIZERS: Dict[str, re.Pattern] = {
+    "FLOW-01": re.compile(r"(?x)" + _NUMERIC + r"| \bescape(?:Literal|Identifier)\( | \bformat\.literal\("),
+    "FLOW-02": re.compile(r"(?x)" + _NUMERIC + r"| \bshlex\.quote\( | \bshell[Ee]scape\( | \bquote\(\s*\["),
+    "FLOW-03": re.compile(r"(?x)" + _NUMERIC + r"| \bescapeHtml\( | \bhtmlEscape\( | \bDOMPurify\.sanitize\("
+                          r"| \bsanitizeHtml\( | \bhtml\.escape\( | \bmarkupsafe\.escape\("),
+    "FLOW-04": re.compile(r"(?x) \bencodeURIComponent\( | \bisAllowed\w*\( | \bassertAllowed\w*\("
+                          r"| \bquote_plus\( | \burllib\.parse\.quote\("),
+    "FLOW-05": re.compile(r"(?x)" + _NUMERIC + r"| \bpath\.basename\( | \bbasename\( | \bsecure_filename\("
+                          r"| \bsanitizeFilename\( | \bsanitize_filename\("),
+}
+GENERIC_SANITIZERS = re.compile(r"(?x) \bvalidate\w*\( | \bsanitize\w*\( | \bclean\w*\( | \bescape\(")
 
 TAINT_SINKS: List[Tuple[str, str, str, str, re.Pattern]] = [
     ("FLOW-01", "CRITICAL", "Untrusted Input Reaches A Raw SQL Query",
@@ -3135,17 +3300,269 @@ TAINT_SINKS: List[Tuple[str, str, str, str, re.Pattern]] = [
 # release gate. `exec`/`execSync` still take a command STRING and remain sinks.
 _SAFE_ARGV_EXEC = re.compile(r"\b(?:spawn|spawnSync|execFile|execFileSync)\s*\([^)]*,\s*\[")
 _SHELL_TRUE = re.compile(r"shell\s*:\s*true|shell\s*=\s*True")
+# Sinks where only the first argument is dangerous: the SQL text, the shell command, the
+# request URL. Filesystem and HTML sinks are judged on the whole call.
+_FIRST_ARG_SINKS = {"FLOW-01", "FLOW-02", "FLOW-04"}
 
 FUNCTION_SPLIT = re.compile(
-    r"(?m)^(?=\s*(?:export\s+)?(?:async\s+)?function\s|\s*(?:export\s+)?const\s+\w+\s*=\s*(?:async\s*)?\(|\s*(?:public|private|protected)?\s*async\s+\w+\s*\()"
+    r"(?m)^(?=\s*(?:async\s+)?def\s|\s*(?:export\s+)?(?:async\s+)?function\s|\s*(?:export\s+)?const\s+\w+\s*=\s*(?:async\s*)?\(|\s*(?:public|private|protected)?\s*async\s+\w+\s*\()"
 )
 
-ASSIGNMENT = re.compile(r"(?:const|let|var)\s+(?:\{\s*([^}]+)\s*\}|(\w+))\s*=\s*(.+)")
+# `let criteria: any = req.query.q` - a TypeScript annotation once hid the assignment.
+ASSIGNMENT = re.compile(
+    r"(?:const|let|var)\s+(?:\{\s*([^}]+)\s*\}|(\w+))\s*(?::\s*[^=]+?)?\s*=(?![=>])\s*(.+)")
+# Python has no declaration keyword: `name = value`, optionally annotated. Same three
+# groups as ASSIGNMENT (the first, destructuring, is always empty).
+PY_ASSIGNMENT = re.compile(r"^\s*()([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)\s*(.+)")
 
 
 def _mentions(name: str, line: str) -> bool:
     """True when `name` appears in `line` as a whole identifier."""
     return re.search(r"\b" + re.escape(name) + r"\b", line) is not None
+
+
+def _call_spans(line: str, pattern: re.Pattern) -> List[Tuple[int, int]]:
+    """Character spans of each `name(...)` call `pattern` opens, parentheses balanced."""
+    spans = []
+    for m in pattern.finditer(line):
+        if not m.group(0).rstrip().endswith("("):
+            continue
+        depth, j = 1, m.end()
+        while j < len(line) and depth:
+            depth += {"(": 1, ")": -1}.get(line[j], 0)
+            j += 1
+        spans.append((m.start(), j))
+    return spans
+
+
+def _outside(line: str, spans: List[Tuple[int, int]]) -> str:
+    """`line` with every span blanked, so what remains is what the calls do not wrap."""
+    chars = list(line)
+    for start, end in spans:
+        for k in range(start, min(end, len(chars))):
+            chars[k] = " "
+    return "".join(chars)
+
+
+def _code_only(expr: str) -> str:
+    """`expr` with string-literal TEXT blanked, keeping `${...}` / f-string `{...}`.
+
+    `query("SELECT * FROM t WHERE name = $1", [name])` mentions the tainted `name` only
+    as SQL text; counting that as a use reported the bound-parameter fix as injection.
+    """
+    out, i, n = [], 0, len(expr)
+    while i < n:
+        ch = expr[i]
+        if ch in "'\"`":
+            fstring = ch != "`" and i > 0 and expr[i - 1] in "fF"
+            j, buf = i + 1, [" "]
+            while j < n and expr[j] != ch:
+                if expr[j] == "\\":
+                    buf.append("  ")
+                    j += 2
+                    continue
+                opener = "${" if ch == "`" else ("{" if fstring else None)
+                if opener and expr.startswith(opener, j):
+                    depth, k = 1, j + len(opener)
+                    while k < n and depth:
+                        depth += {"{": 1, "}": -1}.get(expr[k], 0)
+                        k += 1
+                    buf.append(" " * len(opener) + expr[j + len(opener):k - 1] + " ")
+                    j = k
+                    continue
+                buf.append(" ")
+                j += 1
+            out.append("".join(buf) + " ")
+            i = j + 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _refs_taint(expr: str, tainted: Dict[str, Set[str]], sink: Optional[str] = None) -> List[str]:
+    """Tainted names `expr` uses (as variables, not properties) that are not already
+    cleared for `sink` - plus the pseudo-name "<request>" for a direct request source."""
+    expr = _code_only(expr)
+    hits = [t for t in tainted if (sink is None or sink not in tainted[t])
+            and re.search(r"(?:(?<=\.\.\.)|(?<![\w$.]))" + re.escape(t) + r"\b", expr)]
+    if TAINT_SOURCES.search(expr):
+        hits.append("<request>")
+    return hits
+
+
+_DEF_HEAD = re.compile(
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*(\w+)\s*\(([^)]*)\)"
+    r"|^\s*(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>"
+    r"|^\s*def\s+(\w+)\s*\(([^)]*)\)")
+
+
+def _split_args(args: str) -> List[str]:
+    out, depth, cur = [], 0, ""
+    for ch in args:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    out.append(cur)
+    return [a.strip() for a in out]
+
+
+def _param_names(params: str) -> List[str]:
+    names = []
+    for p in _split_args(params):
+        p = re.split(r"[:=]", p.strip().lstrip("*."), maxsplit=1)[0].strip()
+        names.append(p if p.isidentifier() else "")
+    return names
+
+
+def _flow_block(block_lines: List[str], tainted: Dict[str, Set[str]],
+                helpers: Dict[str, Dict],
+                assignment: re.Pattern = ASSIGNMENT) -> Tuple[List[Tuple], bool]:
+    """Track taint through one function block.
+
+    `tainted` maps a variable to the sinks it has been made safe for. Returns the
+    (line index, rule, carrier, line, confidence, via) hits, and whether the block
+    returns a tainted value.
+    """
+    hits: List[Tuple] = []
+    returns_taint = False
+    weak: Set[str] = set()
+    for i, line in enumerate(block_lines):
+        stripped = line.strip()
+        if stripped.startswith(("//", "*", "#")):
+            continue
+
+        m = assignment.search(line)
+        assigned_here = ""
+        if m:
+            destructured, single, rhs = m.group(1), m.group(2), m.group(3)
+            assigned_here = single or ""
+            # A call to a local helper that returns request data is a source too.
+            source_calls = [n for n, h in helpers.items() if h.get("returns_taint")]
+
+            def taint_in(expr: str) -> List[str]:
+                found = _refs_taint(expr, tainted)
+                if any(re.search(r"(?<![\w$.])" + re.escape(n) + r"\s*\(", expr) for n in source_calls):
+                    found.append("<request>")
+                return found
+            refs = taint_in(rhs)
+            if refs:
+                inherited = None
+                for r in refs:
+                    if r != "<request>":
+                        inherited = set(tainted[r]) if inherited is None else inherited & tainted[r]
+                cleared = set() if inherited is None or "<request>" in refs else inherited
+                universal = _outside(rhs, _call_spans(rhs, UNIVERSAL_SANITIZERS))
+                if not taint_in(universal):
+                    cleared = set(SINK_SANITIZERS)            # schema-validated: safe everywhere
+                else:
+                    for sink_id, pattern in SINK_SANITIZERS.items():
+                        rest = _outside(universal, _call_spans(universal, pattern))
+                        if not taint_in(rest):
+                            cleared.add(sink_id)
+                generic = _outside(universal, _call_spans(universal, GENERIC_SANITIZERS))
+                targets = [single] if single else [
+                    n.split(":")[-1].strip() for n in (destructured or "").split(",")]
+                for name in targets:
+                    if not name or not name.isidentifier():
+                        continue
+                    if cleared >= set(SINK_SANITIZERS):
+                        tainted.pop(name, None)
+                        continue
+                    tainted[name] = cleared
+                    if not taint_in(generic) or any(r in weak for r in refs):
+                        weak.add(name)
+                    else:
+                        weak.discard(name)
+            elif single in tainted:
+                tainted.pop(single, None)      # reassigned from something clean
+
+        if re.match(r"\s*return\b", line) and _refs_taint(line, tainted):
+            returns_taint = True
+
+        if not tainted and not TAINT_SOURCES.search(line):
+            continue
+
+        for rule_id, severity, title, standard, sink in TAINT_SINKS:
+            sink_m = sink.search(line)
+            if not sink_m:
+                continue
+            if (rule_id == "FLOW-02" and _SAFE_ARGV_EXEC.search(line)
+                    and not _SHELL_TRUE.search(line)):
+                continue  # array-form exec, no shell - this is the correct pattern
+            scope = line
+            if (rule_id in _FIRST_ARG_SINKS and sink_m.group(0).endswith("(")
+                    and not (rule_id == "FLOW-02" and _SHELL_TRUE.search(line))):
+                # Only the query, command or URL itself. A value passed as a bound
+                # parameter (`query("... $1", [id])`) or a request body is the fix.
+                depth, j = 1, sink_m.end()
+                while j < len(line) and depth:
+                    depth += {"(": 1, ")": -1}.get(line[j], 0)
+                    j += 1
+                args = _split_args(line[sink_m.end():max(j - 1, sink_m.end())])
+                scope = args[0] if args else ""
+            # #16: a sanitizer counts only if it wraps the tainted value itself, not
+            # because its name appears somewhere else on the line.
+            rest = _outside(scope, _call_spans(scope, UNIVERSAL_SANITIZERS))
+            rest = _outside(rest, _call_spans(rest, SINK_SANITIZERS[rule_id]))
+            candidates = [t for t in _refs_taint(rest, tainted, rule_id)
+                          if t not in ("<request>", assigned_here)]
+            direct = TAINT_SOURCES.search(rest)
+            if not candidates and not direct:
+                continue
+            # A request value used inline, with no variable in between, is the most
+            # direct flow there is - and was never reported.
+            hit = sorted(candidates)[0] if candidates else direct.group(0).strip()
+            unwrapped = _outside(rest, _call_spans(rest, GENERIC_SANITIZERS))
+            still = _refs_taint(unwrapped, tainted, rule_id)
+            confidence = ("LOW" if hit in weak or (hit not in still and not (direct and "<request>" in still))
+                          else "MEDIUM")
+            hits.append((i, rule_id, hit, stripped, confidence, None))
+
+        # #17: a tainted argument handed to a local helper whose parameter reaches a sink.
+        for name, helper in helpers.items():
+            for call in re.finditer(r"(?<![\w$.])" + re.escape(name) + r"\s*\(", line):
+                depth, j = 1, call.end()
+                while j < len(line) and depth:
+                    depth += {"(": 1, ")": -1}.get(line[j], 0)
+                    j += 1
+                args = _split_args(line[call.end():j - 1])
+                for idx, arg in enumerate(args):
+                    for rule_id in helper.get("param_sinks", {}).get(idx, ()):
+                        carriers = [t for t in _refs_taint(arg, tainted, rule_id) if t != "<request>"]
+                        if carriers or TAINT_SOURCES.search(arg):
+                            hits.append((i, rule_id, carriers[0] if carriers else arg.strip(),
+                                         stripped, "MEDIUM", name))
+    return hits, returns_taint
+
+
+def _local_helpers(blocks: List[str], assignment: re.Pattern = ASSIGNMENT) -> Dict[str, Dict]:
+    """One level of interprocedural analysis within a file: which local functions pass
+    a parameter into a sink, and which return request data."""
+    helpers: Dict[str, Dict] = {}
+    for block in blocks:
+        lines = block.splitlines()
+        head = _DEF_HEAD.match(lines[0]) if lines else None
+        if not head:
+            continue
+        name = head.group(1) or head.group(3) or head.group(5)
+        params = _param_names(head.group(2) or head.group(4) or head.group(6) or "")
+        param_sinks: Dict[int, Set[str]] = {}
+        for idx, param in enumerate(params):
+            if not param:
+                continue
+            hits, _ = _flow_block(lines[1:], {param: set()}, {}, assignment)
+            if hits:
+                param_sinks[idx] = {h[1] for h in hits}
+        _, returns_taint = _flow_block(lines[1:], {}, {}, assignment)
+        helpers[name] = {"param_sinks": param_sinks, "returns_taint": returns_taint}
+    return helpers
 
 
 def analyze_data_flow(rel_path: str, ext: str, text: str) -> List[Finding]:
@@ -3156,88 +3573,52 @@ def analyze_data_flow(rel_path: str, ext: str, text: str) -> List[Finding]:
 
     findings: List[Finding] = []
     blocks = FUNCTION_SPLIT.split(text)
+    assignment = PY_ASSIGNMENT if ext == ".py" else ASSIGNMENT
+    helpers = _local_helpers(blocks, assignment)
+    meta = {rule: (sev, title, std) for rule, sev, title, std, _ in TAINT_SINKS}
     offset_line = 1
 
     for block in blocks:
         block_lines = block.splitlines()
-        if not any(TAINT_SOURCES.search(ln) for ln in block_lines):
+        uses_helper_source = any(
+            h["returns_taint"] and re.search(r"(?<![\w$.])" + re.escape(n) + r"\s*\(", block)
+            for n, h in helpers.items())
+        if not (uses_helper_source or any(TAINT_SOURCES.search(ln) for ln in block_lines)):
             offset_line += len(block_lines)
             continue
 
-        tainted: Set[str] = set()
+        hits, _ = _flow_block(block_lines, {}, helpers, assignment)
         reported: Set[str] = set()
-
-        for i, line in enumerate(block_lines):
-            stripped = line.strip()
-            if stripped.startswith(("//", "*", "#")):
+        for i, rule_id, hit, stripped, confidence, via in hits:
+            key = f"{rule_id}:{hit}:{via or ''}"
+            if key in reported:
                 continue
-
-            # Propagate taint through simple assignments.
-            m = ASSIGNMENT.search(line)
-            if m:
-                destructured, single, rhs = m.group(1), m.group(2), m.group(3)
-                rhs_tainted = bool(TAINT_SOURCES.search(rhs)) or any(
-                    _mentions(t, rhs) for t in tainted
+            reported.add(key)
+            severity, title, standard = meta[rule_id]
+            where = f" inside `{via}()`" if via else ""
+            findings.append(
+                Finding(
+                    rule_id=rule_id,
+                    domain="DATAFLOW",
+                    severity=severity,
+                    title=title,
+                    file=rel_path,
+                    line=offset_line + i,
+                    snippet=evidence(f"`{hit}` originates from request input and reaches the sink"
+                                     f"{where} here: {stripped}", 180),
+                    cwe_or_standard=standard,
+                    remediation=(
+                        f"Validate `{hit}` with a schema (zod/pydantic) before use, and pass it as a bound "
+                        "parameter rather than interpolating it into the call. For fetch destinations, check "
+                        "the host against an allowlist and reject private IP ranges. A generic "
+                        "`validate*`/`sanitize*` helper is not accepted as proof: use one specific to "
+                        "this sink."
+                    ),
+                    confidence=confidence,
                 )
-                if rhs_tainted and not SANITIZERS.search(rhs):
-                    if single:
-                        tainted.add(single)
-                    if destructured:
-                        for name in destructured.split(","):
-                            name = name.split(":")[-1].strip()
-                            if name.isidentifier():
-                                tainted.add(name)
-                elif rhs_tainted and SANITIZERS.search(rhs):
-                    # Value was validated on the way in - it is clean from here.
-                    if single:
-                        tainted.discard(single)
-
-            if not tainted:
-                continue
-
-            # Does a tainted name reach a dangerous call on this line?
-            for rule_id, severity, title, standard, sink in TAINT_SINKS:
-                if not sink.search(line):
-                    continue
-                if (rule_id == "FLOW-02" and _SAFE_ARGV_EXEC.search(line)
-                        and not _SHELL_TRUE.search(line)):
-                    continue  # array-form exec, no shell - this is the correct pattern
-                if SANITIZERS.search(line):
-                    continue
-                # Name the variable that CARRIES the taint, not the one being assigned here.
-                assigned_here = (m.group(2) or "") if m else ""
-                candidates = [
-                    t for t in tainted
-                    if t != assigned_here and _mentions(t, line)
-                ]
-                hit = candidates[0] if candidates else None
-                if not hit:
-                    continue
-                key = f"{rule_id}:{hit}"
-                if key in reported:
-                    continue
-                reported.add(key)
-                findings.append(
-                    Finding(
-                        rule_id=rule_id,
-                        domain="DATAFLOW",
-                        severity=severity,
-                        title=title,
-                        file=rel_path,
-                        line=offset_line + i,
-                        snippet=evidence(f"`{hit}` originates from request input and is used here: {stripped}", 180),
-                        cwe_or_standard=standard,
-                        remediation=(
-                            f"Validate `{hit}` with a schema (zod/pydantic) before use, and pass it as a bound "
-                            "parameter rather than interpolating it into the call. For fetch destinations, check "
-                            "the host against an allowlist and reject private IP ranges."
-                        ),
-                        confidence="MEDIUM",
-                    )
-                )
+            )
 
         offset_line += len(block_lines)
-
     return findings
 
 

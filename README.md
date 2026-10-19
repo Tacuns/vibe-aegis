@@ -291,8 +291,8 @@ Also honoured: a `.aegis-ignore` file in the repo root, one entry per line — e
 | :--- | :--- | :--- | :--- |
 | `SEC-01` | **Client-Exposed Secrets** | Critical | Private keys or tokens in `NEXT_PUBLIC_`, `VITE_`, `EXPO_PUBLIC_`, `REACT_APP_`, or hardcoded in source files |
 | `SEC-02` | **Database RLS Disabled** | Critical | Supabase/PostgreSQL tables without `ENABLE ROW LEVEL SECURITY` or permissive `USING (true)` policies; Firebase `allow read, write: if true` |
-| `SEC-03` | **Unprotected API / Server Actions** | Critical | Next.js `/api/*` routes, `"use server"` actions, FastAPI, or Express mutations lacking session/auth verification |
-| `SEC-04` | **Broken Access Control (IDOR)** | Critical | Queries fetching/mutating records by user-supplied `id` without scoping to `auth.uid()` / authenticated session owner |
+| `SEC-03` | **Unprotected API / Server Actions** | Critical | Each Next.js `app/api` / `pages/api` `POST`/`PUT`/`PATCH`/`DELETE` handler, and each `"use server"` action (file-level or inline), that never establishes who is calling - checked per handler, so `GET`'s check does not cover `DELETE`. Creating a client (`createServerClient`) is not a check. FastAPI and Express routes are not covered by this rule |
+| `SEC-04` | **Broken Access Control (IDOR)** | Critical | Queries fetching/mutating records by user-supplied `id` without scoping to `auth.uid()` / authenticated session owner - including an owner field whose value itself comes from the request (`userId: body.userId`) |
 | `SEC-05` | **Payment & Checkout Tampering** | Critical | Trusting client-submitted prices, plan tiers, or quantities in Stripe/Razorpay checkout sessions |
 | `SEC-06` | **Unverified Webhooks** | Critical | Payment or auth webhooks processing payloads without cryptographic signature verification (`stripe.webhooks.constructEvent`) |
 | `SEC-07` | **SQL / Raw Query Injection** | High | String interpolation in SQL, `prisma.$queryRawUnsafe()`, `sequelize.query()`, or Python `cursor.execute(f"...")` |
@@ -358,7 +358,19 @@ depends on the project's default privileges, so it is reported at `MEDIUM` confi
 
 ### E. Data-Flow Analysis (follows the value, not the pattern)
 
-A regex says *"there is a template literal in a query."* Taint analysis says *"**this** value came from the request and reaches **that** query unvalidated."* Input is traced from request sources (`req.body`, `req.json()`, `searchParams.get`, `formData.get`, route `params`) through assignments to dangerous sinks. A value that passes a validator (`zod.parse`, `parseInt`, `encodeURIComponent`, an allowlist check) is treated as clean and **not** reported.
+A regex says *"there is a template literal in a query."* Taint analysis says *"**this** value came from the request and reaches **that** query unvalidated."* Input is traced from request sources (`req.body`, `req.json()`, `searchParams.get`, `formData.get`, route `params`; in Python, Flask `request.args`/`form`/`json`/..., Django `request.GET`/`POST`/..., DRF `request.data`/`query_params`) through assignments - and one level through helper functions in the same file - to dangerous sinks.
+
+What makes a value safe depends on the sink. Schema validation (`schema.parse`, `z.*`) clears it everywhere; otherwise only a sanitizer for **that** sink counts, and only when it wraps the tainted value itself:
+
+| Sink | Accepted |
+| :--- | :--- |
+| SQL (`FLOW-01`) | numeric coercion (`Number`, `parseInt`, `int`), `escapeLiteral`/`escapeIdentifier`, or passing the value as a bound parameter |
+| Shell (`FLOW-02`) | numeric coercion, `shlex.quote`, an argument array without `shell: true` |
+| HTML (`FLOW-03`) | numeric coercion, `escapeHtml`, `DOMPurify.sanitize`, `sanitizeHtml` |
+| Fetch (`FLOW-04`) | `encodeURIComponent` / `quote_plus` on a value inside a fixed URL, `isAllowed*()` |
+| Path (`FLOW-05`) | numeric coercion, `path.basename`, `secure_filename` |
+
+A generic `validate*()` / `sanitize*()` helper is not accepted as proof: the finding is still reported, at `LOW` confidence.
 
 | ID | Flow | Severity |
 | :--- | :--- | :--- |
@@ -368,7 +380,7 @@ A regex says *"there is a template literal in a query."* Taint analysis says *"*
 | `FLOW-04` | Request input reaches a server-side fetch (SSRF) | High |
 | `FLOW-05` | Request input reaches a filesystem path | High |
 
-Reported at `MEDIUM` confidence by design — the tracker works within a function scope, so the Skeptic stage confirms before anything is called CONFIRMED.
+Reported at `MEDIUM` confidence by design — the tracker follows simple assignments within a function and one call deep into helpers in the same file, not across files, so the Skeptic stage confirms before anything is called CONFIRMED.
 
 ### F. Shipped-Artifact Verification (what your users actually receive)
 

@@ -117,9 +117,13 @@ it, and always give the rotation-first remediation order.
 Switch perspective to the **Skeptic**. For every candidate finding from Stages 1–3:
 - Attempt to **disprove** the claim by checking upstream middleware (`middleware.ts`), layout auth guards, ORM automatic parameterization, framework auto-escaping, or parent responsive containers.
 - If a defence completely blocks the trigger, mark the finding `DISMISSED` and cite the exact defensive `file:line`.
-- `DATAFLOW` findings are reported at `MEDIUM` confidence by design: the tracker works within a
-  single function scope, so confirm the value really is attacker-controlled and really is unvalidated
-  before promoting one to `CONFIRMED`.
+- `DATAFLOW` findings are reported at `MEDIUM` confidence by design: the tracker follows a function
+  and one call into helpers in the same file, not across files, so confirm the value really is
+  attacker-controlled and really is unvalidated before promoting one to `CONFIRMED`. A `LOW`
+  `DATAFLOW` finding passed through a generic `validate*`/`sanitize*` helper: read that helper and
+  decide whether it actually makes the value safe for this sink.
+- A `LOW` `SEC-04` takes its owner from a request field such as `req.body.UserId`: check whether
+  middleware overwrites that field from the verified token on every route that reaches the query.
 - `ART-01` is the exception - it is already confirmed evidence and must not be dismissed.
 - A publishable key (Supabase anon, Stripe publishable, Firebase web config) in a bundle is **not**
   a leak. Instead verify the protection it depends on: an anon key is only safe when Row-Level

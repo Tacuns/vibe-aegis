@@ -3705,3 +3705,255 @@ class TestChangeScopeDoesNotOverrideTheVerdict(unittest.TestCase):
         _code, report = self._diff_scan({"web/vendor.min.js": "var a=1;"})
         self.assertTrue(report["release_verdict"].startswith("NO CODE CHANGES TO REVIEW"),
                         report["release_verdict"])
+
+
+# ---------------------------------------------------------------------------
+# Checklist C: authentication, IDOR and data-flow accuracy
+# ---------------------------------------------------------------------------
+
+def _rule_hits(rel, code, rules):
+    with tempfile.TemporaryDirectory() as tmp:
+        write(Path(tmp), rel, code)
+        found, _ = aegis_scan.scan_repository(Path(tmp))
+    return sorted((f.rule_id, f.line, f.confidence) for f in found if f.rule_id in rules)
+
+
+class TestEachHandlerMustAuthenticate(unittest.TestCase):
+    """One file-wide search: client setup counted as auth, and GET's check covered DELETE."""
+
+    ROUTE = "app/api/orders/route.ts"
+
+    def _sec03(self, code, rel=ROUTE):
+        return [(line, conf) for _r, line, conf in _rule_hits(rel, code, {"SEC-03"})]
+
+    def test_creating_a_client_is_not_authentication(self):
+        self.assertEqual(len(self._sec03(
+            "export async function POST(req: Request) {\n"
+            "  const supabase = createServerClient(URL, KEY, { cookies })\n"
+            "  await supabase.from('orders').delete().eq('id', (await req.json()).id)\n}\n")), 1)
+
+    def test_a_client_that_is_asked_for_the_user_is(self):
+        self.assertEqual(self._sec03(
+            "export async function POST(req: Request) {\n"
+            "  const supabase = createServerClient(URL, KEY, { cookies })\n"
+            "  const { data: { user } } = await supabase.auth.getUser()\n"
+            "  if (!user) return new Response(null, { status: 401 })\n}\n"), [])
+
+    def test_auth_in_one_handler_does_not_cover_another(self):
+        self.assertEqual(self._sec03(
+            "export async function GET(req: Request) {\n  const user = await getUser(req)\n}\n"
+            "export async function DELETE(req: Request) {\n  await db.order.deleteMany({})\n}\n"),
+            [(4, "MEDIUM")])
+
+    def test_a_read_only_handler_is_not_a_mutation(self):
+        self.assertEqual(self._sec03(
+            "export async function GET(req: Request) {\n  return Response.json(await db.post.findMany())\n}\n"
+            "export async function POST(req: Request) {\n  const s = await auth()\n"
+            "  await db.post.create({})\n}\n"), [])
+
+    def test_wrapped_handlers_and_local_guards_count(self):
+        self.assertEqual(self._sec03(
+            "export const POST = withAuth(async (req) => {\n  await db.o.create({})\n})\n"), [])
+        self.assertEqual(self._sec03(
+            "'use server'\nasync function mustBeOwner() {\n  const s = await auth()\n"
+            "  if (!s) throw new Error('no')\n  return s\n}\n"
+            "export async function deletePost(id) {\n  const s = await mustBeOwner()\n"
+            "  await db.post.deleteMany({})\n}\n", "app/actions.ts"), [])
+
+    def test_an_inline_server_action_is_checked(self):
+        page = ("export default function Page() {\n  async function save(fd) {\n    'use server'\n"
+                "%s    await db.post.deleteMany({})\n  }\n  return <form action={save} />\n}\n")
+        self.assertEqual(self._sec03(page % "", "app/page.tsx"), [(2, "MEDIUM")])
+        self.assertEqual(self._sec03(page % "    const s = await auth()\n", "app/page.tsx"), [])
+
+    def test_the_directive_must_be_a_directive(self):
+        # Quoting the string is not declaring server actions - in JS or anywhere else.
+        self.assertEqual(self._sec03("const label = 'use server'\nexport async function x() {\n"
+                                     "  await db.x.deleteMany({})\n}\n", "app/lib.ts"), [])
+        self.assertEqual(self._sec03('SAMPLE = """\'use server\'\nexport async function x() {}\n"""\n',
+                                     "tools/gen.py"), [])
+
+    def test_every_unauthenticated_server_action_is_named(self):
+        self.assertEqual(self._sec03(
+            "'use server'\nexport async function a() {\n  await db.x.deleteMany({})\n}\n"
+            "export async function b() {\n  const s = await auth()\n}\n"
+            "export async function c() {\n  await db.y.deleteMany({})\n}\n", "app/actions.ts"),
+            [(2, "MEDIUM"), (8, "MEDIUM")])
+
+
+class TestOwnershipMustComeFromTheSession(unittest.TestCase):
+    """`userId: body.userId` satisfied the owner check; the attacker sets it."""
+
+    def _sec04(self, body):
+        code = ("export async function POST(req: Request) {\n  const session = await auth()\n"
+                + body + "\n}\n")
+        return [(line, conf) for _r, line, conf in _rule_hits("app/api/o/route.ts", code, {"SEC-04"})]
+
+    def test_owner_from_the_parsed_body_fires(self):
+        self.assertEqual(self._sec04(
+            "  const body = await req.json()\n"
+            "  return db.o.findFirst({ where: { id: body.id, userId: body.userId } })"), [(4, "MEDIUM")])
+
+    def test_owner_destructured_from_the_body_fires(self):
+        self.assertEqual(self._sec04(
+            "  const { id, userId } = await req.json()\n"
+            "  return db.o.findFirst({ where: { id, userId } })"), [(4, "MEDIUM")])
+
+    def test_owner_copied_through_variables_still_fires(self):
+        self.assertEqual(self._sec04(
+            "  const body = await req.json()\n  const claims = body.claims\n  const owner = claims.userId\n"
+            "  return db.o.findFirst({ where: { id: body.id, userId: owner } })"), [(6, "MEDIUM")])
+
+    def test_owner_from_the_session_is_silent(self):
+        self.assertEqual(self._sec04(
+            "  const body = await req.json()\n"
+            "  return db.o.findFirst({ where: { id: body.id, userId: session.user.id } })"), [])
+        self.assertEqual(self._sec04(
+            "  const { id } = await req.json()\n  const userId = session.user.id\n"
+            "  return db.o.findFirst({ where: { id, userId } })"), [])
+
+    def test_owner_from_an_auth_call_on_a_request_token_is_silent(self):
+        self.assertEqual(self._sec04(
+            "  const body = await req.json()\n  const user = await getUser(body.token)\n"
+            "  return db.o.findFirst({ where: { id: body.id, userId: user.id } })"), [])
+
+    def test_a_mutable_request_field_is_low_confidence(self):
+        # Express middleware may overwrite req.body.UserId from the token; a file
+        # cannot see that, so it is a prompt to verify, not a demonstrated defect.
+        self.assertEqual(self._sec04(
+            "  return db.o.findOne({ where: { id: req.params.id, UserId: req.body.UserId } })"),
+            [(3, "LOW")])
+
+    def test_a_lookup_by_a_non_id_field_is_not_addressed_by_id(self):
+        self.assertEqual(self._sec04(
+            "  const email = (await req.json()).email\n"
+            "  return db.user.findFirst({ where: { email: email } })"), [])
+
+    def test_no_owner_at_all_still_fires(self):
+        self.assertEqual(self._sec04(
+            "  const body = await req.json()\n  return db.o.findFirst({ where: { id: body.id } })"),
+            [(4, "MEDIUM")])
+
+
+class TestSanitizersAreSinkSpecific(unittest.TestCase):
+    """Matched safe/vulnerable pairs for every sink, in TypeScript and Python."""
+
+    JS_SINKS = {
+        "FLOW-01": ("db.query(`SELECT * FROM t WHERE id = ${v}`)", ["Number(", "z.string().uuid().parse("],
+                    ["encodeURIComponent(", "validateId("]),
+        "FLOW-02": ("exec(`convert ${v} out.png`)", ["parseInt(", "Schema.parse("],
+                    ["encodeURIComponent(", "sanitizeInput("]),
+        "FLOW-03": ("el.innerHTML = v", ["escapeHtml(", "DOMPurify.sanitize("],
+                    ["encodeURIComponent(", "validateText("]),
+        "FLOW-04": ("await fetch(`https://api.example.com/u/${v}`)", ["encodeURIComponent(", "Schema.parse("],
+                    ["Number(", "validateUrl("]),
+        "FLOW-05": ("readFileSync(path.join(DIR, v))", ["path.basename(", "Schema.parse("],
+                    ["encodeURIComponent(", "cleanPath("]),
+    }
+    PY_SINKS = {
+        "FLOW-01": ('cursor.execute(f"SELECT * FROM t WHERE id = {v}")', "int("),
+        "FLOW-02": ('subprocess.run(f"convert {v}", shell=True)', "shlex.quote("),
+        "FLOW-04": ('requests.get(f"https://api.example.com/u/{v}")', "quote_plus("),
+        "FLOW-05": ("open(os.path.join(DIR, v))", "secure_filename("),
+    }
+
+    @staticmethod
+    def _js(wrap, sink):
+        code = "export async function GET(req) {\n  const v = %sreq.query.x%s\n  %s\n}\n" % (
+            wrap, ")" if wrap else "", sink)
+        return {f.rule_id: f.confidence for f in aegis_scan.analyze_data_flow("app/api/r/route.ts", ".ts", code)}
+
+    @staticmethod
+    def _py(wrap, sink):
+        code = "def view(request):\n    v = %srequest.args.get('x')%s\n    %s\n" % (
+            wrap, ")" if wrap else "", sink)
+        return {f.rule_id for f in aegis_scan.analyze_data_flow("app/views.py", ".py", code)}
+
+    def test_every_js_sink_fires_unsanitized(self):
+        for rule, (sink, _safe, _wrong) in self.JS_SINKS.items():
+            self.assertEqual(self._js("", sink), {rule: "MEDIUM"}, rule)
+
+    def test_the_right_sanitizer_clears_each_js_sink(self):
+        for rule, (sink, safe, _wrong) in self.JS_SINKS.items():
+            for fn in safe:
+                self.assertEqual(self._js(fn, sink), {}, (rule, fn))
+
+    def test_the_wrong_sanitizer_does_not(self):
+        for rule, (sink, _safe, wrong) in self.JS_SINKS.items():
+            self.assertEqual(self._js(wrong[0], sink), {rule: "MEDIUM"}, (rule, wrong[0]))
+
+    def test_a_generic_validator_is_reported_at_low_confidence(self):
+        for rule, (sink, _safe, wrong) in self.JS_SINKS.items():
+            self.assertEqual(self._js(wrong[1], sink), {rule: "LOW"}, (rule, wrong[1]))
+
+    def test_json_parse_is_not_validation(self):
+        self.assertEqual(self._js("JSON.parse(", self.JS_SINKS["FLOW-01"][0]), {"FLOW-01": "MEDIUM"})
+
+    def test_python_views_are_analysed(self):
+        for rule, (sink, fn) in self.PY_SINKS.items():
+            self.assertEqual(self._py("", sink), {rule}, rule)
+            self.assertEqual(self._py(fn, sink), set(), (rule, fn))
+
+
+class TestASanitizerMustWrapTheTaintedValue(unittest.TestCase):
+    """A sanitizer anywhere on the line suppressed the finding."""
+
+    def _flow(self, sink_line):
+        code = "export async function GET(req) {\n  const name = req.query.name\n  %s\n}\n" % sink_line
+        return {f.rule_id for f in aegis_scan.analyze_data_flow("app/api/q/route.ts", ".ts", code)}
+
+    def test_a_sanitizer_on_another_value_does_not_count(self):
+        self.assertEqual(self._flow("db.query(`SELECT * FROM t WHERE name = '${name}' LIMIT ${Number(10)}`)"),
+                         {"FLOW-01"})
+
+    def test_a_sanitizer_around_the_value_does(self):
+        self.assertEqual(self._flow("db.query(`SELECT * FROM t WHERE id = ${Number(name)}`)"), set())
+
+    def test_a_bound_parameter_is_the_fix(self):
+        self.assertEqual(self._flow('db.query("SELECT * FROM t WHERE name = $1", [name])'), set())
+        self.assertEqual(self._flow("await fetch('https://api.example.com/x', { body: name })"), set())
+
+    def test_a_request_value_used_inline_fires(self):
+        code = ("export async function POST(req) {\n"
+                "  return db.query(`SELECT * FROM u WHERE email = '${req.body.email}'`)\n}\n")
+        self.assertEqual({f.rule_id for f in aegis_scan.analyze_data_flow("app/api/l/route.ts", ".ts", code)},
+                         {"FLOW-01"})
+
+    def test_a_typescript_annotation_does_not_hide_an_assignment(self):
+        code = ("export async function GET(req) {\n  let criteria: any = req.query.q ?? ''\n"
+                "  return db.query(`SELECT * FROM p WHERE name LIKE '%${criteria}%'`)\n}\n")
+        self.assertEqual({f.rule_id for f in aegis_scan.analyze_data_flow("app/api/s/route.ts", ".ts", code)},
+                         {"FLOW-01"})
+
+
+class TestTaintCrossesLocalFunctions(unittest.TestCase):
+    """Data handed to a helper, or returned by one, escaped the per-function tracker."""
+
+    @staticmethod
+    def _flow(code):
+        return sorted((f.rule_id, f.line) for f in aegis_scan.analyze_data_flow("app/api/q/route.ts", ".ts", code))
+
+    def test_a_helper_whose_parameter_reaches_a_sink(self):
+        self.assertEqual(self._flow(
+            "function runQuery(value) {\n  return db.query(`SELECT * FROM t WHERE name = '${value}'`)\n}\n"
+            "export async function GET(req) {\n  const name = req.query.name\n  return runQuery(name)\n}\n"),
+            [("FLOW-01", 6)])
+
+    def test_a_helper_that_returns_request_data(self):
+        self.assertEqual(self._flow(
+            "function getName(req) {\n  return req.query.name\n}\n"
+            "export async function GET(req) {\n  const name = getName(req)\n"
+            "  return db.query(`SELECT * FROM t WHERE name = '${name}'`)\n}\n"),
+            [("FLOW-01", 6)])
+
+    def test_a_validated_argument_to_the_helper_is_safe(self):
+        self.assertEqual(self._flow(
+            "function runQuery(value) {\n  return db.query(`SELECT * FROM t WHERE id = ${value}`)\n}\n"
+            "export async function GET(req) {\n  const id = Number(req.query.id)\n  return runQuery(id)\n}\n"),
+            [])
+
+    def test_a_helper_that_binds_its_parameter_is_safe(self):
+        self.assertEqual(self._flow(
+            "function runQuery(value) {\n  return db.query('SELECT * FROM t WHERE name = $1', [value])\n}\n"
+            "export async function GET(req) {\n  const name = req.query.name\n  return runQuery(name)\n}\n"),
+            [])

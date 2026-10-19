@@ -131,6 +131,41 @@ Reproduced on this branch before each change; each fix has a regression test.
   outside the diff are no longer recorded as skipped, so an unchanged bundle is not a gap
   in a diff review.
 
+### Fixed - authentication, IDOR and data-flow accuracy (checklist C)
+
+Reproduced on this branch before each change; each has matched vulnerable and safe tests.
+
+- **`SEC-03` was one search of the whole file (HIGH).** An auth call in `GET` covered an
+  unauthenticated `DELETE` beside it, and `createServerClient` - which builds a database
+  client and says nothing about the caller - counted as authentication. Each mutating
+  handler and each server action is now checked on its own, a local helper that checks
+  the caller counts, and client constructors do not. `"use server"` is recognised only
+  as a directive (top of a file, or first statement of an inline action), so a file that
+  merely quotes the string - including a Python test - is no longer treated as actions.
+  The rule table no longer claims FastAPI or Express coverage it never had.
+- **`SEC-04` accepted any owner field (HIGH).** `where: { id, userId: body.userId }` passed,
+  although the attacker chooses `userId`. The owner value must now not come from the
+  request; a request-supplied owner is reported, at `LOW` confidence when it is an
+  Express `req.body.*` field that middleware may set from the token. Shorthand
+  `where: { id }` with a request-derived `id` is recognised.
+- **Sanitizers were interchangeable across sinks (HIGH).** `encodeURIComponent()` cleared
+  a value for SQL, `Number()` for a fetch destination, and any `validateX()` for
+  everything. Schema validation still clears every sink; otherwise only a sanitizer for
+  that sink counts, and a generic `validate*`/`sanitize*` helper leaves the finding at
+  `LOW` confidence. `JSON.parse` is no longer mistaken for schema validation.
+- **A sanitizer anywhere on the line suppressed the finding (MEDIUM).** It now counts only
+  when it wraps the tainted value. For SQL, shell and fetch sinks only the query, command
+  or URL is examined, so a bound parameter (`query("... $1", [id])`) is correctly treated
+  as the fix; string-literal text no longer counts as a use of a variable of the same name.
+- **Taint did not cross functions (MEDIUM).** One level within a file is now followed: a
+  tainted argument to a local helper whose parameter reaches a sink, and a helper that
+  returns request data. A request value used inline in the sink - the most direct flow -
+  was never reported and now is, and a TypeScript annotation (`let q: any = ...`) no longer
+  hides an assignment.
+- **Python files were analysed with JavaScript sources only.** Flask, Django and DRF
+  request attributes (names checked against Flask 3.1, Django 6.1 and DRF), `def`
+  boundaries and plain `name = value` assignments are now recognised.
+
 ### Changed - GitHub Actions are pinned to commit SHAs
 
 This repository's CI and the workflow shipped in `adapters/github-actions/` used movable
