@@ -34,6 +34,28 @@ def write(root: Path, rel: str, content: str) -> Path:
     return path
 
 
+ANDROID_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "android"
+
+
+def android_manifest(name: str) -> bytes:
+    """A binary AndroidManifest.xml compiled by aapt - see tests/fixtures/android/README.md."""
+    return (ANDROID_FIXTURES / (name + ".axml")).read_bytes()
+
+
+class _NoApksigner:
+    """Hide any installed `apksigner`, so a test does not depend on the machine."""
+
+    def __enter__(self):
+        import shutil as _sh
+        self._real = _sh.which
+        _sh.which = lambda name, *a, **k: None if name == "apksigner" else self._real(name, *a, **k)
+
+    def __exit__(self, *exc):
+        import shutil as _sh
+        _sh.which = self._real
+        return False
+
+
 class TestStaticRules(unittest.TestCase):
     """The original regex + contextual rule coverage."""
 
@@ -270,7 +292,7 @@ class TestArtifactVerification(unittest.TestCase):
             root = Path(tmp)
             apk = root / "app-release.apk"
             with zipfile.ZipFile(apk, "w") as z:
-                z.writestr("AndroidManifest.xml", 'android:debuggable="true" usesCleartextTraffic="true"')
+                z.writestr("AndroidManifest.xml", android_manifest("debuggable_cleartext_true"))
                 z.writestr("assets/.env", f"GOOGLE={GOOGLE_KEY}\n")
                 z.writestr("classes.dex", "stub")
             rule_ids = {f.rule_id for f in aegis_scan.scan_mobile_package(root, apk)}
@@ -1321,20 +1343,23 @@ class TestApkSigningDetection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             apk = _build_apk(root / "app-release.apk", **kw)
-            return {f.rule_id for f in aegis_scan.scan_mobile_package(root, apk)}
+            with _NoApksigner():
+                return {f.title for f in aegis_scan.scan_mobile_package(root, apk)}
+
+    UNSIGNED = "Mobile Package Appears Unsigned"
 
     def test_v1_signed_apk_is_not_reported_unsigned(self):
-        self.assertNotIn("ART-11", self._rules(v1=True))
+        self.assertNotIn(self.UNSIGNED, self._rules(v1=True))
 
     def test_v2_only_signed_apk_is_not_reported_unsigned(self):
         """The regression: modern release builds sign with v2/v3 only."""
-        self.assertNotIn("ART-11", self._rules(v2=True))
+        self.assertNotIn(self.UNSIGNED, self._rules(v2=True))
 
     def test_apk_signed_both_ways_is_not_reported_unsigned(self):
-        self.assertNotIn("ART-11", self._rules(v1=True, v2=True))
+        self.assertNotIn(self.UNSIGNED, self._rules(v1=True, v2=True))
 
     def test_genuinely_unsigned_apk_still_fires(self):
-        self.assertIn("ART-11", self._rules())
+        self.assertIn(self.UNSIGNED, self._rules())
 
     def test_signing_block_detector_is_accurate(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2090,7 +2115,7 @@ class TestMobilePackageOutputIsRedacted(unittest.TestCase):
                 zf.writestr("assets/config.json",
                             json.dumps({"stripe": K, "apiSecret": E, "dsn": CANARY_URL}))
                 zf.writestr("assets/.env", "API_SECRET=%s\n" % E)
-                zf.writestr("AndroidManifest.xml", "usesCleartextTraffic debuggable")
+                zf.writestr("AndroidManifest.xml", android_manifest("debuggable_cleartext_true"))
             found = aegis_scan.scan_mobile_package(root, pkg)
             bad = root / "broken.apk"
             bad.write_bytes(b"not a zip " + E.encode())
@@ -3957,3 +3982,192 @@ class TestTaintCrossesLocalFunctions(unittest.TestCase):
             "function runQuery(value) {\n  return db.query('SELECT * FROM t WHERE name = $1', [value])\n}\n"
             "export async function GET(req) {\n  const name = req.query.name\n  return runQuery(name)\n}\n"),
             [])
+
+
+# ---------------------------------------------------------------------------
+# Checklist D: mobile package verification
+# ---------------------------------------------------------------------------
+
+def _apk_with_manifest(root, manifest, name="app.apk"):
+    apk = root / name
+    with zipfile.ZipFile(apk, "w", zipfile.ZIP_DEFLATED) as z:
+        if manifest is not None:
+            z.writestr("AndroidManifest.xml", manifest)
+        z.writestr("classes.dex", b"dex\n035\0" + b"\0" * 100)
+    return apk
+
+
+class TestManifestIsDecodedNotGrepped(unittest.TestCase):
+    """The string pool holds the attribute NAME whatever its value, so the correct
+    `debuggable="false"` was flagged exactly like `true`. Fixtures are aapt output."""
+
+    def _manifest(self, fixture=None, raw=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            apk = _apk_with_manifest(root, raw if raw is not None else android_manifest(fixture))
+            with _NoApksigner():
+                found = aegis_scan.scan_mobile_package(root, apk)
+        return sorted((f.rule_id, f.severity, f.confidence) for f in found
+                      if f.rule_id in ("ART-13", "ART-14") or f.title.startswith(("Android Manifest", "App Bundle")))
+
+    def test_debuggable_true_is_high(self):
+        self.assertIn(("ART-14", "HIGH", "HIGH"), self._manifest("debuggable_cleartext_true"))
+
+    def test_debuggable_false_is_silent(self):
+        self.assertNotIn("ART-14", {r for r, _s, _c in self._manifest("debuggable_false")})
+
+    def test_cleartext_true_fires_and_false_is_silent(self):
+        self.assertIn(("ART-13", "MEDIUM", "HIGH"), self._manifest("debuggable_cleartext_true"))
+        self.assertEqual(self._manifest("cleartext_false"), [])
+
+    def test_the_default_depends_on_target_sdk(self):
+        # Android docs: cleartext defaults to allowed for targetSdkVersion 27 or lower.
+        self.assertEqual(self._manifest("no_attributes_sdk23"), [("ART-13", "MEDIUM", "HIGH")])
+        self.assertEqual(self._manifest("no_attributes_sdk28"), [])
+
+    def test_a_resource_reference_is_a_prompt_to_verify(self):
+        self.assertIn(("ART-14", "MEDIUM", "LOW"), self._manifest("debuggable_from_resource"))
+
+    def test_an_undecodable_manifest_is_a_gap(self):
+        self.assertEqual(self._manifest(raw=b"android:debuggable usesCleartextTraffic"),
+                         [("ART-10", "LOW", "HIGH")])
+
+    def test_an_app_bundle_manifest_is_a_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aab = root / "app.aab"
+            with zipfile.ZipFile(aab, "w") as z:
+                z.writestr("base/manifest/AndroidManifest.xml", b"\x0a\x07android")
+            titles = {f.title for f in aegis_scan.scan_mobile_package(root, aab)}
+        self.assertIn("App Bundle Manifest Not Decoded", titles)
+
+    def test_decoder_reads_the_exact_values(self):
+        def app(name):
+            d = aegis_scan.decode_android_manifest(android_manifest(name))
+            a = next(at for el, at in d if el == "application")
+            return {k: (v[1], v[2]) for k, v in a.items() if k in ("debuggable", "usesCleartextTraffic")}
+        self.assertEqual(app("debuggable_cleartext_true"),
+                         {"debuggable": (0x12, 0xFFFFFFFF), "usesCleartextTraffic": (0x12, 0xFFFFFFFF)})
+        self.assertEqual(app("debuggable_false"), {"debuggable": (0x12, 0)})
+        self.assertEqual(app("debuggable_from_resource")["debuggable"][0], 0x01)
+
+    def test_attributes_are_identified_by_resource_id_not_name(self):
+        """Obfuscators rename attribute strings; the resource-id map still says what an
+        attribute is (aapt decodes it the same way)."""
+        renamed = android_manifest("debuggable_cleartext_true").replace(
+            "debuggable".encode("utf-16-le"), "xyzzyabcde".encode("utf-16-le"))
+        self.assertIn(("ART-14", "HIGH", "HIGH"), self._manifest(raw=renamed))
+
+    def test_a_utf8_string_pool_decodes_identically(self):
+        """aapt2 writes UTF-8 string pools; these fixtures (aapt) are UTF-16. Re-encode
+        one fixture's pool as UTF-8 (ResStringPool_header UTF8_FLAG) and compare."""
+        import struct
+        buf = android_manifest("debuggable_cleartext_true")
+        _t, hs, _total = struct.unpack_from("<HHI", buf, 0)
+        ptype, phs, psize = struct.unpack_from("<HHI", buf, hs)
+        self.assertEqual(ptype, 0x0001)
+        strings = aegis_scan._axml_strings(buf, hs)
+        body, offsets = b"", []
+        for text in strings:
+            raw = text.encode("utf-8")
+            self.assertLess(len(raw), 0x80)
+            offsets.append(len(body))
+            body += bytes([len(text), len(raw)]) + raw + b"\0"
+        body += b"\0" * (-len(body) % 4)
+        start = phs + 4 * len(strings)
+        pool_hdr = struct.pack("<HHIIIIII", 0x0001, phs, start + len(body), len(strings), 0, 0x100, start, 0)
+        pool = pool_hdr + struct.pack("<%dI" % len(strings), *offsets) + body
+        rest = buf[hs + psize:]
+        utf8 = struct.pack("<HHI", 0x0003, hs, hs + len(pool) + len(rest)) + buf[8:hs] + pool + rest
+        self.assertEqual(aegis_scan.decode_android_manifest(utf8),
+                         aegis_scan.decode_android_manifest(buf))
+
+    def test_a_network_security_config_governs_the_default(self):
+        decoded = [("manifest", {}), ("uses-sdk", {"targetSdkVersion": (0x01010270, 0x10, 23)}),
+                   ("application", {"networkSecurityConfig": (0, 0x01, 0x7F0A0000)})]
+        real = aegis_scan.decode_android_manifest
+        aegis_scan.decode_android_manifest = lambda _b: decoded
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                zf = zipfile.ZipFile(_apk_with_manifest(Path(tmp), b"x"))
+                found = aegis_scan._manifest_findings("app.apk", zf, zf.namelist())
+                zf.close()
+        finally:
+            aegis_scan.decode_android_manifest = real
+        self.assertEqual(found, [])
+
+    def test_malformed_input_never_raises(self):
+        import random
+        rng = random.Random(1234)
+        for name in ("debuggable_cleartext_true", "no_attributes_sdk28"):
+            good = android_manifest(name)
+            for _ in range(300):
+                b = bytearray(good)
+                if rng.random() < 0.5:
+                    b = b[:rng.randrange(len(b))]
+                for _ in range(rng.randrange(1, 6)):
+                    if b:
+                        b[rng.randrange(len(b))] = rng.randrange(256)
+                result = aegis_scan.decode_android_manifest(bytes(b))
+                self.assertTrue(result is None or isinstance(result, list))
+
+
+class TestSignatureIsVerifiedOrSaidToBeUnverified(unittest.TestCase):
+    """A signing block's PRESENCE was reported as if the signature had been checked."""
+
+    def _scan(self, apk_name, verifier=None):
+        """verifier: None hides apksigner; an exit code installs a stand-in that
+        exits with it; "real" uses the installed apksigner."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            apk = root / apk_name
+            shutil.copy(ANDROID_FIXTURES / apk_name, apk)
+            if verifier == "real":
+                return {f.title for f in aegis_scan.scan_mobile_package(root, apk)}
+            if verifier is None:
+                with _NoApksigner():
+                    return {f.title for f in aegis_scan.scan_mobile_package(root, apk)}
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            tool = bin_dir / "apksigner"
+            tool.write_text("#!/bin/sh\necho 'DOES NOT VERIFY' >&2\nexit %d\n" % verifier)
+            tool.chmod(0o755)
+            old = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(bin_dir) + os.pathsep + old
+            try:
+                return {f.title for f in aegis_scan.scan_mobile_package(root, apk)}
+            finally:
+                os.environ["PATH"] = old
+
+    UNVERIFIED = "Package Signature Not Cryptographically Verified"
+    FAILS = "Package Signature Does Not Verify"
+
+    def test_without_a_verifier_the_signature_is_an_unknown(self):
+        titles = self._scan("signed.apk")
+        self.assertIn(self.UNVERIFIED, titles)
+        self.assertNotIn(self.FAILS, titles)
+
+    @unittest.skipIf(os.name == "nt", "stand-in verifier is a shell script")
+    def test_a_verifier_that_passes_clears_it(self):
+        titles = self._scan("signed.apk", 0)
+        self.assertNotIn(self.UNVERIFIED, titles)
+        self.assertNotIn(self.FAILS, titles)
+
+    @unittest.skipIf(os.name == "nt", "stand-in verifier is a shell script")
+    def test_a_verifier_that_fails_is_high(self):
+        titles = self._scan("tampered.apk", 1)
+        self.assertIn(self.FAILS, titles)
+
+    def test_an_unsigned_package_is_still_unsigned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            apk = _apk_with_manifest(root, android_manifest("cleartext_false"))
+            with _NoApksigner():
+                titles = {f.title for f in aegis_scan.scan_mobile_package(root, apk)}
+        self.assertIn("Mobile Package Appears Unsigned", titles)
+        self.assertNotIn(self.UNVERIFIED, titles)
+
+    @unittest.skipUnless(shutil.which("apksigner"), "apksigner is not installed")
+    def test_against_the_real_apksigner(self):
+        self.assertFalse({self.UNVERIFIED, self.FAILS} & self._scan("signed.apk", "real"))
+        self.assertIn(self.FAILS, self._scan("tampered.apk", "real"))

@@ -166,6 +166,26 @@ Reproduced on this branch before each change; each has matched vulnerable and sa
   request attributes (names checked against Flask 3.1, Django 6.1 and DRF), `def`
   boundaries and plain `name = value` assignments are now recognised.
 
+### Fixed - mobile package verification (checklist D)
+
+- **A signing block's presence was taken as a valid signature (HIGH).** It proves the
+  structure exists, not that the certificate and content digests are valid. When
+  `apksigner` is on PATH the package is now verified with it (`ART-11` if it fails);
+  otherwise the signature is an `ART-10` gap, "not cryptographically verified". No
+  cryptography is reimplemented here: the platform's own verifier decides, or nothing does.
+  Checked with the real `apksigner` 31.0.2 on signed, v1-only, v2-only, v3 and tampered
+  packages.
+- **Manifest checks grepped the string pool (MEDIUM).** The binary manifest is now decoded
+  (layout from AOSP `ResourceTypes.h`), so `android:debuggable="true"` is `ART-14` at HIGH
+  and the correct `false` is silent; `usesCleartextTraffic="true"`, or its absence below
+  targetSdk 28 with no network security config (the documented default), is `ART-13`.
+  A value taken from a resource is a LOW-confidence prompt to verify; an undecodable
+  manifest, or an `.aab`'s protobuf manifest, is an `ART-10` gap. The decoder matches
+  `aapt dump xmltree` on every attribute of 54 real APKs (UTF-16 and UTF-8 string pools),
+  and on 56 real APKs the scanner agrees with `aapt` on debuggable and with `apksigner` on
+  signature validity in every case. Test fixtures in `tests/fixtures/android/` are real
+  `aapt`/`apksigner` output built from manifests in the same directory.
+
 ### Changed - GitHub Actions are pinned to commit SHAs
 
 This repository's CI and the workflow shipped in `adapters/github-actions/` used movable

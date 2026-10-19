@@ -79,8 +79,9 @@ STEP 7 - WRITE .aegis/ARTIFACT_REPORT.md
 
 RULES
 - ART-01 is confirmed evidence - never downgrade or dismiss it.
-- ART-13 and ART-14 come from strings inside binary XML; report them as MANUAL_REVIEW unless you
-  decode the manifest properly.
+- ART-13 and ART-14 are read from the decoded binary manifest; a LOW-confidence one takes its value
+  from a resource - report it as MANUAL_REVIEW. If ART-10 says the signature was not verified, run
+  `apksigner verify --print-certs` before calling the package signed.
 - Never print a full credential in the report - the scanner redacts, and so must you.
 - Say a credential is EXPOSED, never that it was exploited. You cannot know that.
 ```

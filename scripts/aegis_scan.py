@@ -3035,6 +3035,211 @@ def has_apk_signing_block(pkg_path: Path) -> Optional[bool]:
     return data[cd_offset - 16:cd_offset] == b"APK Sig Block 42"
 
 
+# ---- Android binary XML (AndroidManifest.xml inside an APK) ----------------
+# Layout from AOSP frameworks/base/libs/androidfw/include/androidfw/ResourceTypes.h:
+# a RES_XML_TYPE chunk holding a string pool, a resource-id map and element chunks
+# whose attributes carry a typed Res_value. Checked against `aapt dump xmltree` on
+# every attribute of 54 real APKs (UTF-16 and UTF-8 string pools) with no mismatch.
+_AXML_TYPE, _AXML_STRING_POOL, _AXML_RESOURCE_MAP, _AXML_START_ELEMENT = 0x0003, 0x0001, 0x0180, 0x0102
+_RES_TYPE_REFERENCE, _RES_TYPE_INT_DEC, _RES_TYPE_INT_HEX, _RES_TYPE_BOOLEAN = 0x01, 0x10, 0x11, 0x12
+# Platform attribute resource ids, as printed by `aapt dump xmltree` for android.jar.
+_ATTR_DEBUGGABLE, _ATTR_CLEARTEXT, _ATTR_TARGET_SDK, _ATTR_MIN_SDK = 0x0101000F, 0x010104EC, 0x01010270, 0x0101020C
+
+
+def _axml_strings(buf: bytes, off: int) -> List[str]:
+    import struct
+    _t, header_size, _size = struct.unpack_from("<HHI", buf, off)
+    count, _styles, flags, strings_start, _ = struct.unpack_from("<IIIII", buf, off + 8)
+    offsets = struct.unpack_from("<%dI" % count, buf, off + header_size)
+    base, utf8, out = off + strings_start, bool(flags & 0x100), []
+    for o in offsets:
+        q = base + o
+        if utf8:
+            q += 2 if buf[q] & 0x80 else 1                 # UTF-16 length, not needed
+            n = buf[q]
+            if n & 0x80:
+                n, q = ((n & 0x7F) << 8) | buf[q + 1], q + 2
+            else:
+                q += 1
+            out.append(buf[q:q + n].decode("utf-8", errors="replace"))
+        else:
+            n = struct.unpack_from("<H", buf, q)[0]
+            q += 2
+            if n & 0x8000:
+                n, q = ((n & 0x7FFF) << 16) | struct.unpack_from("<H", buf, q)[0], q + 2
+            out.append(buf[q:q + 2 * n].decode("utf-16-le", errors="replace"))
+    return out
+
+
+def decode_android_manifest(buf: bytes) -> Optional[List[Tuple[str, Dict[str, Tuple[int, int, int]]]]]:
+    """[(element, {attribute: (resource_id, value_type, value)})], or None if `buf` is
+    not binary XML this decoder can read. Never raises on malformed input."""
+    import struct
+    try:
+        kind, header_size, total = struct.unpack_from("<HHI", buf, 0)
+        if kind != _AXML_TYPE or total > len(buf):
+            return None
+        strings: List[str] = []
+        res_ids: List[int] = []
+        elements = []
+        off = header_size
+        while off + 8 <= total:
+            ctype, chs, csize = struct.unpack_from("<HHI", buf, off)
+            if csize < 8 or off + csize > total:
+                return None
+            if ctype == _AXML_STRING_POOL:
+                strings = _axml_strings(buf, off)
+            elif ctype == _AXML_RESOURCE_MAP:
+                res_ids = list(struct.unpack_from("<%dI" % ((csize - chs) // 4), buf, off + chs))
+            elif ctype == _AXML_START_ELEMENT:
+                ext = off + chs
+                _ns, name, attr_start, attr_size, attr_count = struct.unpack_from("<IIHHH", buf, ext)
+                attrs = {}
+                for i in range(attr_count):
+                    _ans, aname, _raw, _sz, _r0, dtype, data = struct.unpack_from(
+                        "<IIIHBBI", buf, ext + attr_start + i * attr_size)
+                    attrs[strings[aname] if aname < len(strings) else ""] = (
+                        res_ids[aname] if aname < len(res_ids) else 0, dtype, data)
+                elements.append((strings[name] if name < len(strings) else "", attrs))
+            off += csize
+        return elements
+    except (struct.error, IndexError, ValueError, MemoryError):
+        return None
+
+
+def _manifest_attr(attrs: Dict[str, Tuple[int, int, int]], res_id: int, name: str):
+    for key, value in attrs.items():
+        if value[0] == res_id or (value[0] == 0 and key == name):
+            return value
+    return None
+
+
+def _manifest_findings(rel: str, zf, names: List[str]) -> List["Finding"]:
+    def gap(title: str, detail: str) -> "Finding":
+        return Finding(
+            rule_id="ART-10", domain="ARTIFACT", severity="LOW", title=title, file=rel, line=0,
+            snippet=evidence(detail, 300), cwe_or_standard="Informational",
+            remediation=("Check the release build with `aapt dump xmltree <pkg> AndroidManifest.xml` "
+                         "(or `apkanalyzer manifest print`): `android:debuggable` must not be true, "
+                         "and cleartext traffic must be off unless it is deliberate."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED")
+
+    if "AndroidManifest.xml" not in names:
+        if "base/manifest/AndroidManifest.xml" in names:
+            # An App Bundle stores its manifest as a protocol buffer, not binary XML.
+            return [gap("App Bundle Manifest Not Decoded",
+                        "The .aab manifest is in protocol-buffer format, which this scanner does not "
+                        "decode, so debuggable and cleartext settings were not checked.")]
+        return []
+    try:
+        decoded = decode_android_manifest(zf.read("AndroidManifest.xml"))
+    except Exception:
+        decoded = None
+    if not decoded:
+        return [gap("Android Manifest Could Not Be Decoded",
+                    "AndroidManifest.xml is not binary XML this scanner can read, so debuggable "
+                    "and cleartext settings were not checked.")]
+
+    app = next((a for e, a in decoded if e == "application"), {})
+    sdk = next((a for e, a in decoded if e == "uses-sdk"), {})
+    where = f"{rel}!AndroidManifest.xml"
+    out: List[Finding] = []
+
+    debuggable = _manifest_attr(app, _ATTR_DEBUGGABLE, "debuggable")
+    if debuggable and debuggable[1] == _RES_TYPE_BOOLEAN and debuggable[2]:
+        out.append(Finding(
+            rule_id="ART-14", domain="ARTIFACT", severity="HIGH",
+            title="App Package Is Debuggable (`android:debuggable=\"true\"`)", file=where, line=0,
+            snippet="The decoded manifest sets android:debuggable to true.",
+            cwe_or_standard="CWE-489 Active Debug Code / OWASP MASVS-RESILIENCE",
+            remediation=("Build the release variant (debuggable is false there by default) and remove "
+                         "any explicit android:debuggable=\"true\": a debuggable app lets anyone "
+                         "attach a debugger, read its memory and run code as the app."),
+            confidence="HIGH"))
+    elif debuggable and debuggable[1] != _RES_TYPE_BOOLEAN:
+        out.append(Finding(
+            rule_id="ART-14", domain="ARTIFACT", severity="MEDIUM",
+            title="`android:debuggable` Is Set From A Resource - Verify It Is False", file=where, line=0,
+            snippet="android:debuggable is a resource reference, which the manifest alone cannot resolve.",
+            cwe_or_standard="CWE-489 Active Debug Code / OWASP MASVS-RESILIENCE",
+            remediation="Confirm with `aapt dump badging <pkg> | grep debuggable` that the release build is not debuggable.",
+            confidence="LOW"))
+
+    cleartext = _manifest_attr(app, _ATTR_CLEARTEXT, "usesCleartextTraffic")
+    target = _manifest_attr(sdk, _ATTR_TARGET_SDK, "targetSdkVersion") or _manifest_attr(
+        sdk, _ATTR_MIN_SDK, "minSdkVersion")
+    target_sdk = target[2] if target and target[1] in (_RES_TYPE_INT_DEC, _RES_TYPE_INT_HEX) else None
+    has_nsc = "networkSecurityConfig" in app
+    cleartext_remediation = ("Set `android:usesCleartextTraffic=\"false\"` (or a Network Security Config "
+                             "that denies cleartext) so every request must use HTTPS.")
+    if cleartext and cleartext[1] == _RES_TYPE_BOOLEAN and cleartext[2]:
+        out.append(Finding(
+            rule_id="ART-13", domain="ARTIFACT", severity="MEDIUM",
+            title="App Allows Cleartext Traffic (`android:usesCleartextTraffic=\"true\"`)", file=where, line=0,
+            snippet="The decoded manifest sets android:usesCleartextTraffic to true.",
+            cwe_or_standard="CWE-319 Cleartext Transmission / OWASP MASVS-NETWORK",
+            remediation=cleartext_remediation, confidence="MEDIUM" if has_nsc else "HIGH"))
+    elif cleartext and cleartext[1] != _RES_TYPE_BOOLEAN:
+        out.append(Finding(
+            rule_id="ART-13", domain="ARTIFACT", severity="MEDIUM",
+            title="`android:usesCleartextTraffic` Is Set From A Resource - Verify It Is False",
+            file=where, line=0, snippet="The value is a resource reference the manifest alone cannot resolve.",
+            cwe_or_standard="CWE-319 Cleartext Transmission / OWASP MASVS-NETWORK",
+            remediation=cleartext_remediation, confidence="LOW"))
+    elif cleartext is None and not has_nsc and target_sdk is not None and target_sdk <= 27:
+        # Android docs: the default is "true" for apps targeting API level 27 or lower.
+        out.append(Finding(
+            rule_id="ART-13", domain="ARTIFACT", severity="MEDIUM",
+            title=f"App Allows Cleartext Traffic By Default (targetSdkVersion {target_sdk})",
+            file=where, line=0,
+            snippet=evidence(f"No usesCleartextTraffic or networkSecurityConfig, and targetSdkVersion "
+                             f"{target_sdk} is 27 or lower, where cleartext defaults to allowed.", 300),
+            cwe_or_standard="CWE-319 Cleartext Transmission / OWASP MASVS-NETWORK",
+            remediation=cleartext_remediation, confidence="HIGH"))
+    return out
+
+
+def _verify_apk_signature(rel: str, pkg_path: Path) -> List["Finding"]:
+    """Verify with the platform's `apksigner`, or say plainly that nothing was verified."""
+    import shutil
+    import subprocess
+    tool = shutil.which("apksigner")
+    if not tool:
+        return [Finding(
+            rule_id="ART-10", domain="ARTIFACT", severity="LOW",
+            title="Package Signature Not Cryptographically Verified", file=rel, line=0,
+            snippet=("A signature block is present, but its certificate and content digests were not "
+                     "checked: `apksigner` is not on PATH."),
+            cwe_or_standard="Informational",
+            remediation=("Install Android build-tools (or your distribution's `apksigner` package) and "
+                         "re-run, or verify by hand with `apksigner verify --print-certs <file>`."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED")]
+    try:
+        proc = subprocess.run([tool, "verify", "--print-certs", str(pkg_path)],
+                              capture_output=True, text=True, timeout=120, shell=False)
+    except Exception as exc:
+        return [Finding(
+            rule_id="ART-10", domain="ARTIFACT", severity="LOW",
+            title="Package Signature Verification Did Not Complete", file=rel, line=0,
+            snippet=evidence(f"apksigner could not be run: {type(exc).__name__}", 200),
+            cwe_or_standard="Informational",
+            remediation="Run `apksigner verify --print-certs <file>` by hand.",
+            confidence="HIGH", kind="skipped_check", status="SKIPPED")]
+    if proc.returncode == 0:
+        return []
+    detail = " ".join(ln.strip() for ln in (proc.stdout + "\n" + proc.stderr).splitlines()
+                      if ln.strip() and not ln.startswith("Picked up "))
+    return [Finding(
+        rule_id="ART-11", domain="ARTIFACT", severity="HIGH",
+        title="Package Signature Does Not Verify", file=rel, line=0,
+        snippet=evidence(f"apksigner exited {proc.returncode}: {detail}", 300),
+        cwe_or_standard="CWE-347 Improper Verification of Cryptographic Signature",
+        remediation=("The package was modified after signing, or signed incorrectly. Rebuild and sign "
+                     "the release with your upload key; never ship a package that fails "
+                     "`apksigner verify`."),
+        confidence="HIGH")]
+
+
 def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
     """Inspect an APK/AAB/IPA as a zip archive - no external tooling required."""
     import zipfile
@@ -3096,6 +3301,11 @@ def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
                     confidence="HIGH", kind="skipped_check", status="SKIPPED",
                 )
             )
+        elif pkg_path.suffix.lower() == ".apk":
+            # A signing block is present. That is structure, not proof: the certificate
+            # and the content digests are checked by the platform's own verifier or not
+            # at all - never by a guess of ours.
+            findings.extend(_verify_apk_signature(rel, pkg_path))
 
         # Configuration files that should never ship inside an app package.
         for n in names:
@@ -3113,54 +3323,10 @@ def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
                     )
                 )
 
-        # Manifest posture. AndroidManifest.xml inside an APK is binary XML, so we
-        # look for the encoded attribute strings rather than parsing it as text.
-        for manifest_name in ("AndroidManifest.xml", "base/manifest/AndroidManifest.xml"):
-            if manifest_name not in names:
-                continue
-            try:
-                raw = zf.read(manifest_name)
-            except Exception:
-                continue
-            decoded = raw.decode("utf-16-le", errors="ignore") + raw.decode("utf-8", errors="ignore")
-            if "usesCleartextTraffic" in decoded:
-                findings.append(
-                    Finding(
-                        rule_id="ART-13", domain="ARTIFACT", severity="MEDIUM",
-                        title="Manifest References Cleartext Traffic",
-                        file=f"{rel}!{manifest_name}", line=0,
-                        snippet="`usesCleartextTraffic` appears in the manifest.",
-                        cwe_or_standard="CWE-319 Cleartext Transmission / OWASP MASVS-NETWORK",
-                        remediation="Set `android:usesCleartextTraffic=\"false\"` and define a network security config that requires HTTPS.",
-                        confidence="MEDIUM",
-                    )
-                )
-            if "debuggable" in decoded:
-                # Binary AndroidManifest stores booleans as integers in a separate value
-                # array, so the string pool proves only that the ATTRIBUTE is present -
-                # `android:debuggable="false"`, which is the correct hardening, leaves the
-                # same string behind. Reporting this HIGH failed `--fail-on-high` on
-                # properly configured release builds. It is a prompt to verify, not a
-                # defect we can demonstrate, so it is graded accordingly.
-                findings.append(
-                    Finding(
-                        rule_id="ART-14", domain="ARTIFACT", severity="MEDIUM",
-                        title="Manifest References The `debuggable` Attribute - Verify It Is False",
-                        file=f"{rel}!{manifest_name}", line=0,
-                        snippet=(
-                            "`debuggable` appears in the manifest string pool. Its VALUE cannot be "
-                            "read from a binary manifest without full decoding, so this may be the "
-                            "correct `android:debuggable=\"false\"`."
-                        ),
-                        cwe_or_standard="CWE-489 Active Debug Code / OWASP MASVS-RESILIENCE",
-                        remediation=(
-                            "Confirm with `aapt dump badging <pkg> | grep debuggable` (or `apkanalyzer "
-                            "manifest debuggable`) that the release build is not debuggable - a "
-                            "debuggable app lets anyone inspect its memory and data."
-                        ),
-                        confidence="LOW",
-                    )
-                )
+        # Manifest posture, read from the decoded binary manifest. Searching its string
+        # pool for "debuggable" flagged the correct `android:debuggable="false"` exactly
+        # like `true`, because the attribute NAME is there either way.
+        findings.extend(_manifest_findings(rel, zf, names))
 
         # Credential sweep across packaged assets and code sections. Every eligible entry
         # this does not read is a coverage gap: entries over the size cap, entries that

@@ -434,10 +434,10 @@ Source code says what you wrote. The build output says what ships. Because the s
 | `ART-01` | **Confirmed secret leak** | Critical | A credential from your source is present in the shipped bundle. Confirmed by construction |
 | `ART-02` | Source map shipped | Medium / Low | With `sourcesContent`, your original unminified source reaches every visitor |
 | `ART-03` | Credential in bundle | Critical–Medium | A provider-format key found directly in shipped JS/HTML/JSON |
-| `ART-11` | Unsigned package | High | Neither a v1 signature under `META-INF/` nor a v2/v3 APK Signing Block. A v2-only release (the modern default) is correctly recognised as signed; an unreadable archive or an `.aab` reports `ART-10` instead of guessing |
+| `ART-11` | Unsigned, or signature does not verify | High | Neither a v1 signature under `META-INF/` nor a v2/v3 APK Signing Block - or, when `apksigner` is on PATH, `apksigner verify` rejects the package. A v2-only release (the modern default) is correctly recognised as signed. A signature that is present but could not be verified (no `apksigner`), an unreadable archive or an `.aab` reports `ART-10` instead of guessing |
 | `ART-12` | Config bundled in app | Critical | `.env`, `id_rsa` or `service-account.json` inside the `.apk`/`.aab`/`.ipa` |
-| `ART-13` | Cleartext traffic | Medium | Manifest references cleartext HTTP |
-| `ART-14` | Debuggable release | Medium | The `debuggable` attribute appears in the manifest. A binary manifest stores the *value* separately, so correct `debuggable="false"` hardening looks identical — verify with `aapt dump badging` |
+| `ART-13` | Cleartext traffic | Medium | The decoded manifest sets `android:usesCleartextTraffic="true"`, or omits it with `targetSdkVersion` 27 or lower and no network security config (cleartext is then allowed by default). `false` is silent |
+| `ART-14` | Debuggable release | High | The decoded binary manifest sets `android:debuggable="true"`. `false` is silent; a value taken from a resource is reported `MEDIUM` at `LOW` confidence, to verify with `aapt dump badging`. A manifest that cannot be decoded (or an `.aab`'s protobuf manifest) is an `ART-10` gap |
 | `ART-15` | Credential in package | Critical–Medium | A key embedded in packaged assets, resources or code |
 
 ### G. Supply Chain & Git History
