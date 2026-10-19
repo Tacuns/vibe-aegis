@@ -117,7 +117,7 @@ Also honoured: a `.aegis-ignore` file in the repo root, one entry per line, eith
 | `--deps` | Check dependencies against the OSV vulnerability database. |
 | `--url <URL>` | Passive, read-only live header and exposure checks. |
 | `--all` | Enable artifacts + git history + dependencies. |
-| `--offline` | Disable this scanner's own network requests. Does not apply to external engines. |
+| `--offline` | No network request from this run: disables `--deps` and `--url`, and starts only external engines verified to work offline (`gitleaks`, `trufflehog`); others become `ENG-00` gaps. |
 
 **External engines (optional, never auto-installed)**
 
@@ -175,10 +175,11 @@ python3 scripts/aegis_scan.py . --fail-on-high
 
 A default scan makes no network request, and there is no telemetry. `--deps` (and `--all`,
 `--profile full`, `--profile release`) sends dependency names and versions to
-`https://api.osv.dev/v1/querybatch`. `--url` sends one `GET` to the supplied URL and one
-each to `/.env` and `/.git/config` on the same host. `--offline` disables both. External
-engines are separate programs with their own network behaviour, and `--offline` does not
-apply to them.
+`https://api.osv.dev/v1/querybatch`, then fetches each matched advisory's record from
+`https://api.osv.dev/v1/vulns/<id>` (at most 200) to read its severity. `--url` sends one
+`GET` to the supplied URL and one each to `/.env` and `/.git/config` on the same host.
+`--offline` disables both, and starts only the external engines verified to run without
+a network (`gitleaks`, `trufflehog`).
 
 ## What `--url` Actually Does
 

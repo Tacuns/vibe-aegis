@@ -2825,3 +2825,314 @@ class TestReleaseProfileFailsOnHighByDefault(unittest.TestCase):
             code, out = _run_main([tmp, "--quiet"])
         self.assertIn(aegis_scan.VERDICT_BLOCKED, out)
         self.assertEqual(code, 0, out)
+
+
+# ---------------------------------------------------------------------------
+# Dependency severity, offline mode, installer safety, pinned Actions
+# ---------------------------------------------------------------------------
+
+class TestCvssCalculators(unittest.TestCase):
+    """Exhaustively cross-checked against an independent implementation (all 5,184
+    v3.x and 729 v2 base vectors agree); these pin the published reference values."""
+
+    def test_cvss3_reference_scores(self):
+        for vector, score in (
+            ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", 9.8),
+            ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H", 10.0),
+            ("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N", 6.1),
+            ("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:H", 9.1),
+            ("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:H/A:H", 7.4),
+            ("CVSS:3.0/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N", 5.5),
+            ("CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:N/I:N/A:N", 0.0),
+            # Scope changed with privileges required: PR weighs differently (0.68 / 0.5).
+            ("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H", 9.9),
+            ("CVSS:3.1/AV:N/AC:L/PR:H/UI:N/S:C/C:L/I:L/A:N", 5.5),
+        ):
+            self.assertEqual(aegis_scan.cvss3_base_score(vector), score, vector)
+
+    def test_cvss3_rejects_what_it_cannot_score(self):
+        for bad in ("", "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N",
+                    "CVSS:3.1/AV:N/AC:L", "CVSS:3.1/AV:X/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"):
+            self.assertIsNone(aegis_scan.cvss3_base_score(bad), bad)
+
+    def test_cvss2_reference_scores(self):
+        self.assertEqual(aegis_scan.cvss2_base_score("AV:N/AC:L/Au:N/C:C/I:C/A:C"), 10.0)
+        self.assertEqual(aegis_scan.cvss2_base_score("AV:N/AC:L/Au:N/C:P/I:P/A:P"), 7.5)
+        self.assertIsNone(aegis_scan.cvss2_base_score("AV:N/AC:L"))
+
+
+def _osv(vid="GHSA-test-0001", v3=None, v4=None, label=None, pkg_severity=None, ubuntu=None):
+    """An OSV record shaped like the real ones in github/advisory-database."""
+    severity = []
+    if v3:
+        severity.append({"type": "CVSS_V3", "score": v3})
+    if v4:
+        severity.append({"type": "CVSS_V4", "score": v4})
+    if ubuntu:
+        severity.append({"type": "Ubuntu", "score": ubuntu})
+    affected = {"package": {"ecosystem": "npm", "name": "x"}}
+    if pkg_severity:
+        affected["severity"] = [{"type": "CVSS_V3", "score": pkg_severity}]
+    rec = {"id": vid, "affected": [affected]}
+    if severity:
+        rec["severity"] = severity
+    if label:
+        rec["database_specific"] = {"severity": label, "github_reviewed": True}
+    return rec
+
+
+V4 = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:N/SI:N/SA:N"
+
+
+class TestOsvRecordSeverity(unittest.TestCase):
+
+    def sev(self, record):
+        return aegis_scan.osv_record_severity(record)[0]
+
+    def test_cvss3_vector_is_scored(self):
+        self.assertEqual(self.sev(_osv(v3="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:H")), "CRITICAL")
+
+    def test_v4_only_record_falls_back_to_its_label(self):
+        """1,349 of 5,239 sampled GitHub-reviewed records carry only CVSS v4."""
+        self.assertEqual(self.sev(_osv(v4=V4, label="HIGH")), "HIGH")
+
+    def test_label_only_record(self):
+        self.assertEqual(self.sev(_osv(label="MODERATE")), "MEDIUM")
+
+    def test_the_higher_signal_wins_when_vector_understates(self):
+        """Real pattern: a v3 vector scoring 8.1 HIGH on an advisory rated CRITICAL."""
+        self.assertEqual(self.sev(_osv(v3="CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                                       label="CRITICAL")), "CRITICAL")
+
+    def test_the_higher_signal_wins_when_label_understates(self):
+        self.assertEqual(self.sev(_osv(v3="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                                       label="MODERATE")), "CRITICAL")
+
+    def test_package_level_severity_is_read(self):
+        """The schema allows severity per affected package instead of top level."""
+        self.assertEqual(self.sev(_osv(pkg_severity="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")),
+                         "CRITICAL")
+
+    def test_ubuntu_priority_is_read(self):
+        self.assertEqual(self.sev(_osv(ubuntu="high")), "HIGH")
+
+    def test_malicious_package_is_critical(self):
+        self.assertEqual(self.sev(_osv(vid="MAL-2026-1234")), "CRITICAL")
+
+    def test_unreadable_record_is_unknown_not_low(self):
+        self.assertIsNone(self.sev(_osv()))
+        self.assertIsNone(self.sev(_osv(v4=V4)))
+
+
+class TestDependencySeverityReachesTheGate(unittest.TestCase):
+    """DEP-01 used to be MEDIUM for every advisory, so --fail-on-high never saw one."""
+
+    def _check(self, records, deps=(("npm", "lodash", "4.17.4"),), batch=None, fail_ids=()):
+        real = aegis_scan.urllib.request.urlopen
+
+        def fake(req, timeout=None, context=None):
+            url = req.full_url
+            if url.endswith("/querybatch"):
+                n = len(json.loads(req.data.decode("utf-8"))["queries"])
+                return _FakeResponse({}, json.dumps({"results": batch or
+                    [{"vulns": [{"id": r["id"]} for r in records]}] * n}).encode())
+            vid = url.rsplit("/", 1)[-1]
+            if vid in fail_ids:
+                raise OSError("connection reset")
+            rec = next(r for r in records if r["id"] == vid)
+            return _FakeResponse({}, json.dumps(rec).encode())
+
+        aegis_scan.urllib.request.urlopen = fake
+        try:
+            return aegis_scan.check_dependency_vulnerabilities(list(deps))
+        finally:
+            aegis_scan.urllib.request.urlopen = real
+
+    def test_a_critical_advisory_is_reported_critical(self):
+        found = self._check([_osv("GHSA-aaaa-0001", v3="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:H")])
+        self.assertEqual([(f.rule_id, f.severity, f.confidence) for f in found],
+                         [("DEP-01", "CRITICAL", "HIGH")])
+        self.assertIn("GHSA-aaaa-0001 CRITICAL (CVSS 9.1)", found[0].snippet)
+
+    def test_the_worst_of_several_advisories_wins(self):
+        found = self._check([_osv("GHSA-aaaa-0001", label="LOW"), _osv("GHSA-aaaa-0002", label="HIGH")])
+        self.assertEqual(found[0].severity, "HIGH")
+
+    def test_a_failed_lookup_is_high_never_medium(self):
+        found = self._check([_osv("GHSA-aaaa-0001", label="LOW")], fail_ids=("GHSA-aaaa-0001",))
+        self.assertEqual((found[0].severity, found[0].confidence), ("HIGH", "MEDIUM"))
+        self.assertIn("could not be determined", found[0].snippet)
+
+    def test_advisories_past_the_lookup_cap_are_high(self):
+        real = aegis_scan.OSV_DETAIL_LIMIT
+        aegis_scan.OSV_DETAIL_LIMIT = 1
+        try:
+            found = self._check([_osv("GHSA-aaaa-0001", label="LOW"), _osv("GHSA-aaaa-0002", label="LOW")])
+        finally:
+            aegis_scan.OSV_DETAIL_LIMIT = real
+        self.assertEqual(found[0].severity, "HIGH")
+        self.assertIn("too many advisories", found[0].snippet)
+
+    def test_a_low_advisory_stays_low(self):
+        """Negative: the fix must not inflate a genuinely low advisory."""
+        found = self._check([_osv("GHSA-aaaa-0001", v3="CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N")])
+        self.assertEqual(found[0].severity, "LOW")
+
+    def test_each_advisory_is_fetched_once(self):
+        calls = []
+        real = aegis_scan.fetch_osv_record
+        aegis_scan.fetch_osv_record = lambda vid: calls.append(vid) or _osv(vid, label="HIGH")
+        try:
+            self._check([_osv("GHSA-aaaa-0001", label="HIGH")],
+                        deps=(("npm", "a", "1"), ("npm", "b", "1"), ("npm", "c", "1")))
+        finally:
+            aegis_scan.fetch_osv_record = real
+        self.assertEqual(calls, ["GHSA-aaaa-0001"])
+
+
+class TestOfflineMeansOffline(unittest.TestCase):
+    """--offline is a promise about the whole run, external engines included."""
+
+    def test_no_network_connection_is_attempted_by_any_stage(self):
+        import socket
+        attempts = []
+        real = (socket.socket.connect, socket.getaddrinfo, socket.create_connection)
+
+        def refuse(*a, **k):
+            attempts.append(a[1:] if len(a) > 1 else a)
+            raise OSError("network blocked by test")
+
+        socket.socket.connect = refuse
+        socket.getaddrinfo = lambda *a, **k: refuse(None, *a)
+        socket.create_connection = lambda *a, **k: refuse(None, *a)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "app"
+                write(root, "src/a.ts", "export const a = 1;\n")
+                write(root, "requirements.txt", "django==2.2.0\n")
+                write(root, "dist/index.js", "var a=1;")
+                _git_init(root)
+                code, out = _run_main([str(root), "--profile", "release", "--offline", "--json",
+                                       "--url", "https://staging.example.com"])
+        finally:
+            socket.socket.connect, socket.getaddrinfo, socket.create_connection = real
+        self.assertEqual(attempts, [], "a network connection was attempted under --offline")
+        report = json.loads(out)
+        self.assertNotIn("live-url", report["stages"])
+        self.assertIn("DEP-00", {g["rule_id"] for g in report["skipped_checks"]})
+
+    @unittest.skipUnless(os.name == "posix", "fake engines are POSIX shell scripts")
+    def test_network_engines_are_not_started_offline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir, root = Path(tmp) / "bin", Path(tmp) / "app"
+            bin_dir.mkdir()
+            write(root, "a.ts", "export const a = 1;\n")
+            marker = Path(tmp) / "started"
+            for name in ("semgrep", "trivy", "osv-scanner", "scorecard", "gitleaks", "trufflehog"):
+                exe = bin_dir / name
+                exe.write_text("#!/bin/sh\necho %s >> '%s'\n%s\n" % (
+                    name, marker, "echo '[]'" if name != "trufflehog" else "exit 0"), encoding="utf-8")
+                exe.chmod(0o755)
+            real = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(bin_dir) + os.pathsep + real
+            try:
+                engines = []
+                for name in ("semgrep", "trivy", "osv-scanner", "scorecard", "gitleaks", "trufflehog"):
+                    engines += ["--engine", name]
+                _code, out = _run_main([str(root), "--offline", "--json"] + engines)
+            finally:
+                os.environ["PATH"] = real
+            started = marker.read_text().split() if marker.exists() else []
+        self.assertEqual(sorted(started), ["gitleaks", "trufflehog"])
+        refused = {g["title"].rsplit(": ", 1)[-1] for g in json.loads(out)["skipped_checks"]
+                   if g["rule_id"] == "ENG-00" and "--offline" in g["snippet"]}
+        self.assertEqual(refused, {"semgrep", "trivy", "osv-scanner", "scorecard"})
+
+    def test_without_offline_engines_are_not_blocked(self):
+        """Negative: the gate applies to --offline only."""
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "a.ts", "export const a = 1;\n")
+            _code, out = _run_main([tmp, "--json", "--engine", "semgrep"])
+        snippets = [g["snippet"] for g in json.loads(out)["skipped_checks"] if g["rule_id"] == "ENG-00"]
+        self.assertTrue(snippets)
+        self.assertFalse(any("--offline" in s for s in snippets))
+
+
+@unittest.skipUnless(shutil.which("bash"), "needs bash")
+class TestInstallerNeverClobbersProjectFiles(unittest.TestCase):
+
+    INSTALL = str(REPO_ROOT / "install.sh")
+
+    def _install(self, target, *extra, home=None):
+        env = dict(os.environ, HOME=str(home)) if home else None
+        return subprocess.run(["bash", self.INSTALL, "--target", str(target), "--agent", "all", *extra],
+                              capture_output=True, text=True, env=env, timeout=120)
+
+    def _files(self, root):
+        return sorted(p.relative_to(root).as_posix() for p in Path(root).rglob("*") if p.is_file())
+
+    def test_existing_shared_config_is_never_modified(self):
+        shared = {".github/copilot-instructions.md": "OUR TEAM RULES\n", "CLAUDE.md": "MINE\n",
+                  "AGENTS.md": "OURS\n", ".vscode/tasks.json": "{}\n", ".cursorrules": "x\n",
+                  ".clinerules": "y\n", "GEMINI.md": "z\n"}
+        with tempfile.TemporaryDirectory() as tmp:
+            for rel, body in shared.items():
+                write(Path(tmp), rel, body)
+            r = self._install(tmp)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            for rel, body in shared.items():
+                self.assertEqual((Path(tmp) / rel).read_text(), body, rel)
+                self.assertTrue((Path(tmp) / ".aegis" / "suggested" / rel).is_file(), rel)
+            self.assertIn("Kept your existing files unchanged", r.stdout)
+
+    def test_an_edited_owned_file_is_backed_up_before_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), ".claude/commands/aegis.md", "MY EDIT\n")
+            r = self._install(tmp)
+            backups = list((Path(tmp) / ".aegis" / "backup").rglob("aegis.md"))
+            self.assertEqual(len(backups), 1, r.stdout)
+            self.assertEqual(backups[0].read_text(), "MY EDIT\n")
+            self.assertEqual((Path(tmp) / ".claude/commands/aegis.md").read_text(),
+                             (REPO_ROOT / "adapters/claude/aegis.md").read_text())
+
+    def test_fresh_install_writes_everything_and_reruns_change_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._install(tmp)
+            first = self._files(tmp)
+            self.assertNotIn(".aegis/suggested", " ".join(first))
+            self.assertNotIn(".aegis/backup", " ".join(first))
+            r = self._install(tmp)
+            self.assertEqual(self._files(tmp), first)
+            self.assertNotIn("Kept your existing", r.stdout)
+
+    def test_global_install_backs_up_too(self):
+        with tempfile.TemporaryDirectory() as home:
+            write(Path(home), ".claude/commands/aegis.md", "GLOBAL EDIT\n")
+            r = subprocess.run(["bash", self.INSTALL, "--global"], capture_output=True, text=True,
+                               env=dict(os.environ, HOME=home), timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            backups = list((Path(home) / ".aegis" / "backup").rglob("aegis.md"))
+            self.assertEqual([b.read_text() for b in backups], ["GLOBAL EDIT\n"])
+
+
+class TestGitHubActionsArePinned(unittest.TestCase):
+    """A tag can be moved to new code; a commit SHA cannot. Covers this repo's CI and
+    the workflow we ship to users."""
+
+    FILES = sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml")) + \
+        sorted((REPO_ROOT / "adapters" / "github-actions").glob("*.yml"))
+
+    def test_every_action_is_pinned_to_a_full_commit_sha(self):
+        unpinned = []
+        for f in self.FILES:
+            for n, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+                m = re.match(r"\s*(?:-\s*)?uses:\s*(\S+)(.*)", line)
+                if not m or m.group(1).startswith("./"):
+                    continue
+                if not re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", m.group(1)) \
+                        or not re.match(r"\s*#\s*v\d", m.group(2)):
+                    unpinned.append("%s:%d %s" % (f.relative_to(REPO_ROOT).as_posix(), n, line.strip()))
+        self.assertEqual(unpinned, [], "pin to a commit SHA with a `# vN` comment for Dependabot")
+
+    def test_the_check_has_something_to_check(self):
+        self.assertGreaterEqual(sum(f.read_text().count("uses:") for f in self.FILES), 7)

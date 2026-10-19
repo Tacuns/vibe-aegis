@@ -2123,6 +2123,154 @@ def dependency_coverage_gaps(root: Path) -> List[Finding]:
     return gaps
 
 
+# ---------------------------------------------------------------------------
+# Dependency severity: never understate a known vulnerability
+# ---------------------------------------------------------------------------
+# The OSV batch endpoint returns advisory ids only, so every DEP-01 used to be reported
+# as MEDIUM. A dependency with a 9.8 CRITICAL advisory therefore passed --fail-on-high
+# and the release gate. Severity now comes from each advisory's own record:
+#
+#   * every CVSS v3.x vector (top-level or per-package) is scored with the calculator
+#     below, written from the FIRST CVSS v3.1 specification;
+#   * CVSS v2 vectors are scored with the v2 equations;
+#   * the record's own label (GitHub's CRITICAL / HIGH / MODERATE / LOW, Ubuntu's
+#     priority) is read as given;
+#   * the HIGHEST of all of these wins - signals disagree, and the gate must not
+#     take the comforting one;
+#   * a MAL- advisory is a known malicious package: CRITICAL;
+#   * anything that cannot be read is reported HIGH at MEDIUM confidence, with the
+#     reason, rather than guessed low.
+#
+# CVSS v4 is not scored here: its equations need the specification's 270-entry lookup
+# table. A v4-only record falls back to its label - every GitHub-reviewed record
+# carries one.
+
+_CVSS3_WEIGHTS = {
+    "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2},
+    "AC": {"L": 0.77, "H": 0.44},
+    "UI": {"N": 0.85, "R": 0.62},
+    "C": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "I": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "A": {"H": 0.56, "L": 0.22, "N": 0.0},
+}
+_CVSS3_PR = {"U": {"N": 0.85, "L": 0.62, "H": 0.27}, "C": {"N": 0.85, "L": 0.68, "H": 0.5}}
+
+
+def _cvss31_roundup(value: float) -> float:
+    """CVSS v3.1 Appendix A: round up to one decimal, immune to float error."""
+    whole = int(round(value * 100000))
+    if whole % 10000 == 0:
+        return whole / 100000.0
+    return (math.floor(whole / 10000) + 1) / 10.0
+
+
+def cvss3_base_score(vector: str) -> Optional[float]:
+    """Base score of a CVSS v3.0 / v3.1 vector, or None if it is not a valid one."""
+    parts = vector.strip().split("/")
+    if not parts or not re.fullmatch(r"CVSS:3\.[01]", parts[0]):
+        return None
+    metrics = dict(p.split(":", 1) for p in parts[1:] if ":" in p)
+    try:
+        scope = metrics["S"]
+        av, ac = _CVSS3_WEIGHTS["AV"][metrics["AV"]], _CVSS3_WEIGHTS["AC"][metrics["AC"]]
+        pr, ui = _CVSS3_PR[scope][metrics["PR"]], _CVSS3_WEIGHTS["UI"][metrics["UI"]]
+        c, i, a = (_CVSS3_WEIGHTS[k][metrics[k]] for k in ("C", "I", "A"))
+    except KeyError:
+        return None
+    iss = 1 - (1 - c) * (1 - i) * (1 - a)
+    impact = 6.42 * iss if scope == "U" else 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
+    exploitability = 8.22 * av * ac * pr * ui
+    if impact <= 0:
+        return 0.0
+    if scope == "U":
+        return _cvss31_roundup(min(impact + exploitability, 10))
+    return _cvss31_roundup(min(1.08 * (impact + exploitability), 10))
+
+
+def cvss2_base_score(vector: str) -> Optional[float]:
+    """Base score of a CVSS v2 vector (`AV:N/AC:L/Au:N/C:P/I:P/A:P`), or None."""
+    metrics = dict(p.split(":", 1) for p in vector.strip().split("/") if ":" in p)
+    try:
+        av = {"L": 0.395, "A": 0.646, "N": 1.0}[metrics["AV"]]
+        ac = {"H": 0.35, "M": 0.61, "L": 0.71}[metrics["AC"]]
+        au = {"M": 0.45, "S": 0.56, "N": 0.704}[metrics["Au"]]
+        c, i, a = ({"N": 0.0, "P": 0.275, "C": 0.660}[metrics[k]] for k in ("C", "I", "A"))
+    except KeyError:
+        return None
+    impact = 10.41 * (1 - (1 - c) * (1 - i) * (1 - a))
+    exploitability = 20 * av * ac * au
+    f_impact = 0 if impact == 0 else 1.176
+    return round((0.6 * impact + 0.4 * exploitability - 1.5) * f_impact + 1e-9, 1)
+
+
+def _band(score: float) -> str:
+    # CVSS v3 qualitative rating scale. A score of 0.0 is "None": still a known
+    # advisory against the installed version, so it is not dropped - it is LOW.
+    if score >= 9.0:
+        return "CRITICAL"
+    if score >= 7.0:
+        return "HIGH"
+    if score >= 4.0:
+        return "MEDIUM"
+    return "LOW"
+
+
+_LABELS = {"CRITICAL": "CRITICAL", "HIGH": "HIGH", "MODERATE": "MEDIUM", "MEDIUM": "MEDIUM",
+           "LOW": "LOW", "NEGLIGIBLE": "LOW"}
+_SEV_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+
+
+def osv_record_severity(record: Dict) -> Tuple[Optional[str], str]:
+    """(severity or None, how it was decided) for one OSV vulnerability record."""
+    vuln_id = str(record.get("id", ""))
+    if vuln_id.startswith("MAL-"):
+        return "CRITICAL", "known malicious package"
+    entries = list(record.get("severity") or [])
+    for aff in record.get("affected") or []:
+        entries.extend(aff.get("severity") or [])
+    found: List[Tuple[str, str]] = []
+    for e in entries:
+        kind, score = str(e.get("type", "")), str(e.get("score", ""))
+        if kind == "CVSS_V3":
+            value = cvss3_base_score(score)
+            if value is not None:
+                found.append((_band(value), f"CVSS {value}"))
+        elif kind == "CVSS_V2":
+            value = cvss2_base_score(score)
+            if value is not None:
+                found.append((_band(value), f"CVSS v2 {value}"))
+        elif kind == "Ubuntu" and score.upper() in _LABELS:
+            found.append((_LABELS[score.upper()], f"Ubuntu {score.lower()}"))
+    labels = [record.get("database_specific") or {}]
+    labels += [a.get("database_specific") or {} for a in record.get("affected") or []]
+    labels += [a.get("ecosystem_specific") or {} for a in record.get("affected") or []]
+    for spec in labels:
+        label = str(spec.get("severity", "")).upper() if isinstance(spec, dict) else ""
+        if label in _LABELS:
+            found.append((_LABELS[label], f"rated {label.lower()}"))
+    if not found:
+        return None, "no readable severity in the advisory"
+    return max(found, key=lambda x: _SEV_ORDER[x[0]])
+
+
+OSV_DETAIL_LIMIT = 200
+
+
+def fetch_osv_record(vuln_id: str) -> Optional[Dict]:
+    """GET one OSV record. None on any failure - the caller treats that as unknown."""
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,100}", vuln_id):
+        return None
+    try:
+        req = urllib.request.Request(
+            "https://api.osv.dev/v1/vulns/" + urllib.parse.quote(vuln_id, safe=""),
+            headers={"User-Agent": "VibeAegis-PreLaunch-Audit/2.0"}, method="GET")
+        with urllib.request.urlopen(req, timeout=10, context=ssl.create_default_context()) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: bool = False) -> List[Finding]:
     """Query the free OSV.dev batch API. Degrades gracefully with no network."""
     findings: List[Finding] = []
@@ -2189,15 +2337,33 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
         )
         return findings
 
+    # Each advisory's severity comes from its own record (see osv_record_severity).
+    # One lookup per distinct id, capped; an id past the cap or a failed lookup is
+    # "unknown", which is reported HIGH - never silently MEDIUM.
+    severities: Dict[str, Tuple[Optional[str], str]] = {}
+    for result in results:
+        for v in (result or {}).get("vulns") or []:
+            vid = str(v.get("id", ""))
+            if vid and vid not in severities:
+                if len(severities) >= OSV_DETAIL_LIMIT:
+                    severities[vid] = (None, "not looked up: too many advisories in one scan")
+                    continue
+                record = fetch_osv_record(vid)
+                severities[vid] = (osv_record_severity(record) if record is not None
+                                   else (None, "advisory record could not be fetched"))
+
     for (eco, name, version), result in zip(deps, results):
         vulns = (result or {}).get("vulns") or []
         if not vulns:
             continue
         ids = [v.get("id", "?") for v in vulns][:6]
-        # The OSV batch endpoint returns advisory IDs only, with no CVSS score, so
-        # grading each one here would be inventing a number. Report MEDIUM and point
-        # at the advisories; the Skeptic/Referee stages confirm real impact.
-        worst = "MEDIUM"
+        rated = [(str(v.get("id", "?")),) + severities.get(str(v.get("id", "")), (None, "unknown"))
+                 for v in vulns]
+        known = [sev for _id, sev, _how in rated if sev]
+        unknown = [vid for vid, sev, _how in rated if not sev]
+        worst = max(known + (["HIGH"] if unknown else []), key=lambda x: _SEV_ORDER[x])
+        detail = "; ".join(f"{vid} {sev or 'UNKNOWN'} ({how})" for vid, sev, how in rated[:6])
+        unknown_shown = ", ".join(unknown[:3])
         findings.append(
             Finding(
                 rule_id="DEP-01",
@@ -2207,16 +2373,16 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
                 file="package-lock.json" if eco == "npm" else "dependencies",
                 line=0,
                 snippet=evidence(
-                    f"{eco}:{name}@{version} -> {', '.join(ids)}"
+                    f"{eco}:{name}@{version} -> {detail}"
                     + (f" (+{len(vulns) - len(ids)} more)" if len(vulns) > len(ids) else "")
-                    + ". OSV batch lookup does not return CVSS scores, so severity here is "
-                      "reported as MEDIUM pending review of the linked advisories.", 600),
+                    + (f". Severity of {unknown_shown} could not be determined, so it "
+                       "is treated as HIGH rather than guessed lower." if unknown else ""), 600),
                 cwe_or_standard="OWASP A06 Vulnerable and Outdated Components",
                 remediation=(
                     f"Upgrade `{name}` past the affected range. Details: "
                     f"https://osv.dev/vulnerability/{ids[0]}"
                 ),
-                confidence="HIGH",
+                confidence="MEDIUM" if unknown and not known else "HIGH",
             )
         )
     return findings
@@ -3068,6 +3234,13 @@ ENGINE_COMMANDS = {
 
 NDJSON_ENGINES = {"trufflehog"}
 
+# Engines that may run under --offline. Each was run with our exact command inside a
+# network namespace with no network at all and produced its normal results. The rest
+# need the network by design - semgrep --config auto fetches its rules, trivy its
+# vulnerability database, osv-scanner queries its API - or were not verified, which is
+# treated the same way.
+OFFLINE_SAFE_ENGINES = {"gitleaks", "trufflehog"}
+
 
 def _relative_to(root: Path, findings: List[Finding]) -> List[Finding]:
     """Engines are given an absolute target and report absolute paths. A report should
@@ -3634,6 +3807,20 @@ def main() -> int:
                                  "against a deployment you control."),
                     confidence="HIGH", kind="skipped_check", status="SKIPPED"))
                 continue
+        if args.offline and engine_name not in OFFLINE_SAFE_ENGINES:
+            # --offline is a promise about this whole run, not just our own requests.
+            findings.append(Finding(
+                rule_id="ENG-00", domain="COVERAGE", severity="LOW",
+                title=f"External Engine Not Run: {engine_name}",
+                file="(engines)", line=0,
+                snippet=evidence(f"--offline is set, and {engine_name} makes network "
+                                 "requests of its own, so it was not started.", 300),
+                cwe_or_standard="Coverage",
+                remediation=(f"Re-run without --offline to include {engine_name}. Only "
+                             + ", ".join(sorted(OFFLINE_SAFE_ENGINES)) + " run under "
+                             "--offline: each was verified to work with no network."),
+                confidence="HIGH", kind="skipped_check", status="SKIPPED"))
+            continue
         stages.append(f"engine:{engine_name}")
         eng_findings, eng_gap = run_engine(engine_name, root)
         findings.extend(eng_findings)

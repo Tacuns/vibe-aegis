@@ -78,7 +78,7 @@ with every stage in `RELEASE_STAGES` actually completed, returns `RELEASE_AUDIT_
 
 ## Already done on this branch — do not redo
 
-180 tests pass; CI is green on all three jobs.
+258 tests pass; CI is green on all three jobs.
 
 - **`CoverageLedger`** — every skipped file, line and package is recorded and surfaced
   as a `COV-00` gap. Wired into oversized files (`--max-file-size`), unreadable files,
@@ -117,6 +117,11 @@ fingerprints) reads an in-memory vault instead of the snippet. Known limit: only
 *recognisable* secrets are masked. Trivy's `Secrets` are now imported from the masked
 `Match` only; its `Code` context lines are never read, because they hold neighbouring
 source lines unmasked.
+
+### Done outside the numbered items
+OSV severity is read from each advisory record (no more blanket MEDIUM); `--offline`
+covers external engines; the installer never modifies a project's own config files and
+backs up its own before updating; every GitHub Action is pinned to a commit SHA.
 
 ### 2. Test fixture corpus
 `tests/fixtures/{vulnerable,safe}/` — matched pairs per rule, where the safe fixture is

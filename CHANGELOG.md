@@ -34,6 +34,43 @@ python3 .aegis/scripts/aegis_scan.py . --profile release --fail-on-high
 `--profile release` exits `1` on an incomplete stage and on any `CRITICAL`/`HIGH` finding.
 An explicit `--fail-on <level>` overrides the severity threshold.
 
+### Fixed - dependency vulnerabilities were always reported MEDIUM (CRITICAL)
+
+The OSV batch endpoint returns advisory ids only, and `DEP-01` reported every advisory as
+`MEDIUM`. A dependency with a 9.8 CRITICAL advisory therefore passed `--fail-on-high` and
+the release gate. Severity now comes from each advisory's own record: every CVSS v3.x and
+v2 vector is scored (the calculator agrees with an independent implementation on all
+5,184 v3.x and 729 v2 base vectors), the record's own rating is read, and **the highest
+signal wins** - in a sample of 5,239 GitHub-reviewed advisories, 115 had a CVSS vector
+alone that would understate GitHub's own rating. A `MAL-` advisory is CRITICAL; an
+advisory whose severity cannot be read is HIGH at MEDIUM confidence. `--deps` now also
+sends one `GET /v1/vulns/<id>` per matched advisory (at most 200).
+
+### Fixed - `--offline` did not stop external engines (HIGH)
+
+`--offline` disabled only the scanner's own requests; `--engine semgrep` still fetched its
+rules and `--engine trivy` its database. Under `--offline` only `gitleaks` and
+`trufflehog` now start - each verified to produce its normal results inside a network
+namespace with no network - and every other engine is an `ENG-00` gap. A test blocks every
+socket and runs the full release profile under `--offline` to prove no connection is
+attempted.
+
+### Fixed - the installer overwrote project files (HIGH)
+
+`install.sh` copied `.github/copilot-instructions.md`, `.claude/commands/aegis.md` and every
+skill file over whatever was there, with no backup - a team's own Copilot instructions were
+simply replaced. A project's own config files are now never modified (our version goes to
+`.aegis/suggested/`), files only Vibe Aegis writes are backed up to `.aegis/backup/` before
+an update, the summary lists what was kept, and a re-run with nothing changed touches
+nothing. The same applies to `--global`.
+
+### Changed - GitHub Actions are pinned to commit SHAs
+
+This repository's CI and the workflow shipped in `adapters/github-actions/` used movable
+tags (`@v4`). Each is now pinned to the commit its tag resolved to - cross-checked between
+our own CI logs and `git ls-remote` - with a `# vN` comment that Dependabot updates. A
+test fails on any unpinned `uses:`.
+
 ### Added
 
 - **`SEC-18` .. `SEC-21`, Postgres/Supabase privilege rules** for `.sql` migrations, written

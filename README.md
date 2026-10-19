@@ -125,6 +125,16 @@ bash install.sh --target /path/to/your/app --agent all
 bash install.sh --global --agent all
 ```
 
+**Your existing files are safe.** The installer writes two kinds of file and never
+confuses them:
+
+| Kind | Examples | If it already exists and differs |
+| :--- | :--- | :--- |
+| Your project's own config | `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.vscode/tasks.json`, `.cursorrules`, `.clinerules`, `GEMINI.md` | **Never modified.** Our version goes to `.aegis/suggested/<same path>` for you to merge, and the installer lists what it kept |
+| Files only Vibe Aegis writes | the scanner, our skills, `.claude/commands/aegis.md`, `.cursor/rules/vibe-aegis.mdc` | Updated, after the previous copy is saved to `.aegis/backup/<timestamp>/<same path>` |
+
+Re-running the installer with nothing changed touches nothing.
+
 ### Option 2: `npx` CLI Installer (Node.js 18+)
 
 ```bash
@@ -208,7 +218,7 @@ python3 scripts/aegis_scan.py . --fail-on-high --min-confidence high --fail-on-i
 | `--deps` | Check dependencies against the OSV vulnerability database |
 | `--url <URL>` | Passive, read-only live header & exposure checks |
 | `--all` | Enable artifacts + git history + dependencies |
-| `--offline` | Disable this scanner's own network requests (`--deps`, `--url`). Does not reach inside external engines — see below |
+| `--offline` | No network request from this run: disables `--deps` and `--url`, and starts only the external engines verified to work without a network (`gitleaks`, `trufflehog`) — see below |
 
 **External engines (optional)**
 
@@ -251,17 +261,19 @@ opt-in:
 
 | Enabled by | Request | What is disclosed |
 | :--- | :--- | :--- |
-| `--deps`, `--all`, `--profile full` or `--profile release` | `POST https://api.osv.dev/v1/querybatch` | Your dependency **names and versions** — not your source, not your file names |
+| `--deps`, `--all`, `--profile full` or `--profile release` | `POST https://api.osv.dev/v1/querybatch`, then one `GET https://api.osv.dev/v1/vulns/<id>` per advisory found (at most 200) to read its severity | Your dependency **names and versions**, and the advisory ids they matched — not your source, not your file names |
 | `--url <URL>` | One `GET` to that URL, plus one `GET` each to `/.env` and `/.git/config` on the **same host** | Nothing of yours; it reads your own deployment's response headers and the first 512 bytes of those two paths |
 
 `--offline` disables both. A stage that could not reach the network is recorded as a
 coverage gap (`DEP-00` / `LIVE-00`), so the verdict becomes `INCOMPLETE_SCAN` instead of
 silently passing.
 
-**External engines are separate programs with their own network behaviour, and
-`--offline` does not apply to them.** Check each tool's documentation before using
-`--engine` on a machine that must stay offline - for example, `semgrep --config auto`
-fetches its ruleset from the Semgrep registry.
+**`--offline` covers external engines too.** They are separate programs with network
+behaviour of their own - `semgrep --config auto` fetches its rules, `trivy` its
+vulnerability database, `osv-scanner` queries its API - so under `--offline` only
+`gitleaks` and `trufflehog` are started: each was run with the exact command above inside
+a network namespace with no network at all and produced its normal results. Every other
+requested engine is recorded as an `ENG-00` coverage gap naming `--offline`, never run.
 
 **Credentials in reports are redacted** before anything is written: only the provider's
 public prefix (`sk_live_`, `AKIA`) and the length remain - no character of the secret itself.
@@ -377,7 +389,7 @@ Source code says what you wrote. The build output says what ships. Because the s
 
 | ID | Category | Severity | What it catches |
 | :--- | :--- | :--- | :--- |
-| `DEP-01` | Known dependency vulnerability | Medium | Package versions with OSV advisories (npm, PyPI, crates.io, Go) |
+| `DEP-01` | Known dependency vulnerability | Low–Crit | Package versions with OSV advisories (npm, PyPI, crates.io, Go). Severity is the highest of every signal in each advisory's own record: its CVSS v3.x and v2 vectors (scored here), and its database or Ubuntu rating. A `MAL-` (malicious package) advisory is `CRITICAL`; an advisory whose severity cannot be read is `HIGH` at `MEDIUM` confidence, never guessed lower |
 | `HIST-01` | Credential in git history | Critical–Medium | A key committed at any point — **even if deleted later**, it is still readable and still compromised |
 
 ### Rule Variants
