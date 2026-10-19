@@ -1523,6 +1523,7 @@ REDACTION_EXEMPT = {
     "ART-13": "TestMobilePackageOutputIsRedacted",
     "ART-14": "TestMobilePackageOutputIsRedacted",
     "ART-15": "TestMobilePackageOutputIsRedacted",
+    "ART-00": "build-stage gaps - TestArtifactStageFailsClosed (incl. a canary bundle)",
 }
 
 
@@ -2092,3 +2093,217 @@ class TestMobilePackageOutputIsRedacted(unittest.TestCase):
         ids = {f.rule_id for f in found}
         self.assertTrue({"ART-10", "ART-11", "ART-12", "ART-13", "ART-14", "ART-15"} <= ids, ids)
         self.assertEqual(leaked(finding_blob(found)), [])
+
+
+# ---------------------------------------------------------------------------
+# A release stage that examined nothing is a gap, not a pass
+# ---------------------------------------------------------------------------
+
+def _git_init(root):
+    git = ["git", "-c", "user.name=dev", "-c", "user.email=dev@localhost",
+           "-c", "commit.gpgsign=false"]
+    subprocess.run(git + ["init", "-q"], cwd=root, check=True)
+    subprocess.run(git + ["add", "-A"], cwd=root, check=True)
+    subprocess.run(git + ["commit", "-q", "-m", "init"], cwd=root, check=True)
+
+
+def _run_main(argv, osv_results=None):
+    """Run the CLI in-process, with OSV answered locally so no request leaves the test."""
+    real_argv, real_open = sys.argv, aegis_scan.urllib.request.urlopen
+    out = []
+
+    def fake(req, timeout=None, context=None):
+        n = len(json.loads(req.data.decode("utf-8"))["queries"])
+        return _FakeResponse({}, json.dumps({"results": osv_results or [{}] * n}).encode())
+
+    sys.argv = ["aegis_scan.py"] + argv
+    aegis_scan.urllib.request.urlopen = fake
+    import io
+    import contextlib
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            code = aegis_scan.main()
+    finally:
+        sys.argv, aegis_scan.urllib.request.urlopen = real_argv, real_open
+    out.append(buf.getvalue())
+    return code, out[0]
+
+
+def _gap_titles(findings, rule_id):
+    return {f.title for f in findings if f.rule_id == rule_id}
+
+
+class TestArtifactStageFailsClosed(unittest.TestCase):
+    """Each of these returned an empty list, which `--profile release` read as audited."""
+
+    def _scan(self, files, artifact=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel, body in files.items():
+                p = root / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(body if isinstance(body, bytes) else body.encode("utf-8"))
+            return aegis_scan.scan_build_artifacts(root, artifact, [])
+
+    def test_no_build_output_is_a_gap(self):
+        found = self._scan({"src/a.ts": "export const a = 1;\n"})
+        self.assertEqual(_gap_titles(found, "ART-00"), {"No Build Output Found"})
+        self.assertTrue(all(aegis_scan._is_incomplete(f) for f in found))
+
+    def test_missing_artifact_path_is_a_gap(self):
+        found = self._scan({"src/a.ts": "x"}, artifact="dist-that-was-never-built")
+        self.assertEqual(_gap_titles(found, "ART-00"), {"Build Artifact Path Does Not Exist"})
+
+    def test_build_output_with_nothing_readable_is_a_gap(self):
+        found = self._scan({"dist/logo.png": b"\x89PNG\r\n", "dist/font.woff2": b"wOF2"})
+        self.assertEqual(_gap_titles(found, "ART-00"), {"No Readable Build Files"})
+
+    def test_oversized_bundle_is_a_gap(self):
+        real = aegis_scan.ARTIFACT_MAX_BYTES
+        aegis_scan.ARTIFACT_MAX_BYTES = 100
+        try:
+            found = self._scan({"dist/big.js": 'var k="%s";' % CANARY_STRIPE + "x" * 200,
+                                "dist/small.js": "var a=1;"})
+        finally:
+            aegis_scan.ARTIFACT_MAX_BYTES = real
+        self.assertEqual(_gap_titles(found, "ART-00"), {"Build Files Over 0 MB Not Examined"})
+        self.assertEqual(leaked(finding_blob(found)), [])
+
+    def test_truncation_is_a_gap_and_deterministic(self):
+        real = aegis_scan.ARTIFACT_FILE_LIMIT
+        aegis_scan.ARTIFACT_FILE_LIMIT = 3
+        try:
+            files = {"dist/%d.js" % i: "var a=%d;" % i for i in range(4)}
+            files["dist/z.js"] = 'var k="%s";' % CANARY_STRIPE   # sorts last: not examined
+            found = self._scan(files)
+        finally:
+            aegis_scan.ARTIFACT_FILE_LIMIT = real
+        self.assertEqual(_gap_titles(found, "ART-00"), {"Build Output Truncated At 3 Files"})
+        self.assertNotIn("ART-03", {f.rule_id for f in found})
+
+    def test_a_package_inside_the_build_directory_is_inspected(self):
+        import io
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("assets/.env", "X=1\n")
+        found = self._scan({"release/app.apk": buf.getvalue(), "release/index.html": "<p>"})
+        self.assertIn("ART-12", {f.rule_id for f in found})
+
+    def test_complete_build_output_raises_no_gap(self):
+        found = self._scan({"dist/index.html": "<p>hi</p>", "dist/app.js": "var a=1;",
+                            "dist/logo.png": b"\x89PNG"})
+        self.assertEqual([f.rule_id for f in found if f.rule_id == "ART-00"], [])
+
+
+class TestDependencyStageFailsClosed(unittest.TestCase):
+    """An empty dependency list used to read as "no known vulnerabilities"."""
+
+    def _gaps(self, files):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel, body in files.items():
+                write(root, rel, body)
+            return _gap_titles(aegis_scan.dependency_coverage_gaps(root), "DEP-00")
+
+    LOCK = json.dumps({"lockfileVersion": 3, "packages": {
+        "node_modules/lodash": {"version": "4.17.21"}}})
+
+    def test_unsupported_lockfile_is_a_gap(self):
+        gaps = self._gaps({"poetry.lock": '[[package]]\nname = "django"\nversion = "2.2.0"\n'})
+        self.assertIn("Dependency Manifest Format Not Supported", gaps)
+
+    def test_lockfile_in_a_subdirectory_is_a_gap(self):
+        gaps = self._gaps({"package-lock.json": self.LOCK, "package.json": "{}",
+                           "apps/web/package-lock.json": self.LOCK})
+        self.assertEqual(gaps, {"Dependency Manifests Below The Repository Root Not Checked"})
+
+    def test_manifests_in_ignored_directories_are_not_counted(self):
+        gaps = self._gaps({"package-lock.json": self.LOCK, "package.json": "{}",
+                           "node_modules/lodash/package.json": "{}"})
+        self.assertEqual(gaps, set())
+
+    def test_package_json_without_a_lockfile_is_a_gap(self):
+        gaps = self._gaps({"package.json": '{"dependencies":{"lodash":"^4.17.0"}}'})
+        self.assertEqual(gaps, {"npm Versions Taken From Ranges, Not Installed Versions"})
+
+    def test_unpinned_requirements_are_a_gap(self):
+        gaps = self._gaps({"requirements.txt": "django>=2.0\nrequests\nflask==2.0.0\n"})
+        self.assertEqual(gaps, {"Unpinned Python Requirements Not Checked"})
+
+    def test_no_manifest_at_all_is_a_gap(self):
+        self.assertEqual(self._gaps({"app.py": "x = 1\n"}), {"No Dependency Manifest Found"})
+
+    def test_fully_supported_and_pinned_manifests_raise_no_gap(self):
+        gaps = self._gaps({"package-lock.json": self.LOCK, "package.json": "{}",
+                           "requirements.txt": "# pinned\nflask==2.0.0\n\nrequests==2.31.0\n"})
+        self.assertEqual(gaps, set())
+
+
+class TestReleaseVerdictRequiresEvidence(unittest.TestCase):
+    """End to end through `main()`: what `--profile release` may and may not claim."""
+
+    def _repo(self, tmp, built=True, lock=True):
+        root = Path(tmp) / "app"
+        write(root, "src/a.ts", "export const a = 1;\n")
+        write(root, "package.json", '{"dependencies":{"lodash":"4.17.21"}}')
+        if lock:
+            write(root, "package-lock.json", TestDependencyStageFailsClosed.LOCK)
+        if built:
+            write(root, "dist/index.js", "var a=1;")
+        _git_init(root)
+        return root
+
+    def test_a_complete_clean_release_still_passes(self):
+        """Closing the holes must not make the release verdict unreachable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = _run_main([str(self._repo(tmp)), "--profile", "release", "--quiet"])
+        self.assertEqual(code, 0, out)
+        self.assertIn(aegis_scan.VERDICT_RELEASE_OK, out)
+
+    def test_release_without_build_output_is_incomplete_and_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = _run_main([str(self._repo(tmp, built=False)), "--profile", "release",
+                                   "--quiet"])
+        self.assertEqual(code, 1, out)
+        self.assertIn(aegis_scan.VERDICT_INCOMPLETE, out)
+        self.assertNotIn(aegis_scan.VERDICT_RELEASE_OK, out)
+
+    def test_release_without_a_lockfile_is_incomplete_and_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = _run_main([str(self._repo(tmp, lock=False)), "--profile", "release",
+                                   "--quiet"])
+        self.assertEqual(code, 1, out)
+        self.assertIn(aegis_scan.VERDICT_INCOMPLETE, out)
+
+
+class TestProfilesAndFlagsDoWhatTheHelpSays(unittest.TestCase):
+
+    def _stages(self, argv):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "app"
+            write(root, "src/a.ts", "export const a = 1;\n")
+            write(root, "dist/index.js", "var a=1;")
+            _git_init(root)
+            _code, out = _run_main([str(root), "--json", "--offline"] + argv)
+        return json.loads(out)["stages"]
+
+    def test_quick_alone_runs_no_deep_stage(self):
+        self.assertEqual(self._stages(["--profile", "quick"]), ["static"])
+
+    def test_quick_honours_an_explicit_all(self):
+        """`--all` is an explicit flag; quick used to drop it without a word."""
+        self.assertEqual(set(self._stages(["--profile", "quick", "--all"])),
+                         {"static", "git-history", "dependencies", "artifacts"})
+
+    def test_quick_and_code_produce_identical_findings(self):
+        """The help text says they are currently identical - hold it to that."""
+        with tempfile.TemporaryDirectory() as tmp:
+            build_redaction_corpus(Path(tmp))
+            runs = [json.loads(_run_main([tmp, "--json", "--profile", p])[1]) for p in ("quick", "code")]
+        strip = lambda r: sorted((f["rule_id"], f["file"], f["line"]) for f in r["findings"])
+        self.assertEqual(strip(runs[0]), strip(runs[1]))
+
+    def test_artifact_with_no_value_auto_detects(self):
+        """The help promised this; argparse rejected `--artifact` without a path."""
+        self.assertIn("artifacts", self._stages(["--artifact"]))

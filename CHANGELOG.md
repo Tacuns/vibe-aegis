@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed - `--profile release` certified stages that examined nothing (CRITICAL)
+
+`RELEASE_AUDIT_PASSED` is only meaningful if every release stage actually read
+something. Two stages could "complete" without reading anything, and the release verdict
+then claimed "source, dependencies, git history and shipped artifacts all audited". Each
+case below was reproduced through the CLI and returned `RELEASE_AUDIT_PASSED`, exit `0`:
+
+- **Build artifacts**: no build output at all; an `--artifact` path that does not exist;
+  build output holding only file types the stage does not read; a bundle over the 12 MB
+  cap - including one holding a live Stripe key. Files past the first 4000 were dropped
+  silently, in filesystem order, so which files went unread varied by machine.
+- **Dependencies**: no manifest at all; a `poetry.lock` (or `yarn.lock`, `pnpm-lock.yaml`
+  and other formats the parser does not read) pinning a vulnerable version; lockfiles in a
+  monorepo's subdirectories; `requirements.txt` lines not pinned with `==`. Even
+  `--offline` passed, because zero parsed dependencies skipped the offline check entirely.
+
+Each is now a coverage gap - `ART-00` or `DEP-00` - so the verdict is `INCOMPLETE_SCAN`
+and `--profile release` exits `1`, naming what was not read. A `package.json` with no
+`package-lock.json` is also a gap: versions are then read from semver ranges (`^4.17.0`
+is queried as `4.17.0`), not the version actually installed. Build files are now read in
+sorted order, and an `.apk`/`.aab`/`.ipa` inside the build directory is inspected rather
+than skipped. A fully built, pinned, committed project still reaches
+`RELEASE_AUDIT_PASSED`; a test holds that.
+
+**Upgrade impact:** a `--profile release` (or `full`) pipeline that passed before may now
+fail as incomplete. That pipeline was never auditing what it claimed. Commit a supported
+lockfile, build before scanning or pass `--artifact`, or add `--engine osv-scanner` for
+dependency formats this scanner does not read.
+
+### Fixed - flags did not do what their help said
+
+- `--profile quick` silently discarded `--all`, contradicting the documented rule that an
+  explicit flag always adds a stage. It now honours it. The help text claimed quick ran
+  "fast source patterns only"; it never did - `quick` and `code` run identical source
+  analysis, and the help now says so.
+- `--artifact` with no value was rejected by argparse, although the help and README both
+  said it auto-detects `dist/`, `build/` and `.next/`. It now does.
+
 ### Fixed - eight more routes put a credential in the report (CRITICAL)
 
 2.5.0 removed one rule that quoted a raw source line. `redact_findings()` was still the

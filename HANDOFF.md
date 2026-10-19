@@ -77,7 +77,7 @@ with every stage in `RELEASE_STAGES` actually completed, returns `RELEASE_AUDIT_
 
 ## Already done on this branch — do not redo
 
-159 tests pass; CI is green on all three jobs.
+180 tests pass; CI is green on all three jobs.
 
 - **`CoverageLedger`** — every skipped file, line and package is recorded and surfaced
   as a `COV-00` gap. Wired into oversized files (`--max-file-size`), unreadable files,

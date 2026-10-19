@@ -1898,6 +1898,83 @@ def parse_dependencies(root: Path) -> List[Tuple[str, str, str]]:
     return deps
 
 
+# Manifests and lockfiles that exist in the wild but that `parse_dependencies()` does not
+# read. Finding one means some dependencies were never checked.
+UNSUPPORTED_MANIFESTS = (
+    "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "bun.lock", "poetry.lock", "Pipfile.lock",
+    "Pipfile", "uv.lock", "pyproject.toml", "Gemfile.lock", "composer.lock", "pom.xml",
+    "build.gradle", "build.gradle.kts", "gradle.lockfile", "Package.resolved",
+    "Podfile.lock", "pubspec.lock", "mix.lock", "packages.lock.json",
+)
+SUPPORTED_MANIFESTS = ("package-lock.json", "package.json", "requirements.txt",
+                       "Cargo.lock", "go.mod")
+
+
+def dependency_coverage_gaps(root: Path) -> List[Finding]:
+    """What the dependency stage could NOT see. Each is a gap, never a pass.
+
+    `parse_dependencies()` reads five manifest formats, at the repository root only. An
+    empty result used to read as "no known vulnerabilities" - for a `poetry.lock`
+    pinning a vulnerable Django, for every lockfile in a monorepo's subdirectories, and
+    for each `requirements.txt` line not pinned with `==`.
+    """
+    def gap(title: str, file: str, detail: str, remediation: str) -> Finding:
+        return Finding(
+            rule_id="DEP-00", domain="SUPPLY_CHAIN", severity="LOW", title=title,
+            file=file, line=0, snippet=evidence(detail, 400), cwe_or_standard="Coverage",
+            remediation=remediation, confidence="HIGH", kind="skipped_check", status="SKIPPED")
+
+    engines = ("Use a dedicated scanner for these (`--engine osv-scanner` or "
+               "`--engine trivy`), which reads far more formats.")
+    gaps: List[Finding] = []
+    unsupported = [n for n in UNSUPPORTED_MANIFESTS if (root / n).is_file()]
+    if unsupported:
+        gaps.append(gap("Dependency Manifest Format Not Supported", unsupported[0],
+                        "Not read, so none of their packages were checked: "
+                        + ", ".join(unsupported), engines))
+
+    nested: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        if Path(dirpath) == root:
+            continue
+        for name in filenames:
+            if name in SUPPORTED_MANIFESTS or name in UNSUPPORTED_MANIFESTS:
+                nested.append((Path(dirpath) / name).relative_to(root).as_posix())
+    if nested:
+        gaps.append(gap("Dependency Manifests Below The Repository Root Not Checked",
+                        nested[0], f"{len(nested)} manifest(s) in subdirectories were not "
+                        f"read: {', '.join(nested[:5])}",
+                        "Only root-level manifests are parsed. Scan each package directory "
+                        "separately, or " + engines[0].lower() + engines[1:]))
+
+    if (root / "package.json").is_file() and not (root / "package-lock.json").is_file():
+        gaps.append(gap("npm Versions Taken From Ranges, Not Installed Versions",
+                        "package.json", "No package-lock.json, so each version was read "
+                        "from a semver range (^4.17.0 is queried as 4.17.0) rather than the "
+                        "version actually installed.",
+                        "Commit a package-lock.json, or " + engines[0].lower() + engines[1:]))
+
+    req = root / "requirements.txt"
+    if req.is_file():
+        unpinned = [ln.strip() for ln in req.read_text(encoding="utf-8", errors="ignore").splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")
+                    and not re.match(r"^([A-Za-z0-9_.\-]+)\s*==\s*([0-9A-Za-z.\-]+)", ln.strip())]
+        if unpinned:
+            gaps.append(gap("Unpinned Python Requirements Not Checked", "requirements.txt",
+                            f"{len(unpinned)} line(s) not pinned with ==, so not checked: "
+                            + ", ".join(unpinned[:5]),
+                            "Pin exact versions (pip freeze, or pip-compile), or "
+                            + engines[0].lower() + engines[1:]))
+
+    if not unsupported and not nested and not any((root / n).is_file() for n in SUPPORTED_MANIFESTS):
+        gaps.append(gap("No Dependency Manifest Found", "(repository)",
+                        "No manifest or lockfile was found, so no dependency was checked.",
+                        "If the project has dependencies, commit their lockfile. "
+                        + engines))
+    return gaps
+
+
 def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: bool = False) -> List[Finding]:
     """Query the free OSV.dev batch API. Degrades gracefully with no network."""
     findings: List[Finding] = []
@@ -2034,7 +2111,29 @@ ARTIFACT_DIRS = ("dist", "build", "out", ".next", ".output", ".svelte-kit", "www
 ARTIFACT_TEXT_EXT = {".js", ".mjs", ".cjs", ".css", ".html", ".json", ".txt", ".map", ".wasm"}
 
 
+ARTIFACT_FILE_LIMIT = 4000
+ARTIFACT_MAX_BYTES = 12_000_000
+MOBILE_PACKAGE_EXT = {".apk", ".aab", ".ipa", ".zip"}
+
+
+def _artifact_gap(title: str, file: str, detail: str, remediation: str) -> Finding:
+    return Finding(
+        rule_id="ART-00", domain="ARTIFACT", severity="LOW", title=title, file=file,
+        line=0, snippet=evidence(detail, 400), cwe_or_standard="Coverage",
+        remediation=remediation, confidence="HIGH", kind="skipped_check", status="SKIPPED",
+    )
+
+
 def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secrets: List[Finding]) -> List[Finding]:
+    """Read what actually ships. Anything this stage could not read is a coverage gap.
+
+    It used to return an empty list - indistinguishable from "examined and clean" - when
+    there was no build output at all, when `--artifact` named a path that did not exist,
+    when every file was a type it does not read, when a bundle was over the size cap, and
+    for every file past the first 4000. `--profile release` then reported "shipped
+    artifacts all audited" about artifacts that were never opened, including a 12 MB
+    bundle holding a live key.
+    """
     findings: List[Finding] = []
 
     targets: List[Path] = []
@@ -2045,6 +2144,11 @@ def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secret
         p = p.resolve()
         if p.exists():
             targets.append(p)
+        else:
+            return [_artifact_gap(
+                "Build Artifact Path Does Not Exist", artifact_path,
+                f"--artifact {artifact_path} was not found, so nothing that ships was examined.",
+                "Build the project first, or pass the path of the real build output.")]
     else:
         for name in ARTIFACT_DIRS:
             candidate = root / name
@@ -2052,7 +2156,12 @@ def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secret
                 targets.append(candidate)
 
     if not targets:
-        return findings
+        return [_artifact_gap(
+            "No Build Output Found", "(repository)",
+            "None of " + ", ".join(f"{d}/" for d in ARTIFACT_DIRS) + " exists, so what "
+            "ships to users was not examined.",
+            "Build the project and re-run, or point --artifact at the build output or the "
+            ".apk/.aab/.ipa you publish.")]
 
     # What the source stage already identified as a secret, so we can prove a leak. The
     # exact value comes from the in-memory vault: snippets are fully redacted, and the
@@ -2063,22 +2172,42 @@ def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secret
         if value and len(value) >= 8 and value not in known_secrets:
             known_secrets[value] = f
 
+    examined = 0
+    oversized: List[str] = []
+    unreadable: List[str] = []
     for target in targets:
-        if target.is_file() and target.suffix.lower() in {".apk", ".aab", ".ipa", ".zip"}:
+        if target.is_file() and target.suffix.lower() in MOBILE_PACKAGE_EXT:
             findings.extend(scan_mobile_package(root, target))
+            examined += 1
             continue
 
-        files = [target] if target.is_file() else [p for p in target.rglob("*") if p.is_file()]
-        for fpath in files[:4000]:
+        # Sorted, so which files fall past the limit is the same on every machine.
+        files = [target] if target.is_file() else sorted(p for p in target.rglob("*") if p.is_file())
+        if len(files) > ARTIFACT_FILE_LIMIT:
+            findings.append(_artifact_gap(
+                f"Build Output Truncated At {ARTIFACT_FILE_LIMIT} Files", target.name,
+                f"{len(files)} files under {target.name}/; the last "
+                f"{len(files) - ARTIFACT_FILE_LIMIT} in path order were NOT examined.",
+                "Point --artifact at the deployable output only (for example the client "
+                "bundle directory), so every shipped file is read."))
+        for fpath in files[:ARTIFACT_FILE_LIMIT]:
             ext = fpath.suffix.lower()
+            if ext in MOBILE_PACKAGE_EXT and ext != ".zip":
+                # A package inside the build directory ships too.
+                findings.extend(scan_mobile_package(root, fpath))
+                examined += 1
+                continue
             if ext not in ARTIFACT_TEXT_EXT:
                 continue
             try:
-                if fpath.stat().st_size > 12_000_000:
+                if fpath.stat().st_size > ARTIFACT_MAX_BYTES:
+                    oversized.append(fpath.name)
                     continue
                 text = fpath.read_text(encoding="utf-8", errors="ignore")
             except Exception:
+                unreadable.append(fpath.name)
                 continue
+            examined += 1
 
             try:
                 rel = fpath.relative_to(root).as_posix()
@@ -2144,6 +2273,25 @@ def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secret
                     )
                     findings.append(f)
 
+    if oversized:
+        findings.append(_artifact_gap(
+            f"Build Files Over {ARTIFACT_MAX_BYTES // 1_000_000} MB Not Examined",
+            oversized[0],
+            f"{len(oversized)} file(s) skipped for size: {', '.join(oversized[:5])}",
+            "A large bundle is exactly where an inlined credential ends up. Split the "
+            "bundle or inspect these files directly."))
+    if unreadable:
+        findings.append(_artifact_gap(
+            "Build Files Could Not Be Read", unreadable[0],
+            f"{len(unreadable)} file(s) could not be read: {', '.join(unreadable[:5])}",
+            "Check file permissions on the build output and re-run."))
+    if not examined:
+        findings.append(_artifact_gap(
+            "No Readable Build Files", targets[0].name,
+            "Build output exists but contains no file type this stage reads "
+            "(" + ", ".join(sorted(ARTIFACT_TEXT_EXT | MOBILE_PACKAGE_EXT)) + ").",
+            "Point --artifact at the directory holding the shipped JavaScript, HTML or "
+            "mobile package."))
     return findings
 
 
@@ -3101,11 +3249,12 @@ def main() -> int:
                            "must mean 'fully audited', not merely 'nothing found'.")
     gate.add_argument("--profile", choices=["quick", "code", "full", "release"], default="code",
                       help="How much evidence to gather, and therefore which verdicts are "
-                           "reachable. quick: fast source patterns only. code (default): full "
-                           "source, data-flow and secret analysis. full: adds dependencies, git "
-                           "history and build artifacts. release: everything, plus "
-                           "--fail-on-incomplete, and the only profile that can return "
-                           "RELEASE_AUDIT_PASSED. A source scan can never certify a release.")
+                           "reachable. quick and code (default): full source, data-flow and "
+                           "secret analysis, no deep stage unless you add one - the two are "
+                           "currently identical. full: adds dependencies, git history and build "
+                           "artifacts. release: everything, plus --fail-on-incomplete, and the "
+                           "only profile that can return RELEASE_AUDIT_PASSED. A source scan "
+                           "can never certify a release.")
     gate.add_argument("--min-confidence", choices=["high", "medium", "low"], default="low",
                       help="Only let findings at or above this confidence affect the exit code. "
                            "Severity says how bad a finding would be IF real; confidence says how "
@@ -3144,7 +3293,7 @@ def main() -> int:
 
     deep = parser.add_argument_group("deep analysis")
     deep.add_argument("--url", help="Live/staging URL for passive, read-only header & exposure checks")
-    deep.add_argument("--artifact", metavar="PATH",
+    deep.add_argument("--artifact", metavar="PATH", nargs="?", const="",
                       help="Verify a build output directory or an .apk/.aab/.ipa package. "
                            "Auto-detects dist/, build/, .next/ when given no value.")
     deep.add_argument("--git-history", metavar="N", nargs="?", type=int, const=300,
@@ -3187,9 +3336,11 @@ def main() -> int:
     want_history = args.all or deep_profile or args.git_history is not None
     want_deps = args.all or deep_profile or args.deps or args.sbom is not None
     if args.profile == "quick":
-        want_artifacts = args.artifact is not None
-        want_history = args.git_history is not None
-        want_deps = args.deps or args.sbom is not None
+        # Enables no deep stage by default - but `--all` is an explicit flag too, and
+        # this once dropped it silently.
+        want_artifacts = args.all or args.artifact is not None
+        want_history = args.all or args.git_history is not None
+        want_deps = args.all or args.deps or args.sbom is not None
     if args.profile == "release":
         # A release gate that tolerates an unexamined stage is not a gate.
         args.fail_on_incomplete = True
@@ -3225,6 +3376,7 @@ def main() -> int:
         if args.deps or args.all or deep_profile:
             stages.append("dependencies")
             findings.extend(check_dependency_vulnerabilities(dependencies, offline=args.offline))
+            findings.extend(dependency_coverage_gaps(root))
 
     if want_artifacts:
         stages.append("artifacts")
