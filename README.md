@@ -613,16 +613,23 @@ vibe-aegis/
 │   ├── marketplace.json                       # Claude Code / Codex plugin marketplace manifest
 │   └── plugin.json                            # Plugin manifest (4 skills + /aegis command)
 ├── .github/
-│   └── workflows/ci.yml                       # Unit tests, installer smoke test, schema validation
+│   └── workflows/ci.yml                       # Unit tests, release gate, installer smoke test, schema validation
 └── tests/
-    └── test_scanner.py                        # Automated unit test suite for `aegis_scan.py`
+    ├── test_scanner.py                        # Automated unit test suite for `aegis_scan.py`
+    ├── corpus/<RULE>/{vulnerable,safe}/       # A realistic flawed and a realistic correct implementation per rule
+    ├── release_gate/                          # Controlled projects for the strict release profile
+    └── fixtures/android/                      # Real aapt / apksigner output for the mobile checks
 ```
 
 ## 🧪 Development
 
 ```bash
-# Run the unit test suite
+# Run the unit test suite (includes the vulnerable/safe corpus for every rule)
 python3 -B -m unittest discover -s tests -v
+
+# Run --profile release on clean, vulnerable, review-required and incomplete projects and
+# check each exact verdict and exit code (the clean case queries the OSV API)
+python3 -B tests/release_gate/run.py
 
 # Smoke-test the installer
 bash install.sh --target /tmp/test-app --agent all

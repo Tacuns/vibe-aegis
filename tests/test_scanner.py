@@ -4351,3 +4351,164 @@ class TestInstallerKeepsEveryReplacedFile(unittest.TestCase):
             self.assertEqual((backups[0] / ".claude/commands/aegis.md").read_text(), "MY COMMAND\n")
             self.assertEqual((backups[0] / ".cursor/rules/vibe-aegis.mdc").read_text(), "MY CURSOR RULE\n")
 
+
+# ---------------------------------------------------------------------------
+# Checklist F: a matched vulnerable/safe corpus for every rule
+# ---------------------------------------------------------------------------
+
+CORPUS = Path(__file__).resolve().parent / "corpus"
+
+# Rules a source-tree fixture cannot exercise, and the test class that proves each one in
+# both directions instead. Named explicitly, so a NEW rule cannot skip the corpus: it needs
+# a pair under tests/corpus/<RULE>/, or an entry here naming the test that covers it.
+CORPUS_EXEMPT = {
+    "ART-00": "TestArtifactStageFailsClosed", "COV-00": "TestCoverageLedgerIsOrderIndependent",
+    "DEP-00": "TestDependencyStageFailsClosed", "ENG-00": "TestEngineExitStatusIsChecked",
+    "GIT-00": "TestGitHistoryCoverageIsStated", "LIVE-00": "TestLiveProbeFailuresAreGaps",
+    "ART-10": "TestSignatureIsVerifiedOrSaidToBeUnverified",
+    "DEP-01": "TestDependencySeverityReachesTheGate",        # needs the OSV API
+    "HIST-01": "TestGitHistoryCoverageIsStated",              # needs a git history
+    "SEC-17B": "TestLiveAndNetworkOutputIsRedacted",          # needs a live server
+    "SEC-01C": "TestEnvFileProtectionAsksGit",                # needs git state and a .env
+    "ART-11": "TestSignatureIsVerifiedOrSaidToBeUnverified",  # needs a signed package
+    "ART-13": "TestManifestIsDecodedNotGrepped",              # needs a binary manifest
+    "ART-14": "TestManifestIsDecodedNotGrepped",
+    "ART-12": "TestCorpus", "ART-15": "TestCorpus",           # packages built in TestCorpus
+}
+
+
+def _restore_build_dir(root: Path) -> None:
+    """Build output is stored as `dist.fixture/`: the repository's .gitignore rightly
+    excludes `dist/`, so a fixture named that would never reach CI."""
+    for stored in list(root.rglob("dist.fixture")):
+        stored.rename(stored.parent / "dist")
+
+
+def _corpus_rules(case_dir: Path) -> set:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "app"
+        shutil.copytree(case_dir, root)
+        _restore_build_dir(root)
+        found, _ = aegis_scan.scan_repository(root)
+        if (root / "dist").exists():
+            secrets = [f for f in found if f.rule_id.startswith("SEC-01")]
+            found += aegis_scan.scan_build_artifacts(root, None, secrets)
+        return {f.rule_id for f in aegis_scan.dedupe(found)}
+
+
+class TestCorpus(unittest.TestCase):
+    """Each rule fires on its vulnerable implementation and stays silent on the safe one.
+
+    Unit tests passing proves the code does what its tests say; this proves each rule
+    detects a realistic flaw and does not fire on a realistic correct implementation. Set
+    AEGIS_CORPUS_REPORT to a path to write the TP/FN/FP/TN summary (CI uploads it).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.results = {}
+        for rule_dir in sorted(p for p in CORPUS.iterdir() if p.is_dir()):
+            cls.results[rule_dir.name] = (_corpus_rules(rule_dir / "vulnerable"),
+                                          _corpus_rules(rule_dir / "safe"))
+        cls.results.update(cls._package_cases())
+        summary = {"rules": len(cls.results), "true_positive": 0, "false_negative": [],
+                   "false_positive": [], "true_negative": 0}
+        for rule, (vuln, safe) in sorted(cls.results.items()):
+            if rule in vuln:
+                summary["true_positive"] += 1
+            else:
+                summary["false_negative"].append(rule)
+            if rule in safe:
+                summary["false_positive"].append(rule)
+            else:
+                summary["true_negative"] += 1
+        cls.summary = summary
+        out = os.environ.get("AEGIS_CORPUS_REPORT")
+        if out:
+            Path(out).write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+
+    @staticmethod
+    def _package_cases():
+        """ART-12 / ART-15 need a package, built here from text rather than committed."""
+        out = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rule, vuln_files, safe_files in (
+                    ("ART-12", {"assets/.env": "API_URL=https://api.example.com\n"},
+                     {"assets/config.json": '{"apiUrl": "https://api.example.com"}'}),
+                    ("ART-15", {"assets/config.json": '{"apiSecret": "%s"}' % ENTROPY_VALUE},
+                     {"assets/config.json": '{"apiUrl": "https://api.example.com"}'})):
+                ids = []
+                for kind, files in (("v", vuln_files), ("s", safe_files)):
+                    pkg = root / ("%s-%s.apk" % (rule, kind))
+                    with zipfile.ZipFile(pkg, "w") as z:
+                        z.writestr("AndroidManifest.xml", android_manifest("cleartext_false"))
+                        for name, body in files.items():
+                            z.writestr(name, body)
+                    with _NoApksigner():
+                        ids.append({f.rule_id for f in aegis_scan.scan_mobile_package(root, pkg)})
+                out[rule] = (ids[0], ids[1])
+        return out
+
+    def test_every_rule_fires_on_its_vulnerable_case(self):
+        self.assertEqual(self.summary["false_negative"], [])
+
+    def test_no_rule_fires_on_its_safe_case(self):
+        self.assertEqual(self.summary["false_positive"], [])
+
+    def test_every_rule_has_a_corpus_pair_or_a_named_test(self):
+        missing = sorted(r for r in scanner_rule_ids()
+                         if r not in self.results and r not in CORPUS_EXEMPT)
+        self.assertEqual(missing, [], "add tests/corpus/<RULE>/{vulnerable,safe}/")
+        for rule, test_class in CORPUS_EXEMPT.items():
+            self.assertTrue(isinstance(globals().get(test_class), type), (rule, test_class))
+        self.assertEqual(sorted(set(CORPUS_EXEMPT) & {p.name for p in CORPUS.iterdir()}), [],
+                         "a rule with a corpus pair needs no exemption")
+
+    def test_every_case_has_both_halves(self):
+        for rule_dir in (p for p in CORPUS.iterdir() if p.is_dir()):
+            for half in ("vulnerable", "safe"):
+                self.assertTrue(any((rule_dir / half).rglob("*")), (rule_dir.name, half))
+
+    def test_the_corpus_carries_no_real_credential(self):
+        # Generic high-entropy values only: no provider-format key, so the corpus can be
+        # committed and published.
+        for f in CORPUS.rglob("*"):
+            if f.is_file():
+                text = f.read_text(encoding="utf-8", errors="ignore")
+                for label, _sev, pattern in aegis_scan.PROVIDER_SECRETS:
+                    self.assertIsNone(pattern.search(text), (f, label))
+
+
+class TestSecretNamesInEveryCommonSpelling(unittest.TestCase):
+    """Found by the corpus: camelCase names, quoted keys and Firebase rules files were missed."""
+
+    def _fires(self, line, path="src/config.ts"):
+        return [f.rule_id for f in aegis_scan.scan_secrets_in_text(path, line + "\n")] == ["SEC-01"]
+
+    def test_camel_case_names(self):
+        for name in ("apiSecret", "secretKey", "dbPassword", "stripeSecretKey"):
+            self.assertTrue(self._fires('const %s = "%s";' % (name, ENTROPY_VALUE)), name)
+
+    def test_a_word_that_merely_contains_secret_is_not_a_name(self):
+        self.assertFalse(self._fires('const secretaryName = "%s";' % ENTROPY_VALUE))
+
+    def test_quoted_keys_in_json_and_python(self):
+        self.assertTrue(self._fires('{"api_secret": "%s"}' % ENTROPY_VALUE, "config/app.json"))
+        self.assertTrue(self._fires("CONFIG = {'password': '%s'}" % ENTROPY_VALUE, "app/settings.py"))
+        self.assertFalse(self._fires('{"name": "%s"}' % ENTROPY_VALUE, "config/app.json"))
+
+    def test_translated_ui_text_is_not_a_credential(self):
+        for value in ("Zapomenuté Heslo", "現在のパスワードを入力してください", "Κωδικός Πρόσβασης"):
+            self.assertFalse(self._fires('"LABEL_PASSWORD": "%s",' % value, "i18n/xx.json"), value)
+
+    def test_a_password_with_one_non_ascii_symbol_is_still_one(self):
+        self.assertTrue(self._fires("password: '0Y8rMnww$*9VFYE§59-!Fg1L6t&6lB'", "data/users.yml"))
+
+    def test_firebase_rules_files_are_scanned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "firestore.rules",
+                  "service cloud.firestore {\n  match /{d=**} {\n    allow read, write: if true;\n  }\n}\n")
+            found, scanned = aegis_scan.scan_repository(Path(tmp))
+        self.assertEqual(scanned, 1)
+        self.assertIn("SEC-02B", {f.rule_id for f in found})

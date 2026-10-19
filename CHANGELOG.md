@@ -212,6 +212,33 @@ Reproduced on this branch before each change; each has matched vulnerable and sa
   are backed up byte for byte before being replaced; a re-run with nothing changed
   creates no new backup.
 
+### Added - a vulnerable/safe corpus for every rule, and a release-gate CI job (checklist F)
+
+- **`tests/corpus/<RULE>/{vulnerable,safe}/`** holds a realistic insecure and a realistic
+  correct implementation for 51 rules; `ART-12`/`ART-15` packages are built in the test.
+  `TestCorpus` requires each rule to fire on its vulnerable case and stay silent on its
+  safe one, and fails when a rule id has neither a corpus pair nor a `CORPUS_EXEMPT` entry
+  naming the test class that covers it. Credentials in the corpus are generic values, so it
+  can be published.
+- **Release Gate CI job.** Runs `--profile release` on a clean, a vulnerable, a
+  review-required and an incomplete project (`tests/release_gate/`) and asserts each exact
+  verdict and exit code, then runs the corpus and uploads its true/false
+  positive/negative summary as `corpus-report.json`. CI now has four jobs.
+
+### Fixed - found by the corpus
+
+- **camelCase secret names were never matched (HIGH).** `apiSecret = "..."` and
+  `secretKey = "..."` - the usual JavaScript spelling - produced nothing, while
+  `API_SECRET` did. camelCase boundaries are now split before the name is checked.
+- **Quoted keys were never matched (HIGH).** JSON (`"api_secret": "..."`) and Python dicts
+  (`{'password': '...'}`) put a quote between the name and the colon, so named secrets in
+  `config.json`, `appsettings.json` and settings modules were invisible. A value must now
+  be a single token that is not mostly non-ASCII, so translated UI text under a key like
+  `LABEL_PASSWORD` is not reported; checked on a real project with 40+ locale files (one
+  new genuine finding, nothing lost).
+- **Firebase rules files were never read.** `SEC-02B` exists for `firestore.rules` and
+  `storage.rules`, but `.rules` was not a scanned extension.
+
 ### Changed - GitHub Actions are pinned to commit SHAs
 
 This repository's CI and the workflow shipped in `adapters/github-actions/` used movable

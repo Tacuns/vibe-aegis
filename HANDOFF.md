@@ -78,7 +78,7 @@ with every stage in `RELEASE_STAGES` actually completed, returns `RELEASE_AUDIT_
 
 ## Already done on this branch — do not redo
 
-381 tests pass; CI is green on all three jobs.
+392 tests pass; CI is green on all four jobs.
 
 - **`CoverageLedger`** — every skipped file, line and package is recorded and surfaced
   as a `COV-00` gap. Wired into oversized files (`--max-file-size`), unreadable files,
@@ -99,9 +99,10 @@ with every stage in `RELEASE_STAGES` actually completed, returns `RELEASE_AUDIT_
 
 ## Remaining work
 
-> Items 1 and 5 are done. Item 5 was the one blocking the merge: the documentation now
-> describes the tool this branch actually builds, and `TestDocumentationMatchesTheScanner`
-> fails if it drifts again. Items 2–4 follow in the order given.
+> Items 1, 2, 4 and 5 are done; item 3 is done for JS/TS heuristics and Python request
+> sources, with Python `ast` analysis and cross-file taint still open. Item 5 was the one
+> blocking the merge: the documentation describes the tool this branch actually builds,
+> and `TestDocumentationMatchesTheScanner` fails if it drifts again.
 
 Do **one item per session**. Finish it completely, with tests and docs, before starting
 the next. `aegis_scan.py` is a single large file, so parallel branches will conflict
@@ -123,22 +124,34 @@ OSV severity is read from each advisory record (no more blanket MEDIUM); `--offl
 covers external engines; the installer never modifies a project's own config files and
 backs up its own before updating; every GitHub Action is pinned to a commit SHA.
 
-### 2. Test fixture corpus
-`tests/fixtures/{vulnerable,safe}/` — matched pairs per rule, where the safe fixture is
-the realistic **correct** implementation of the same feature. Report
-false-positive/false-negative counts in CI.
+The 25-issue review checklist (groups A–F) is worked through in `CHANGELOG.md` 2.7.0 under
+the "checklist A" … "checklist E" headings, each issue reproduced before it was changed.
 
-### 3. Detection depth
-Use Python's built-in `ast` module for `.py` files — stdlib, so rule 1 holds — in place
-of regex for injection and auth checks. For JS/TS, improve the existing heuristics; do
-**not** add a parser dependency. Known weak spots: `SEC-04` (IDOR), `SEC-03` (auth
-recognition), and `FLOW-*` taint propagation across function boundaries.
+### 2. Test fixture corpus — DONE
+`tests/corpus/<RULE>/{vulnerable,safe}/` holds a realistic insecure and a realistic correct
+implementation for 51 rules; `ART-12`/`ART-15` packages are built in the test. `TestCorpus`
+requires every rule to fire on its vulnerable case and stay silent on its safe one, and
+fails when a rule id has neither a corpus pair nor an entry in `CORPUS_EXEMPT` naming the
+test class that covers it (gaps, and rules that need git, the network, a live server or a
+signed package). The **Release Gate** CI job runs it with `AEGIS_CORPUS_REPORT` and uploads
+the TP/FN/FP/TN summary, and runs `tests/release_gate/run.py`: `--profile release` on a
+clean, a vulnerable, a review-required and an incomplete project, asserting each exact
+verdict and exit code. Building the corpus found three detection gaps, fixed: camelCase
+secret names (`apiSecret`), quoted keys (JSON `"api_secret": ...`) and `.rules` files.
 
-### 4. Mobile package verification
-`ART-11` currently checks v1 `META-INF` signatures plus the v2/v3 APK Signing Block
-magic. `.aab` and `.ipa` use different signing models. Never report a signature as
-absent or invalid without platform-correct verification — emit `ART-10` (coverage gap)
-when the format cannot be verified.
+### 3. Detection depth — partly done
+Done (checklist C): `SEC-03` per handler, `SEC-04` requires the owner from the session,
+sink-specific sanitizers bound to the tainted value, one level of interprocedural taint
+within a file, and Flask/Django/DRF request sources for `.py` files. Still open: use
+Python's built-in `ast` module for `.py` files — stdlib, so rule 1 holds — in place of
+regex for injection and auth checks, and taint across files. For JS/TS, keep improving the
+heuristics; do **not** add a parser dependency.
+
+### 4. Mobile package verification — DONE
+An APK signature is verified by `apksigner` when it is on PATH (`ART-11` if it fails) and
+is otherwise an `ART-10` gap; nothing cryptographic is reimplemented. The binary manifest
+is decoded, so `ART-13`/`ART-14` read real values. `.aab` (protobuf manifest, signed by
+Play) and `.ipa` remain `ART-10` gaps by design.
 
 ### 5. Documentation — DONE
 README, `AGENTS.md`, the orchestrator and pre-flight skills, the full-audit prompt, the
@@ -155,7 +168,8 @@ tested and found inaccurate, so the docs say what the code does instead:
 Documenting the profiles exposed real defects, fixed in `9073e8b` before the docs were
 written: `--profile release` certified build-artifact and dependency stages that had read
 nothing; `quick` dropped `--all`; `--artifact` with no value was rejected. Since then,
-`--profile release` also implies `--fail-on-high`. Still true and documented, not changed:
+`--profile release` exits `1` on anything but `RELEASE_AUDIT_PASSED` unless `--fail-on`
+is given. Still true and documented, not changed:
 `quick` is identical to `code`.
 
 ---
@@ -168,7 +182,8 @@ python scripts/build_llms_full.py .
 python scripts/aegis_scan.py . --quiet       # self-scan still sane
 ```
 
-CI must pass all three jobs: Unit Tests (3.8), Unit Tests (3.12), Installer Smoke Test.
+CI must pass all four jobs: Unit Tests (3.8), Unit Tests (3.12), Release Gate, Installer
+Smoke Test.
 
 The Installer Smoke Test carries its **own** inline fail-closed contract check inside
 `.github/workflows/ci.yml`. If you change a verdict constant you must update it too —

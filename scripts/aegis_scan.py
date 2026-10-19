@@ -36,6 +36,9 @@ CODE_EXTENSIONS: Set[str] = {
     ".py", ".rb", ".go", ".rs", ".java", ".kt", ".swift", ".dart",
     ".php", ".sql", ".prisma", ".graphql", ".html", ".css", ".scss",
     ".json", ".yaml", ".yml", ".toml", ".env", ".sh",
+    # Firebase security rules (firestore.rules, storage.rules): SEC-02B exists for these
+    # files, which were never read.
+    ".rules",
 }
 
 FRONTEND_EXTENSIONS: Set[str] = {
@@ -1855,6 +1858,7 @@ PLACEHOLDER_VALUE = re.compile(
 SECRET_ASSIGNMENT = re.compile(
     r"""(?ix)
     (?P<name>[A-Za-z_][A-Za-z0-9_\-\.]*)
+    ['"]?                  # a quoted key: JSON `"api_secret": "..."`, a Python dict
     \s*[:=]\s*
     (?P<quote>['"])(?P<value>[^'"\n]{8,200})(?P=quote)
     """
@@ -1974,10 +1978,19 @@ def scan_secrets_in_text(rel_path: str, text: str, origin: str = "source",
             name = m.group("name")
             value = m.group("value")
             # "_" is a word character, so \bsecret\b can never match inside
-            # NEXT_PUBLIC_API_SECRET. Normalise separators before testing.
-            if not SENSITIVE_NAME.search(re.sub(r"[_\-.]+", " ", name)):
+            # NEXT_PUBLIC_API_SECRET. Normalise separators before testing - camelCase
+            # boundaries too: `apiSecret` and `secretKey`, the usual JavaScript spelling,
+            # were never matched.
+            spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
+            if not SENSITIVE_NAME.search(re.sub(r"[_\-.]+", " ", spaced)):
                 continue
             if looks_like_placeholder(value):
+                continue
+            # A credential is one token. UI text under a secret-sounding key - an i18n
+            # `"LABEL_PASSWORD": "Mot de passe"` or `"現在のパスワードを入力してください"` -
+            # has spaces or is mostly non-ASCII, and its variety of characters scored as
+            # entropy. A password with the odd `§` in it is still a password.
+            if re.search(r"\s", value) or sum(ord(ch) > 127 for ch in value) > len(value) * 0.2:
                 continue
             if shannon_entropy(value) < 3.6 or len(value) < 16:
                 continue

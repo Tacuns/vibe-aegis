@@ -73,7 +73,7 @@ Append to `PROVIDER_SECRETS` as `(label, severity, compiled_regex)`. Then add **
 
 ### Adding a taint sink
 
-Append to `TAINT_SINKS` as `(rule_id, severity, title, standard, compiled_regex)`. If the sink has a safe calling convention, add it to `SANITIZERS` too, and add a test proving the sanitised form produces **zero** findings. A taint rule without a negative test will be rejected.
+Append to `TAINT_SINKS` as `(rule_id, severity, title, standard, compiled_regex)`, and give it an entry in `SINK_SANITIZERS` listing only what makes a value safe for **that** sink (schema validation in `UNIVERSAL_SANITIZERS` already applies everywhere). Add a test proving the correctly sanitised form produces **zero** findings, and one proving a sanitizer for a different sink does not. A taint rule without a negative test will be rejected.
 
 ### Never print a raw credential
 
@@ -107,6 +107,7 @@ Verify the expected files land in `/tmp/test-app` for each agent, then delete th
 
 - [ ] `python3 -B -m unittest discover -s tests -v` passes
 - [ ] New rule has both a positive and a negative test case
+- [ ] New rule has a matched pair in `tests/corpus/<RULE>/vulnerable/` and `safe/` (realistic code, generic secrets only), or an entry in `CORPUS_EXEMPT` naming the test that covers it
 - [ ] Rule is documented in the README coverage matrix
 - [ ] `llms.txt` file map updated if you added or removed a file
 - [ ] `python3 scripts/build_llms_full.py .` re-run if you changed README, AGENTS.md, a SKILL.md, the CLI or the schema
