@@ -213,7 +213,30 @@ python3 scripts/aegis_scan.py /path/to/your/app --fail-on-high
 | `--fail-on-high` | Exit `1` if any `CRITICAL` or `HIGH` finding exists |
 | `--fail-on <level>` | Exit `1` at or above `critical`/`high`/`medium`/`low` |
 | `--include-tests` | Also audit test and fixture files (excluded by default — they contain deliberately insecure code) |
-| `--fail-on-incomplete` | Exit `1` if any check could not run — use when a green pipeline must mean *fully audited*, not merely *nothing found* |
+| `--fail-on-incomplete` | Exit `1` if any check could not run, **or if zero source files were scanned** — use when a green pipeline must mean *fully audited*, not merely *nothing found* |
+| `--min-confidence <level>` | `high` / `medium` / `low` (default `low`). Only findings at or above this confidence affect the **exit code**; everything is still reported |
+
+**Three axes, not one.** A release gate is lied to in three different ways, so they are kept apart:
+
+| Axis | Question | Gate |
+| :--- | :--- | :--- |
+| **Coverage** | Did the check actually run? | `--fail-on-incomplete` |
+| **Severity** | If this is real, how bad is it? | `--fail-on-high` / `--fail-on` |
+| **Confidence** | How sure are we it is real? | `--min-confidence` |
+
+Some rules cannot prove their case — `SEC-03` matches a list of known auth helpers and
+cannot recognise a guard it has never seen; `REL-*` cannot know your data volume. Those are
+reported at `MEDIUM` confidence. `--min-confidence high` gates only on what is demonstrable:
+
+```bash
+# Block only on findings the scanner can actually prove, but still refuse to
+# certify an audit that did not fully run.
+python3 scripts/aegis_scan.py . --fail-on-high --min-confidence high --fail-on-incomplete
+```
+
+A coverage gap can never be suppressed. `.aegis-ignore` and `--baseline` accept known
+*defects*; a check that did not run carries nothing to accept, so gaps are always reported
+and `--write-baseline` refuses to record them.
 
 **Scope — how you adopt this on a real codebase**
 
@@ -339,7 +362,7 @@ Source code says what you wrote. The build output says what ships. Because the s
 | `ART-01` | **Confirmed secret leak** | Critical | A credential from your source is present in the shipped bundle. Confirmed by construction |
 | `ART-02` | Source map shipped | Medium / Low | With `sourcesContent`, your original unminified source reaches every visitor |
 | `ART-03` | Credential in bundle | Critical–Medium | A provider-format key found directly in shipped JS/HTML/JSON |
-| `ART-11` | Unsigned package | High | No signature block under `META-INF/` |
+| `ART-11` | Unsigned package | High | Neither a v1 signature under `META-INF/` nor a v2/v3 APK Signing Block. A v2-only release (the modern default) is correctly recognised as signed; an unreadable archive or an `.aab` reports `ART-10` instead of guessing |
 | `ART-12` | Config bundled in app | Critical | `.env`, `id_rsa` or `service-account.json` inside the `.apk`/`.aab`/`.ipa` |
 | `ART-13` | Cleartext traffic | Medium | Manifest references cleartext HTTP |
 | `ART-14` | Debuggable release | Medium | The `debuggable` attribute appears in the manifest. A binary manifest stores the *value* separately, so correct `debuggable="false"` hardening looks identical — verify with `aapt dump badging` |

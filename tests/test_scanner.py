@@ -1094,5 +1094,274 @@ class TestArrayFormExecIsNotCommandInjection(unittest.TestCase):
         self.assertIn("FLOW-02", self._rules(self.UNSAFE_SHELL_TRUE))
 
 
+
+class TestExitCodeHonoursCoverage(unittest.TestCase):
+    """The fail-closed contract has to reach the PROCESS EXIT STATUS, not just the report.
+
+    `compute_readiness_score()` has returned INCOMPLETE_SCAN at 0/100 for an empty scan
+    since 2.4.0, but `main()` gated `--fail-on-incomplete` on `skipped_checks` alone.
+    Scanning zero files produces no skipped check - every stage ran, there was simply
+    nothing to read - so an empty checkout, a mistyped target path or a run from the
+    wrong working directory exited 0 and certified a scan of nothing.
+    """
+
+    SCANNER = str(Path(__file__).resolve().parent.parent / "scripts" / "aegis_scan.py")
+
+    def _run(self, target, *flags):
+        proc = subprocess.run(
+            [sys.executable, "-B", self.SCANNER, str(target), "--quiet", *flags],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        return proc.returncode
+
+    def test_empty_directory_fails_the_incomplete_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(self._run(tmp, "--fail-on-incomplete"), 1)
+
+    def test_directory_with_no_scannable_source_fails_the_incomplete_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "NOTES.txt", "not source\n")
+            self.assertEqual(self._run(tmp, "--fail-on-incomplete"), 1)
+
+    def test_a_real_clean_repository_still_passes(self):
+        """Closing the hole must not fail every healthy project."""
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "src/ok.ts", "export const add = (a, b) => a + b;\n")
+            self.assertEqual(self._run(tmp, "--fail-on-incomplete"), 0)
+
+    def test_coverage_block_reports_an_empty_scan_as_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                [sys.executable, "-B", self.SCANNER, tmp, "--json"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace")
+            report = json.loads(proc.stdout)
+            self.assertFalse(report["coverage"]["complete"])
+            self.assertEqual(report["readiness_score"], 0)
+            self.assertIn("INCOMPLETE_SCAN", report["release_verdict"])
+
+
+class TestEmptyChangesetIsNotAnIncompleteScan(unittest.TestCase):
+    """`--diff` matching no source is a docs-only PR, not a broken audit."""
+
+    SCANNER = str(Path(__file__).resolve().parent.parent / "scripts" / "aegis_scan.py")
+
+    def _git_repo(self, tmp):
+        root = Path(tmp)
+        env = {"GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@e.com",
+               "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@e.com"}
+        import os
+        full = dict(os.environ, **env)
+        def git(*args):
+            subprocess.run(["git", "-C", str(root), *args], check=True,
+                           capture_output=True, env=full)
+        git("init", "-q", ".")
+        write(root, "src/a.ts", "export const a = 1;\n")
+        write(root, "README.md", "# docs\n")
+        git("add", "-A"); git("commit", "-qm", "base"); git("branch", "-M", "main")
+        git("checkout", "-qb", "feature")
+        return root, git
+
+    def _run(self, target, *flags):
+        proc = subprocess.run(
+            [sys.executable, "-B", self.SCANNER, str(target), "--quiet", *flags],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        return proc.returncode, proc.stdout
+
+    def test_docs_only_changeset_passes_the_incomplete_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self._git_repo(tmp)
+            write(root, "README.md", "# docs updated\n")
+            git("add", "-A"); git("commit", "-qm", "docs")
+            code, out = self._run(root, "--diff", "main", "--fail-on-incomplete")
+            self.assertEqual(code, 0, out)
+            self.assertIn("NO CODE CHANGES", out)
+
+    def test_an_unresolvable_diff_ref_is_still_held_to_the_strict_rule(self):
+        """A failed diff falls back to a full scan, so an empty target must still fail."""
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _ = self._run(tmp, "--diff", "no-such-ref", "--fail-on-incomplete")
+            self.assertEqual(code, 1)
+
+    def test_changeset_containing_code_is_still_scanned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, git = self._git_repo(tmp)
+            write(root, "src/bad.ts", "eval(req.body.x);\n")
+            git("add", "-A"); git("commit", "-qm", "bad")
+            code, out = self._run(root, "--diff", "main", "--fail-on-high")
+            self.assertEqual(code, 1, out)
+
+
+
+class TestSuppressionCannotHideACoverageGap(unittest.TestCase):
+    """Suppression accepts known DEFECTS. It must never accept a missing CHECK.
+
+    Both suppression routes defeated the fail-closed contract, and the baseline route
+    did it silently: one `--write-baseline` run on a machine with no network recorded
+    DEP-00 as an accepted finding, and every later scan then reported READY TO PUBLISH
+    while the dependency check never ran again.
+    """
+
+    def _gap(self, rule_id="DEP-00"):
+        return aegis_scan.Finding(
+            rule_id=rule_id, domain="SUPPLY_CHAIN", severity="LOW",
+            title="Could Not Reach The OSV Vulnerability Database",
+            file="dependencies", line=0, snippet="offline",
+            cwe_or_standard="Informational", remediation="r",
+            kind="skipped_check", status="SKIPPED")
+
+    def _defect(self):
+        f = aegis_scan.Finding(
+            rule_id="SEC-08", domain="SECURITY", severity="HIGH", title="eval",
+            file="src/bad.js", line=1, snippet="eval(req.body.x)",
+            cwe_or_standard="CWE-94", remediation="r")
+        f.fingerprint = aegis_scan.fingerprint(f)
+        return f
+
+    def test_ignore_rule_cannot_suppress_a_gap(self):
+        kept, n = aegis_scan.apply_suppressions([self._gap()], set(), {"DEP-00"}, [])
+        self.assertEqual([f.rule_id for f in kept], ["DEP-00"])
+        self.assertEqual(n, 0)
+
+    def test_ignore_glob_cannot_suppress_a_gap(self):
+        kept, _ = aegis_scan.apply_suppressions([self._gap()], set(), set(), ["*"])
+        self.assertEqual([f.rule_id for f in kept], ["DEP-00"])
+
+    def test_baseline_cannot_suppress_a_gap(self):
+        gap = self._gap()
+        gap.fingerprint = aegis_scan.fingerprint(gap)
+        kept, _ = aegis_scan.apply_suppressions([gap], {gap.fingerprint}, set(), [])
+        self.assertEqual([f.rule_id for f in kept], ["DEP-00"])
+
+    def test_every_gap_marker_is_protected_not_just_the_suffix(self):
+        """`_is_incomplete` is the single source of truth, all three ways."""
+        for gap in (self._gap("DEP-00"),
+                    self._gap("SEC-99"),          # protected by kind/status only
+                    self._gap("LIVE-00")):
+            kept, _ = aegis_scan.apply_suppressions([gap], set(), {gap.rule_id}, ["*"])
+            self.assertEqual(len(kept), 1, "%s was suppressed" % gap.rule_id)
+
+    def test_a_real_defect_is_still_suppressible(self):
+        """Closing the hole must not break the feature."""
+        d = self._defect()
+        kept, n = aegis_scan.apply_suppressions([d], set(), {"SEC-08"}, [])
+        self.assertEqual(kept, [])
+        self.assertEqual(n, 1)
+        kept, n = aegis_scan.apply_suppressions([self._defect()], {d.fingerprint}, set(), [])
+        self.assertEqual(kept, [])
+        self.assertEqual(n, 1)
+
+    def test_a_suppressed_repo_with_a_gap_still_fails_the_gate(self):
+        """End to end: gap survives suppression and reaches the exit code."""
+        scanner = str(Path(__file__).resolve().parent.parent / "scripts" / "aegis_scan.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "package.json", '{"name":"x","dependencies":{"lodash":"4.17.20"}}')
+            write(root, "src/ok.ts", "export const a = 1;\n")
+            write(root, ".aegis-ignore", "DEP-00\n")
+            proc = subprocess.run(
+                [sys.executable, "-B", scanner, str(root), "--deps", "--offline",
+                 "--fail-on-incomplete", "--quiet"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+
+
+def _build_apk(path, v1=False, v2=False):
+    """A minimal APK, optionally carrying a v1 JAR signature and/or a v2/v3 block."""
+    import io
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("AndroidManifest.xml", "x")
+        z.writestr("classes.dex", "y")
+        if v1:
+            z.writestr("META-INF/CERT.RSA", "sig")
+            z.writestr("META-INF/CERT.SF", "sig")
+    data = bytearray(buf.getvalue())
+    if v2:
+        eocd = data.rfind(b"PK\x05\x06")
+        cd = int.from_bytes(data[eocd + 16:eocd + 20], "little")
+        block = b"\x00" * 24 + b"APK Sig Block 42"
+        data[cd:cd] = block
+        new_cd = cd + len(block)
+        data[eocd + len(block) + 16:eocd + len(block) + 20] = new_cd.to_bytes(4, "little")
+    path.write_bytes(bytes(data))
+    return path
+
+
+class TestApkSigningDetection(unittest.TestCase):
+    """`ART-11` only knew about v1 JAR signing.
+
+    APK Signature Scheme v2/v3 (Android 7.0+) stores the signature in an APK Signing
+    Block before the central directory, leaving nothing in `META-INF/`. Release builds
+    have disabled v1 for years, so a correctly signed APK was reported unsigned at
+    HIGH - blocking the gate at the worst possible moment, just before a store upload.
+    """
+
+    def _rules(self, **kw):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            apk = _build_apk(root / "app-release.apk", **kw)
+            return {f.rule_id for f in aegis_scan.scan_mobile_package(root, apk)}
+
+    def test_v1_signed_apk_is_not_reported_unsigned(self):
+        self.assertNotIn("ART-11", self._rules(v1=True))
+
+    def test_v2_only_signed_apk_is_not_reported_unsigned(self):
+        """The regression: modern release builds sign with v2/v3 only."""
+        self.assertNotIn("ART-11", self._rules(v2=True))
+
+    def test_apk_signed_both_ways_is_not_reported_unsigned(self):
+        self.assertNotIn("ART-11", self._rules(v1=True, v2=True))
+
+    def test_genuinely_unsigned_apk_still_fires(self):
+        self.assertIn("ART-11", self._rules())
+
+    def test_signing_block_detector_is_accurate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertTrue(aegis_scan.has_apk_signing_block(_build_apk(root / "a.apk", v2=True)))
+            self.assertFalse(aegis_scan.has_apk_signing_block(_build_apk(root / "b.apk", v1=True)))
+
+    def test_unreadable_archive_is_a_coverage_gap_not_an_unsigned_verdict(self):
+        """Unknown must never be reported as a defect."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aab = _build_apk(root / "app.aab")          # .aab: signed by Play at upload
+            ids = {f.rule_id for f in aegis_scan.scan_mobile_package(root, aab)}
+            self.assertNotIn("ART-11", ids)
+            self.assertIn("ART-10", ids)
+
+
+class TestMinConfidenceGate(unittest.TestCase):
+    """Confidence is a third axis, alongside coverage and severity."""
+
+    SCANNER = str(Path(__file__).resolve().parent.parent / "scripts" / "aegis_scan.py")
+    # A hand-rolled auth guard SEC-03 cannot recognise: CRITICAL, confidence MEDIUM.
+    UNPROVEN = ('import { mustBeLoggedIn } from "@/auth";\n'
+                'export async function DELETE(req){ await mustBeLoggedIn(req); return ok(); }\n')
+
+    def _run(self, root, *flags):
+        proc = subprocess.run(
+            [sys.executable, "-B", self.SCANNER, str(root), "--quiet", *flags],
+            capture_output=True, text=True, encoding="utf-8", errors="replace")
+        return proc.returncode
+
+    def test_unproven_finding_blocks_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "app/api/x/route.ts", self.UNPROVEN)
+            self.assertEqual(self._run(tmp, "--fail-on-high"), 1)
+
+    def test_min_confidence_high_does_not_block_on_an_unproven_finding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "app/api/x/route.ts", self.UNPROVEN)
+            self.assertEqual(self._run(tmp, "--fail-on-high", "--min-confidence", "high"), 0)
+
+    def test_a_proven_finding_still_blocks_at_min_confidence_high(self):
+        """Raising the bar must not disarm the gate."""
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "src/x.jsx",
+                  '<div dangerouslySetInnerHTML={{__html: userInput}} />')
+            self.assertEqual(self._run(tmp, "--fail-on-high", "--min-confidence", "high"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

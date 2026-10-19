@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-SCANNER_VERSION = "2.5.0"
+SCANNER_VERSION = "2.6.0"
 
 IGNORE_DIRS: Set[str] = {
     ".git", "node_modules", ".next", "dist", "build", "out", ".vercel",
@@ -1843,6 +1843,35 @@ def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secret
     return findings
 
 
+def has_apk_signing_block(pkg_path: Path) -> Optional[bool]:
+    """Detect APK Signature Scheme v2/v3, which leaves nothing inside `META-INF/`.
+
+    v1 (JAR) signing drops `.RSA`/`.DSA`/`.EC`/`.SF` files into `META-INF/`, so a
+    namelist check finds it. v2/v3 instead insert an "APK Signing Block" between the
+    last entry and the Central Directory - invisible to `zipfile.namelist()`. Release
+    builds have disabled v1 for years, so looking only in `META-INF/` reported
+    correctly signed APKs as unsigned, at HIGH, right before a store upload.
+
+    The block ends with the 16-byte magic "APK Sig Block 42" immediately before the
+    Central Directory. Returns True/False, or None when the structure cannot be read
+    (ZIP64, a truncated file) - None means UNKNOWN and must not be treated as signed.
+    """
+    try:
+        data = pkg_path.read_bytes()
+    except Exception:
+        return None
+
+    # End of Central Directory: signature, then the CD offset 16 bytes in. The comment
+    # field is at most 65535 bytes, so the record starts within the last 65557.
+    eocd = data.rfind(b"PK\x05\x06", max(0, len(data) - 65557))
+    if eocd < 0 or eocd + 20 > len(data):
+        return None
+    cd_offset = int.from_bytes(data[eocd + 16:eocd + 20], "little")
+    if cd_offset in (0xFFFFFFFF, 0) or cd_offset > len(data):
+        return None  # ZIP64 or nonsense - unknown, not "unsigned"
+    return data[cd_offset - 16:cd_offset] == b"APK Sig Block 42"
+
+
 def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
     """Inspect an APK/AAB/IPA as a zip archive - no external tooling required."""
     import zipfile
@@ -1872,16 +1901,36 @@ def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
     with zf:
         names = zf.namelist()
 
-        # Unsigned package.
-        if not any(n.startswith("META-INF/") and n.endswith((".RSA", ".DSA", ".EC", ".SF")) for n in names):
+        # Unsigned package. Check BOTH signing generations before claiming this.
+        has_v1 = any(n.startswith("META-INF/") and n.endswith((".RSA", ".DSA", ".EC", ".SF"))
+                     for n in names)
+        v2plus = has_apk_signing_block(pkg_path) if pkg_path.suffix.lower() == ".apk" else None
+        if not has_v1 and v2plus is False:
             findings.append(
                 Finding(
                     rule_id="ART-11", domain="ARTIFACT", severity="HIGH",
                     title="Mobile Package Appears Unsigned", file=rel, line=0,
-                    snippet="No signature block found under META-INF/.",
+                    snippet=("No v1 signature under META-INF/ and no v2/v3 APK Signing Block "
+                             "before the central directory."),
                     cwe_or_standard="CWE-347 Improper Verification of Cryptographic Signature",
                     remediation="Sign the release build with your upload key before publishing to the store.",
                     confidence="MEDIUM",
+                )
+            )
+        elif not has_v1 and v2plus is None:
+            # An .aab is signed at upload, and a structure we cannot parse is unknown.
+            # Neither is evidence of an unsigned build, and guessing HIGH here blocked
+            # correct releases - so this is reported as a coverage gap instead.
+            findings.append(
+                Finding(
+                    rule_id="ART-10", domain="ARTIFACT", severity="LOW",
+                    title="Could Not Determine Package Signing State", file=rel, line=0,
+                    snippet=("No v1 signature under META-INF/, and the v2/v3 signing block could "
+                             "not be read (ZIP64, an .aab, or a non-standard archive)."),
+                    cwe_or_standard="Informational",
+                    remediation=("Verify manually with `apksigner verify --print-certs <file>`. "
+                                 "An .aab is signed by Play at distribution time."),
+                    confidence="HIGH", kind="skipped_check", status="SKIPPED",
                 )
             )
 
@@ -2189,6 +2238,16 @@ def apply_suppressions(
     kept: List[Finding] = []
     suppressed = 0
     for f in findings:
+        # A coverage gap is NOT a finding you can accept. Suppression exists to say
+        # "we know about this defect and choose to live with it"; a check that did not
+        # run carries no information to accept. Allowing it through here defeated the
+        # whole fail-closed contract, and the baseline route did it SILENTLY: one
+        # `--write-baseline` run while offline recorded DEP-00 as accepted, and every
+        # later scan then reported READY TO PUBLISH while the dependency check never
+        # ran again. Gaps are always kept, whatever the baseline or .aegis-ignore say.
+        if _is_incomplete(f):
+            kept.append(f)
+            continue
         if f.rule_id in ignore_rules:
             suppressed += 1
             continue
@@ -2404,6 +2463,13 @@ def main() -> int:
     gate.add_argument("--fail-on-incomplete", action="store_true",
                       help="Exit 1 if any check could not run. Use this when a green pipeline "
                            "must mean 'fully audited', not merely 'nothing found'.")
+    gate.add_argument("--min-confidence", choices=["high", "medium", "low"], default="low",
+                      help="Only let findings at or above this confidence affect the exit code. "
+                           "Severity says how bad a finding would be IF real; confidence says how "
+                           "sure we are that it is. Some rules cannot prove their case - SEC-03 "
+                           "matches a list of known auth helpers, REL-* cannot know your data "
+                           "volume - so '--min-confidence high' gates only on what is "
+                           "demonstrable. Everything is still reported either way.")
 
     scope = parser.add_argument_group("scope")
     scope.add_argument("--diff", metavar="REF", nargs="?", const="origin/main",
@@ -2503,14 +2569,23 @@ def main() -> int:
     if args.write_baseline:
         bpath = Path(args.write_baseline)
         bpath.parent.mkdir(parents=True, exist_ok=True)
+        # Record real defects only. Writing a coverage gap into the baseline would
+        # permanently accept the ABSENCE of a check - run `--write-baseline` once on a
+        # machine with no network and DEP-00 is accepted forever.
+        acceptable = [f for f in findings if not _is_incomplete(f)]
+        gaps = len(findings) - len(acceptable)
         bpath.write_text(json.dumps({
             "scanner": "vibe-aegis",
             "version": SCANNER_VERSION,
             "created": datetime.now(timezone.utc).isoformat(),
-            "note": "Findings accepted as pre-existing. Future scans report only new issues.",
-            "accepted": sorted(f.fingerprint for f in findings),
+            "note": "Findings accepted as pre-existing. Future scans report only new issues. "
+                    "Coverage gaps are never recorded here - a check that did not run cannot be accepted.",
+            "accepted": sorted(f.fingerprint for f in acceptable),
         }, indent=2), encoding="utf-8")
-        print(f"Baseline written to {bpath} ({len(findings)} findings marked as accepted).")
+        print(f"Baseline written to {bpath} ({len(acceptable)} findings marked as accepted).")
+        if gaps:
+            print(f"Note: {gaps} coverage gap(s) were NOT baselined - re-run with full "
+                  f"network access so every check actually runs.", file=sys.stderr)
         return 0
 
     sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
@@ -2518,10 +2593,23 @@ def main() -> int:
 
     score, verdict = compute_readiness_score(findings, scanned_files=scanned_files)
 
+    # `--diff` that resolved successfully and matched no source files is an EMPTY
+    # CHANGESET, not a failed audit - a docs-only or config-only pull request is the
+    # normal case. Only a full scan finding nothing to read indicates a broken target
+    # path or checkout. (A diff that could not be resolved falls back to a full scan
+    # above and leaves `only_files` None, so it is still held to the strict rule.)
+    diff_matched_no_source = only_files is not None and scanned_files == 0
+    if diff_matched_no_source:
+        score, verdict = 100, "NO CODE CHANGES TO REVIEW (diff contained no scannable source files)"
+
     # Coverage is a separate axis from severity: a check that did not run is not
     # a small defect, it is an unknown. Keep the two apart in the report.
     skipped_checks = [f for f in findings if f.kind == "skipped_check"]
     findings = [f for f in findings if f.kind != "skipped_check"]
+    # Scanning zero files is a coverage gap with no `skipped_check` to represent it.
+    # Computed once here so the report, the coverage block and the exit code cannot
+    # drift apart on what "incomplete" means.
+    scan_is_incomplete = scanned_files <= 0 and not diff_matched_no_source
     counts = {
         "CRITICAL": sum(1 for f in findings if f.severity == "CRITICAL"),
         "HIGH": sum(1 for f in findings if f.severity == "HIGH"),
@@ -2552,9 +2640,14 @@ def main() -> int:
         "release_verdict": verdict,
         "summary_counts": counts,
         "coverage": {
-            "complete": not skipped_checks,
+            "complete": not skipped_checks and not scan_is_incomplete,
             "checks_skipped": len(skipped_checks),
             "note": (
+                "No source files were scanned, so nothing was verified. Check the target "
+                "path and the checkout."
+                if scan_is_incomplete else
+                "The diff contained no scannable source files - there was nothing to review."
+                if diff_matched_no_source else
                 "All requested checks ran." if not skipped_checks else
                 "Some checks could not run. Their result is UNKNOWN, not clean - "
                 "the score reflects only what was actually inspected."
@@ -2645,9 +2738,25 @@ def main() -> int:
     threshold = args.fail_on or ("high" if args.fail_on_high else None)
     if threshold:
         limit = sev_rank[threshold.upper()]
-        if any(sev_rank.get(f.severity, 9) <= limit for f in findings):
+        # Coverage, severity and CONFIDENCE are three separate axes. Blocking a release
+        # on a finding the scanner cannot demonstrate is the mirror image of passing one
+        # it never checked: both substitute a guess for evidence.
+        conf_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+        conf_limit = conf_rank[args.min_confidence.upper()]
+        if any(sev_rank.get(f.severity, 9) <= limit
+               and conf_rank.get(f.confidence, 2) <= conf_limit
+               for f in findings):
             return 1
-    if args.fail_on_incomplete and skipped_checks:
+
+    # A scan that inspected NOTHING is the most incomplete scan there is, and it
+    # produces no `skipped_checks` - every stage ran, there was simply nothing to look
+    # at. Gating on `skipped_checks` alone therefore returned 0 for an empty checkout,
+    # a mistyped target path, or a run from the wrong working directory: a green
+    # pipeline certifying a scan of zero files. `compute_readiness_score()` has
+    # reported this correctly since 2.4.0 as INCOMPLETE_SCAN at 0/100; the exit code
+    # just never acted on it. Coverage and severity are separate axes all the way out
+    # to the process exit status, not only inside the report.
+    if args.fail_on_incomplete and (skipped_checks or scan_is_incomplete):
         return 1
     return 0
 

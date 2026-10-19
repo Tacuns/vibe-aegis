@@ -4,6 +4,83 @@ All notable changes to Vibe Aegis are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-10-19
+
+The fail-closed contract was correct inside `compute_readiness_score()` and wrong
+everywhere else. Three separate routes still produced a green gate on an audit that had
+not happened.
+
+### Fixed - an empty scan exited 0 (CRITICAL)
+
+`--fail-on-incomplete` gated on `skipped_checks` alone. Scanning **zero files** produces
+no skipped check - every stage ran, there was simply nothing to read - so an empty
+checkout, a mistyped target path, or a run from the wrong working directory exited **0**
+while the report itself said `INCOMPLETE_SCAN` at `0/100`. The verdict has been right
+since 2.4.0; the exit code never acted on it.
+
+`--fail-on-incomplete` now also fails when no source files were scanned, and
+`coverage.complete` reports `false` with a note naming the likely cause.
+
+### Fixed - suppression could hide a coverage gap (CRITICAL)
+
+`.aegis-ignore` accepted `DEP-00` / `LIVE-00` / `ART-10` as ordinary rule ids, and
+`--write-baseline` recorded them like any other finding. The baseline route did it
+**silently**: one `--write-baseline` run on a machine with no network accepted `DEP-00`
+forever, and every later scan reported `READY TO PUBLISH` while the dependency check
+never ran again.
+
+Suppression exists to say "we know about this defect and choose to live with it". A check
+that did not run carries no information to accept. `apply_suppressions()` now always keeps
+anything `_is_incomplete()` recognises - the same single source of truth the scoring
+function uses - and `--write-baseline` refuses to record gaps, reporting how many it
+skipped.
+
+### Fixed - `ART-11` called correctly signed APKs unsigned (HIGH)
+
+The check looked only for v1 JAR signing (`.RSA`/`.DSA`/`.EC`/`.SF` under `META-INF/`).
+APK Signature Scheme **v2/v3** (Android 7.0+) stores the signature in an APK Signing Block
+between the last entry and the central directory, where `zipfile.namelist()` cannot see
+it, and release builds have disabled v1 for years. A correctly signed release APK was
+reported unsigned at HIGH - blocking the gate immediately before a store upload.
+
+New `has_apk_signing_block()` reads the End of Central Directory record and checks for the
+`APK Sig Block 42` magic. A structure that cannot be parsed (ZIP64, an `.aab`, a truncated
+archive) is now `ART-10`, a coverage gap, rather than an unsigned verdict - unknown is not
+a defect.
+
+### Added - `--min-confidence`, the third axis
+
+Coverage and severity were separated in 2.4.0. Confidence was still collapsed into
+severity, so a finding the scanner **cannot prove** blocked a release exactly as hard as
+one it demonstrated. `SEC-03` matches a list of known auth helpers and cannot recognise a
+hand-rolled guard; `REL-*` cannot know your data volume. Both are `MEDIUM` confidence and
+both were `CRITICAL`/`HIGH` blocking.
+
+`--min-confidence high|medium|low` (default `low`, unchanged behaviour) restricts which
+findings affect the **exit code**. Everything is still reported. Blocking a release on a
+finding that cannot be demonstrated is the mirror image of passing one that was never
+checked: both substitute a guess for evidence.
+
+### Changed - `--diff` with an empty changeset is not an incomplete scan
+
+A docs-only pull request legitimately matches no source files. That now reports
+`NO CODE CHANGES TO REVIEW` and exits 0, instead of being swept up by the stricter
+empty-scan rule. A `--diff` ref that cannot be resolved still falls back to a full scan and
+is held to the strict rule.
+
+### Documentation
+
+- README documents the three axes - coverage, severity, confidence - with the flag that
+  gates each, and states that coverage gaps can never be suppressed.
+- `ART-11`'s row explains what it now checks and when it defers to `ART-10`.
+
+### Tests
+
+95 -> 110. New suites: `TestExitCodeHonoursCoverage`,
+`TestEmptyChangesetIsNotAnIncompleteScan`, `TestSuppressionCannotHideACoverageGap`,
+`TestApkSigningDetection`, `TestMinConfidenceGate`. The APK tests build real v1-signed,
+v2-signed, both-signed and unsigned archives rather than asserting on a mock.
+
 ## [2.5.0] - 2026-10-19
 
 Second adversarial self-audit. The scanner was run against its own output, and against
