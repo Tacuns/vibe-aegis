@@ -36,13 +36,23 @@ Examples:
 EOF
 }
 
+need_value() {   # need_value <option> <args...>: the option's value must be present
+  if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
+    echo "Option $1 needs a value." >&2
+    usage >&2
+    exit 2
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target)
+      need_value "$@"
       TARGET_DIR="$2"
       shift 2
       ;;
     --agent)
+      need_value "$@"
       AGENT="$2"
       shift 2
       ;;

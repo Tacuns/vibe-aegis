@@ -42,6 +42,9 @@ jobs:
       - name: Run unit tests
         run: python3 -B -m unittest discover -s tests -v
 
+      - name: Self-scan (the scanner must pass its own gate)
+        run: python3 scripts/aegis_scan.py . --fail-on-high --quiet
+
   release-gate:
     # Unit tests show the code does what its tests say. This shows the strict release
     # profile reaches the right verdict AND exit code on controlled projects - a clean one
@@ -133,7 +136,13 @@ jobs:
           done
 
       - name: Run installed scanner against the installed project
-        run: python3 /tmp/test-app/.aegis/scripts/aegis_scan.py /tmp/test-app
+        run: |
+          set -e
+          # The installer adds no application code: give the scan a source file to read,
+          # and fail the step if the installed scanner blocks a clean project.
+          mkdir -p /tmp/test-app/src
+          printf 'export function add(a: number, b: number): number {\n  return a + b;\n}\n' > /tmp/test-app/src/index.ts
+          python3 /tmp/test-app/.aegis/scripts/aegis_scan.py /tmp/test-app --fail-on-high
 
       - name: Verify the new deep-analysis stages run end to end
         run: |
@@ -255,7 +264,9 @@ jobs:
       - name: Validate JSON report against schema
         run: |
           set -e
-          python3 scripts/aegis_scan.py . --json --output /tmp/scan-report.json > /dev/null
+          # --include-tests: the repository's own code is clean, so the deliberately
+          # vulnerable corpus supplies the findings whose fields this step checks.
+          python3 scripts/aegis_scan.py . --include-tests --offline --json --output /tmp/scan-report.json > /dev/null
           python3 - <<'PY'
           import json, sys
           report = json.load(open("/tmp/scan-report.json"))
@@ -264,6 +275,9 @@ jobs:
           missing = [k for k in required if k not in report]
           if missing:
               print(f"::error::Report is missing required schema keys: {missing}")
+              sys.exit(1)
+          if not report["findings"]:
+              print("::error::No findings to validate - the schema check would be vacuous")
               sys.exit(1)
           for f in report["findings"]:
               fmissing = [k for k in schema["$defs"]["finding"]["required"] if k not in f]

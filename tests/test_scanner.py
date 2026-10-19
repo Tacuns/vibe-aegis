@@ -1560,6 +1560,7 @@ REDACTION_EXEMPT = {
     "DB-01": "catalog names only; the password never leaves the env - TestLiveDatabaseCheck",
     "DB-02": "catalog names only - TestLiveDatabaseCheck",
     "DB-03": "catalog names only - TestLiveDatabaseCheck",
+    "HIST-02": "file path and commit only, never its values - TestEnvFileInGitHistory",
 }
 
 
@@ -4379,6 +4380,7 @@ CORPUS_EXEMPT = {
     "ART-10": "TestSignatureIsVerifiedOrSaidToBeUnverified",
     "DEP-01": "TestDependencySeverityReachesTheGate",        # needs the OSV API
     "HIST-01": "TestGitHistoryCoverageIsStated",              # needs a git history
+    "HIST-02": "TestEnvFileInGitHistory",
     "SEC-17B": "TestLiveAndNetworkOutputIsRedacted",          # needs a live server
     "SEC-01C": "TestEnvFileProtectionAsksGit",                # needs git state and a .env
     "ART-11": "TestSignatureIsVerifiedOrSaidToBeUnverified",  # needs a signed package
@@ -4876,3 +4878,269 @@ class TestTwoAccountTestPlan(unittest.TestCase):
         n, plan = self._plan({"src/a.ts": "export const x = 1;\n"})
         self.assertEqual(n, 0)
         self.assertIn("no finding is not proof", plan)
+
+
+class TestEnvFileInGitHistory(unittest.TestCase):
+    """A deleted .env stays readable in history; only a credential pattern used to find it."""
+
+    G = ["git", "-c", "user.name=dev", "-c", "user.email=dev@localhost", "-c", "commit.gpgsign=false"]
+    WEAK = "hunter2" + "hunter2"          # no credential pattern knows this value
+
+    def _repo(self, tmp, files, msg="add config", then_remove=()):
+        root = Path(tmp) / "r"
+        root.mkdir()
+        subprocess.run(self.G + ["init", "-q", "-b", "main"], cwd=root, check=True)
+        for rel, body in files.items():
+            write(root, rel, body)
+        subprocess.run(self.G + ["add", "-A", "-f"], cwd=root, check=True)
+        subprocess.run(self.G + ["commit", "-q", "-m", msg], cwd=root, check=True)
+        for rel in then_remove:
+            subprocess.run(self.G + ["rm", "-q", "--cached", rel], cwd=root, check=True)
+            subprocess.run(self.G + ["commit", "-q", "-m", "remove " + rel], cwd=root, check=True)
+        return root
+
+    def _hist02(self, root):
+        return [f for f in aegis_scan.scan_git_history(root) if f.rule_id == "HIST-02"]
+
+    def test_a_deleted_env_file_is_reported_without_its_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp, {".env": "DB_PASSWORD=%s\n" % self.WEAK}, then_remove=[".env"])
+            found = self._hist02(root)
+        self.assertEqual([f.title for f in found], ["Environment File `.env` Was Committed To Git History"])
+        self.assertNotIn(self.WEAK, finding_blob(found))
+
+    def test_a_template_beside_it_does_not_stand_in_for_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp, {".env.example": "DB_PASSWORD=changeme\n",
+                                    "config/.env.production": "DB_PASSWORD=%s\n" % self.WEAK},
+                              then_remove=["config/.env.production", ".env.example"])
+            found = self._hist02(root)
+        self.assertEqual([f.title for f in found],
+                         ["Environment File `config/.env.production` Was Committed To Git History"])
+
+    def test_a_commit_message_mentioning_env_is_not_a_finding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp, {"README.md": "setup\n"},
+                              msg="docs: copy .env.example to .env and fill in .env.local")
+            self.assertEqual(aegis_scan.scan_git_history(root), [])
+
+    def test_an_env_file_without_values_is_not_a_finding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp, {".env": "# fill these in\nDB_PASSWORD=\nAPI_KEY=''\n"},
+                              then_remove=[".env"])
+            self.assertEqual(self._hist02(root), [])
+
+    def test_a_file_still_tracked_is_left_to_sec_01c(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp, {".env": "DB_PASSWORD=%s\n" % self.WEAK})
+            self.assertEqual(self._hist02(root), [])
+            self.assertIn("SEC-01C", [f.rule_id for f in aegis_scan.scan_repository(root)[0]])
+
+
+class TestConfigFilesAreNotSourceCoverage(unittest.TestCase):
+    """package.json + tsconfig.json was "3 files scanned" and could pass."""
+
+    CONFIG = {"package.json": '{"name": "x", "dependencies": {}}', "tsconfig.json": "{}",
+              "jsconfig.json": "{}", ".gitignore": "node_modules\n"}
+
+    def test_a_config_only_project_is_an_incomplete_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for rel, body in self.CONFIG.items():
+                write(Path(tmp), rel, body)
+            self.assertEqual(aegis_scan.scan_repository(Path(tmp))[1], 0)
+            code, _out = _run_main([tmp, "--offline", "--fail-on-incomplete", "--output", tmp + "/r.json"])
+            report = json.loads(Path(tmp, "r.json").read_text())
+        self.assertTrue(report["release_verdict"].startswith("INCOMPLETE_SCAN"), report["release_verdict"])
+        self.assertEqual(report["readiness_score"], 0)
+        self.assertNotEqual(code, 0)
+
+    def test_one_source_file_is_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for rel, body in self.CONFIG.items():
+                write(Path(tmp), rel, body)
+            write(Path(tmp), "src/index.ts", "export const add = (a: number, b: number) => a + b;\n")
+            self.assertEqual(aegis_scan.scan_repository(Path(tmp))[1], 1)
+
+    def test_a_config_file_is_still_scanned(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "package.json", '{"name": "x", "token": "%s"}' % STRIPE_KEY)
+            found, n = aegis_scan.scan_repository(Path(tmp))
+        self.assertEqual(n, 0)
+        self.assertIn("SEC-01", [f.rule_id for f in found])
+
+    def test_zero_files_cannot_pass_with_only_the_count(self):
+        self.assertEqual(aegis_scan.compute_readiness_score([], scanned_files=0)[0], 0)
+        self.assertTrue(aegis_scan.compute_readiness_score([], scanned_files=0)[1].startswith("INCOMPLETE_SCAN"))
+
+
+@unittest.skipUnless(shutil.which("git"), "needs git")
+class TestGitignoreNegationDoesNotProtectEnv(unittest.TestCase):
+    """`!.env.example` is a re-include, not a rule that ignores .env."""
+
+    def _sec01c(self, gitignore):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            write(root, ".gitignore", gitignore)
+            write(root, ".env", "DB_PASSWORD=x\n")
+            write(root, ".env.example", "DB_PASSWORD=\n")
+            write(root, "a.ts", "export const a = 1;\n")
+            return [f.file for f in aegis_scan.scan_repository(root)[0] if f.rule_id == "SEC-01C"]
+
+    def test_only_a_negation_leaves_env_exposed(self):
+        self.assertEqual(self._sec01c("node_modules\n!.env.example\n"), [".env"])
+
+    def test_an_ignore_rule_with_a_negated_template_protects_env(self):
+        self.assertEqual(self._sec01c(".env*\n!.env.example\n"), [])
+
+
+class TestInexactVersionsAreGaps(unittest.TestCase):
+    """`*`, `latest` and ranges went to OSV, matched nothing, and read as clean."""
+
+    def _check(self, deps):
+        sent = []
+        real = aegis_scan.urllib.request.urlopen
+
+        def fake(req, timeout=None, context=None):
+            queries = json.loads(req.data.decode("utf-8"))["queries"]
+            sent.extend((q["package"]["name"], q["version"]) for q in queries)
+            return _FakeResponse({}, json.dumps({"results": [{}] * len(queries)}).encode())
+        aegis_scan.urllib.request.urlopen = fake
+        try:
+            return aegis_scan.check_dependency_vulnerabilities(deps), sent
+        finally:
+            aegis_scan.urllib.request.urlopen = real
+
+    def test_unpinned_versions_are_a_gap_and_are_not_queried(self):
+        found, sent = self._check([("npm", "a", "*"), ("npm", "b", "latest"), ("npm", "c", "2.0.0 <3"),
+                                   ("npm", "d", "1.x"), ("npm", "e", "workspace:*")])
+        self.assertEqual(sent, [])
+        self.assertEqual([f.rule_id for f in found], ["DEP-00"])
+        self.assertTrue(aegis_scan._is_incomplete(found[0]))
+        self.assertIn("a@*", found[0].snippet)
+
+    def test_exact_versions_are_queried_and_the_rest_named(self):
+        found, sent = self._check([("npm", "a", "1.2.3"), ("PyPI", "django", "4.2"),
+                                   ("npm", "b", "latest"), ("npm", "c", "1.0.0-beta.2")])
+        self.assertEqual(sent, [("a", "1.2.3"), ("django", "4.2"), ("c", "1.0.0-beta.2")])
+        self.assertEqual([(f.rule_id, f.title) for f in found],
+                         [("DEP-00", "1 Dependencies Have No Exact Version And Were Not Checked")])
+
+    def test_no_dependencies_and_offline(self):
+        self.assertEqual(self._check([])[0], [])          # nothing to check is not a gap
+        found = aegis_scan.check_dependency_vulnerabilities([("npm", "a", "1.0.0")], offline=True)
+        self.assertEqual([(f.rule_id, f.status) for f in found], [("DEP-00", "SKIPPED")])
+
+
+class TestPagesRouterMethodBranches(unittest.TestCase):
+    """A Pages Router handler branches on req.method; it has no POST export to find."""
+
+    def _sec03(self, rel, body):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), rel, body)
+            return [(f.title, f.line) for f in aegis_scan.scan_repository(Path(tmp))[0]
+                    if f.rule_id == "SEC-03"]
+
+    def test_an_unauthenticated_method_branch_is_reported(self):
+        self.assertEqual(self._sec03("pages/api/items.ts",
+            "export default async function handler(req, res) {\n"
+            "  if (req.method === \"POST\") {\n    await db.item.create({ data: req.body });\n"
+            "    return res.json({ ok: true });\n  }\n  res.json(await db.item.findMany());\n}\n"),
+            [("Server Mutation `POST` Appears to Lack Authentication Check", 2)])
+
+    def test_a_switch_case_is_reported(self):
+        self.assertEqual([t for t, _ in self._sec03("pages/api/items.js",
+            "export default async function handler(req, res) {\n  switch (req.method) {\n"
+            "    case 'GET': return res.json([]);\n"
+            "    case 'DELETE': await db.item.deleteMany({}); return res.end();\n  }\n}\n")],
+            ["Server Mutation `DELETE` Appears to Lack Authentication Check"])
+
+    def test_authenticated_or_read_only_handlers_are_silent(self):
+        self.assertEqual(self._sec03("pages/api/items.ts",
+            "export default async function handler(req, res) {\n"
+            "  const session = await getServerSession(req, res, opts);\n"
+            "  if (!session) return res.status(401).end();\n"
+            "  if (req.method === 'POST') { await db.item.create({ data: { owner: session.user.id } }); }\n}\n"), [])
+        self.assertEqual(self._sec03("pages/api/items.ts",
+            "export default async function handler(req, res) {\n"
+            "  if (req.method === 'GET') return res.json(await db.item.findMany());\n}\n"), [])
+
+    def test_the_test_plan_uses_the_branch_method(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "pages/api/items/[id].ts",
+                  "export default async function handler(req, res) {\n"
+                  "  if (req.method === \"DELETE\") {\n"
+                  "    await db.item.delete({ where: { id: req.query.id } });\n    return res.end();\n  }\n}\n")
+            found, _ = aegis_scan.scan_repository(root)
+            aegis_scan.write_idor_plan(found, root, root / "plan.md")
+            plan = (root / "plan.md").read_text()
+        self.assertIn('-X DELETE "$BASE_URL/api/items/$A_ID"', plan)
+        self.assertNotIn("-X GET", plan)
+
+
+class TestSelfScan(unittest.TestCase):
+    """The scanner's rule table is made of the patterns it hunts."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def test_the_repository_passes_its_own_gate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _out = _run_main([str(self.ROOT), "--fail-on-high", "--offline",
+                                    "--output", tmp + "/r.json"])
+            report = json.loads(Path(tmp, "r.json").read_text())
+        self.assertEqual(code, 0, [(f["rule_id"], f["file"], f["line"]) for f in report["findings"]])
+        self.assertEqual([f for f in report["findings"] if f["severity"] in ("CRITICAL", "HIGH")], [])
+
+    def test_only_the_running_scanner_is_skipped_not_its_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scripts").mkdir()
+            shutil.copy(self.ROOT / "scripts" / "aegis_scan.py", root / "scripts" / "aegis_scan.py")
+            write(root, "lib/aegis_scan.py", "import os\nos.system('rm -rf ' + input())\n")
+            found, n = aegis_scan.scan_repository(root)
+        self.assertEqual(n, 1)                                        # the impostor is read
+        self.assertEqual({f.file for f in found}, {"lib/aegis_scan.py"})
+
+
+@unittest.skipUnless(shutil.which("bash") and os.name != "nt", "needs bash")
+class TestInstallerRejectsMissingValues(unittest.TestCase):
+    """`--target` with no value died on `$2: unbound variable`; `--agent --target x`
+    took `--target` as the agent name."""
+
+    def _install(self, *args):
+        return subprocess.run(["bash", str(Path(__file__).resolve().parent.parent / "install.sh"), *args],
+                              capture_output=True, text=True, timeout=30)
+
+    def test_a_missing_value_is_named(self):
+        for args, option in ((["--target"], "--target"), (["--agent"], "--agent"),
+                             (["--agent", "--target", "/tmp/x"], "--agent"), (["--target", ""], "--target")):
+            r = self._install(*args)
+            self.assertEqual(r.returncode, 2, args)
+            self.assertIn("Option %s needs a value." % option, r.stderr, args)
+
+    def test_an_existing_copilot_file_is_kept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mine = write(Path(tmp), ".github/copilot-instructions.md", "my own instructions\n")
+            r = self._install("--target", tmp, "--agent", "vscode")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(mine.read_text(), "my own instructions\n")
+            self.assertTrue(Path(tmp, ".aegis/suggested/.github/copilot-instructions.md").is_file())
+
+
+class TestOsSystemIsAShell(unittest.TestCase):
+    """SEC-08 caught subprocess(..., shell=True) but never os.system, which always is one."""
+
+    def _sec08(self, body):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "app.py", "import os\n" + body + "\n")
+            return [f.rule_id for f in aegis_scan.scan_repository(Path(tmp))[0] if f.rule_id == "SEC-08"]
+
+    def test_a_built_command_is_reported(self):
+        for body in ("os.system(cmd)", "os.system('ping ' + host)", "os.system(f'ping {host}')",
+                     "os.popen(command).read()"):
+            self.assertEqual(self._sec08(body), ["SEC-08"], body)
+
+    def test_a_fixed_literal_is_silent(self):
+        for body in ("os.system('clear')", 'os.popen("uptime").read()'):
+            self.assertEqual(self._sec08(body), [], body)

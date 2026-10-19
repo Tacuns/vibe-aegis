@@ -230,7 +230,9 @@ SECURITY_PATTERNS: List[Tuple[str, str, str, re.Pattern, str, str, Optional[Set[
         "HIGH",
         "Dangerous Dynamic Code or Shell Execution",
         re.compile(
-            r"(?:\beval\s*\(|\bnew\s+Function\s*\(|subprocess\.(?:Popen|run|call)\([^)]*shell\s*=\s*True|child_process\.exec\s*\(\s*`[^`]*\$\{)",
+            r"(?:\beval\s*\(|\bnew\s+Function\s*\(|subprocess\.(?:Popen|run|call)\([^)]*shell\s*=\s*True|child_process\.exec\s*\(\s*`[^`]*\$\{"
+            # os.system / os.popen always run a shell; only a plain literal is fixed.
+            r"|\bos\.(?:system|popen)\s*\((?!\s*(?:'[^'\n]*'|\"[^\"\n]*\")\s*\)))",
         ),
         "CWE-78 / CWE-94",
         "Avoid eval() and shell=True. Pass command arguments as an array to execFile / subprocess.run(..., shell=False) with strict input allowlists.",
@@ -868,6 +870,29 @@ def _mutating_handlers(text: str, server_actions: bool) -> List[Tuple[str, int, 
     return out
 
 
+_METHOD_BRANCH = re.compile(
+    r"""\breq(?:uest)?\.method\s*===?\s*['"](POST|PUT|PATCH|DELETE)['"]""")
+_METHOD_SWITCH = re.compile(r"\bswitch\s*\(\s*req(?:uest)?\.method\s*\)")
+_METHOD_CASE = re.compile(r"""\bcase\s+['"](POST|PUT|PATCH|DELETE)['"]\s*:""")
+
+
+def _pages_api_method_branches(text: str) -> List[Tuple[str, int, str]]:
+    """A Pages Router handler is one default export that branches on `req.method`:
+    `if (req.method === "POST")` / `case "POST":`. There is no per-method export to
+    split on, so the whole file is the body - an auth check anywhere in it counts."""
+    hits = list(_METHOD_BRANCH.finditer(text))
+    if _METHOD_SWITCH.search(text):
+        hits += list(_METHOD_CASE.finditer(text))
+    hits.sort(key=lambda m: m.start())
+    seen: Set[str] = set()
+    out: List[Tuple[str, int, str]] = []
+    for m in hits:
+        if m.group(1) not in seen:
+            seen.add(m.group(1))
+            out.append((m.group(1), text[:m.start()].count("\n") + 1, text))
+    return out
+
+
 _USE_SERVER_LINE = re.compile(r"(?m)^[ \t]*['\"]use server['\"]\s*;?\s*$")
 
 
@@ -1013,6 +1038,8 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
         # proves nothing about who is calling - counted as authentication.
         handlers = (_mutating_handlers(text, has_use_server)
                     if (is_api_route or has_use_server) else []) + inline_actions
+        if is_api_route and "pages/api/" in rel_path:
+            handlers += _pages_api_method_branches(text)
         for name, line_no, body in handlers:
             if _AUTH_CALL.search(body) or _calls_local_guard(body, text):
                 continue
@@ -1290,6 +1317,7 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
 
 _ENV_FILE = re.compile(r"^\.env(?:\.[A-Za-z0-9_-]+)?$")
 _ENV_TEMPLATE = re.compile(r"\.(?:example|sample|template|dist)$")
+_ENV_ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_.]*\s*=\s*['\"]?[^\s'\"#]")
 
 
 def _gitignore_regex(pat: str) -> "re.Pattern":
@@ -1422,6 +1450,21 @@ def check_env_files(root: Path) -> List[Finding]:
     return findings
 
 
+_SELF_TEXT: List[str] = []
+
+
+def _is_this_scanner(text: str) -> bool:
+    if not _SELF_TEXT:
+        try:
+            _SELF_TEXT.append(Path(__file__).read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            _SELF_TEXT.append("\0")  # unreadable: never matches, so the file is scanned
+    return text == _SELF_TEXT[0]
+
+
+NON_SOURCE_FILES = {"package.json", "tsconfig.json", "jsconfig.json", ".gitignore"}
+
+
 def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
                     include_tests: bool = False,
                     ledger: Optional[CoverageLedger] = None,
@@ -1498,10 +1541,22 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
 
             rel_path = fpath.relative_to(root).as_posix()  # POSIX separators so path rules match on Windows too
 
+            if fname == "aegis_scan.py" and _is_this_scanner(text):
+                # Its rule table is made of the patterns it hunts. Skipped only when it is
+                # byte-for-byte the running scanner: a name alone would let any file
+                # called aegis_scan.py hide from the scan.
+                ledger.record("the scanner itself", rel_path, material=False,
+                              detail="Identical to the running aegis_scan.py.")
+                continue
+
             if is_test_path(rel_path) and not include_tests:
                 continue  # fixtures are deliberately insecure; --include-tests to audit them
 
-            scanned_files += 1
+            # Project configuration is still scanned, but it is not application code: a
+            # repository holding only package.json and tsconfig.json was "3 files scanned"
+            # and could pass. Coverage counts source files only.
+            if fname not in NON_SOURCE_FILES and not fname.startswith(".env"):
+                scanned_files += 1
             lines = text.splitlines()
             # Phase 2: high-confidence credential detection (provider formats + entropy),
             # on the ORIGINAL text. A key in a comment is committed exactly like a key in
@@ -1645,8 +1700,8 @@ def check_live_database(schemas: List[str], roles: List[str]) -> List["Finding"]
     url = os.environ.get(DB_URL_ENV, "")
     if not url:
         return [_db_gap(f"--db-check was given but {DB_URL_ENV} is not set.",
-                        f"Export {DB_URL_ENV}=postgres://user:password@host:5432/db (a read-only "
-                        "role is enough) and re-run.")]
+                        f"Export {DB_URL_ENV} as the database's postgres:// connection string "
+                        "(a read-only role is enough) and re-run.")]
     env = _psql_env(url)
     if env is None:
         return [_db_gap(f"{DB_URL_ENV} is not a postgres:// URL.",
@@ -1799,7 +1854,8 @@ def write_idor_plan(findings: List["Finding"], root: Path, out: Path) -> int:
                 text = (root / f.file).read_text(encoding="utf-8", errors="ignore").splitlines()
                 for ln in reversed(text[:max(f.line, 1)]):
                     m = re.search(r"\b(GET|POST|PUT|PATCH|DELETE)\b", ln)
-                    if m and "export" in ln:
+                    # An App Router export, or a Pages Router `req.method` branch.
+                    if m and ("export" in ln or _METHOD_BRANCH.search(ln) or _METHOD_CASE.search(ln)):
                         method = m.group(1)
                         break
             except OSError:
@@ -2585,6 +2641,9 @@ def scan_git_history(root: Path, max_commits: int = 300) -> List[Finding]:
             confidence="HIGH", kind="skipped_check", status="SKIPPED"))
 
     reported: Set[str] = set()
+    env_reported: Set[str] = set()
+    # A file still tracked is SEC-01C's (CRITICAL); HIST-02 is for one that left the tree.
+    tracked_now = set((run_git(root, ["ls-files", "-z"]) or "").split("\0"))
     failed: List[str] = []
     for entry in log.strip().splitlines():
         parts = entry.split("\x1f")
@@ -2602,11 +2661,35 @@ def scan_git_history(root: Path, max_commits: int = 300) -> List[Finding]:
         if diff is None:
             failed.append(sha[:10])
             continue
+        short_sha = sha[:10]
+        # An environment file with a value in it, even one no credential pattern knows
+        # (`DB_PASSWORD=hunter2`), stays readable in history after it is deleted. Judged
+        # per file name, so a template beside it (`.env.example`) never stands in for it.
+        target = None
+        for ln in diff.splitlines():
+            if ln.startswith("+++ "):
+                path = ln[6:] if ln.startswith("+++ b/") else ""
+                name = path.rsplit("/", 1)[-1]
+                target = path if (_ENV_FILE.match(name) and not _ENV_TEMPLATE.search(name)
+                                  and path not in tracked_now and path not in env_reported) else None
+            elif target and ln.startswith("+") and _ENV_ASSIGNMENT.match(ln[1:]):
+                env_reported.add(target)
+                findings.append(Finding(
+                    rule_id="HIST-02", domain="HISTORY", severity="HIGH",
+                    title=f"Environment File `{target}` Was Committed To Git History",
+                    file=f"git:{short_sha}", line=0,
+                    snippet=evidence(f"{target} with values in it was added in commit {short_sha} "
+                                     f"by {author} on {date}: {subject}", 260),
+                    cwe_or_standard="CWE-540 Information Exposure Through Source Code / OWASP A07",
+                    remediation=(f"Every value it held is still readable with `git show {short_sha}`. "
+                                 "Rotate them, then purge the file from history with `git filter-repo` "
+                                 "and force-push after coordinating with every collaborator."),
+                    confidence="HIGH"))
+                target = None
         # Only added lines can introduce a secret.
         added = "\n".join(ln[1:] for ln in diff.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
         if not added:
             continue
-        short_sha = sha[:10]
         for f in scan_secrets_in_text(f"commit {short_sha}", added, origin="git history"):
             # Redacted evidence no longer tells two keys apart, so dedupe on the value.
             dedupe_key = _vaulted(f) or f.snippet
@@ -2956,6 +3039,12 @@ def fetch_osv_record(vuln_id: str) -> Optional[Dict]:
         return None
 
 
+def _is_exact_version(version: str) -> bool:
+    v = (version or "").strip()
+    return bool(re.fullmatch(r"v?\d+(?:\.\d+)*(?:[-+._]?[0-9A-Za-z][0-9A-Za-z.+-]*)?", v)) \
+        and not re.search(r"(?:^|\.)[xX*](?:\.|$)", v)
+
+
 def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: bool = False) -> List[Finding]:
     """Query the free OSV.dev batch API. Degrades gracefully with no network."""
     findings: List[Finding] = []
@@ -2994,8 +3083,28 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
                          "(`--engine osv-scanner` / `--engine trivy`) for large dependency sets."),
             confidence="HIGH", kind="skipped_check", status="SKIPPED",
         ))
+    # OSV matches exact versions only. `*`, `latest`, `>=2 <3`, `1.x`, a git URL or
+    # `workspace:*` matches nothing and came back as "no vulnerabilities" - unchecked,
+    # reported clean. Query what is exact and name the rest as a gap.
+    exact = [d for d in deps[:OSV_BATCH_LIMIT] if _is_exact_version(d[2])]
+    inexact = [d for d in deps[:OSV_BATCH_LIMIT] if not _is_exact_version(d[2])]
+    if inexact:
+        names = ", ".join(f"{n}@{v}" for _e, n, v in inexact[:8]) + (" ..." if len(inexact) > 8 else "")
+        findings.append(Finding(
+            rule_id="DEP-00", domain="SUPPLY_CHAIN", severity="LOW",
+            title=f"{len(inexact)} Dependencies Have No Exact Version And Were Not Checked",
+            file="dependencies", line=0,
+            snippet=evidence(f"Not an exact version, so OSV cannot match it: {names}", 400),
+            cwe_or_standard="Coverage",
+            remediation=("Commit a lockfile (package-lock.json, poetry.lock, ...) so the installed "
+                         "versions are known, or pin these to exact versions."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED",
+        ))
+    if not exact:
+        return findings
+    deps = exact
     batch = [{"package": {"name": n, "ecosystem": e}, "version": v}
-             for e, n, v in deps[:OSV_BATCH_LIMIT]]
+             for e, n, v in deps]
 
     try:
         req = urllib.request.Request(

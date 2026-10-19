@@ -216,7 +216,7 @@ python3 scripts/aegis_scan.py . --fail-on-high --min-confidence high --fail-on-i
 | :--- | :--- |
 | `--artifact [PATH]` | Verify a build directory or an `.apk`/`.aab`/`.ipa`. With no value, auto-detects `dist/`, `build/`, `out/`, `.next/`, `.output/`, `.svelte-kit/`, `www/`, `public/`, `release/`. Finding none is an `ART-00` gap, and so is finding only `public/`: static assets are read, but they are not a build |
 | `--git-history [N]` | Hunt credentials committed in the newest `N` commits (default 300) reachable from **every** ref (`git log --all`: branches, tags, remote-tracking refs, the stash). More commits than `N`, a shallow clone, or a commit git could not show is a `GIT-00` gap |
-| `--deps` | Check dependencies against the OSV vulnerability database |
+| `--deps` | Check dependencies against the OSV vulnerability database. Only exact versions are queried: `*`, `latest`, a range such as `>=2 <3`, `1.x`, a git URL or `workspace:*` cannot be matched, so those packages are named in a `DEP-00` gap rather than reported clean — commit a lockfile to resolve them |
 | `--url <URL>` | Passive, read-only live header & exposure checks |
 | `--all` | Enable artifacts + git history + dependencies |
 | `--offline` | No network request from this run: disables `--deps` and `--url`, and starts only the external engines verified to work without a network (`gitleaks`, `trufflehog`) — see below |
@@ -301,12 +301,12 @@ Also honoured: a `.aegis-ignore` file in the repo root, one entry per line — e
 | :--- | :--- | :--- | :--- |
 | `SEC-01` | **Client-Exposed Secrets** | Critical | Private keys or tokens in `NEXT_PUBLIC_`, `VITE_`, `EXPO_PUBLIC_`, `REACT_APP_`, or hardcoded in source files |
 | `SEC-02` | **Database RLS Disabled** | Critical | Supabase/PostgreSQL tables without `ENABLE ROW LEVEL SECURITY` or permissive `USING (true)` policies; Firebase `allow read, write: if true` |
-| `SEC-03` | **Unprotected API / Server Actions** | Critical | Each Next.js `app/api` / `pages/api` `POST`/`PUT`/`PATCH`/`DELETE` handler, and each `"use server"` action (file-level or inline), that never establishes who is calling - checked per handler, so `GET`'s check does not cover `DELETE`. Creating a client (`createServerClient`) is not a check. FastAPI and Express routes are not covered by this rule |
+| `SEC-03` | **Unprotected API / Server Actions** | Critical | Each Next.js `app/api` / `pages/api` `POST`/`PUT`/`PATCH`/`DELETE` handler, and each `"use server"` action (file-level or inline), that never establishes who is calling - checked per handler, so `GET`'s check does not cover `DELETE`. A Pages Router handler is one default export, so each `req.method === "POST"` branch (or `case "POST":` in a `switch (req.method)`) is checked, and an auth check anywhere in the file counts. Creating a client (`createServerClient`) is not a check. FastAPI and Express routes are not covered by this rule |
 | `SEC-04` | **Broken Access Control (IDOR)** | Critical | Queries fetching/mutating records by user-supplied `id` without scoping to `auth.uid()` / authenticated session owner - including an owner field whose value itself comes from the request (`userId: body.userId`) |
 | `SEC-05` | **Payment & Checkout Tampering** | Critical | Trusting client-submitted prices, plan tiers, or quantities in Stripe/Razorpay checkout sessions |
 | `SEC-06` | **Unverified Webhooks** | Critical | Payment or auth webhooks processing payloads without cryptographic signature verification (`stripe.webhooks.constructEvent`) |
 | `SEC-07` | **SQL / Raw Query Injection** | High | String interpolation in SQL, `prisma.$queryRawUnsafe()`, `sequelize.query()`, or Python `cursor.execute(f"...")` |
-| `SEC-08` | **Command & Code Injection** | High | Unsanitized input passed to `child_process.exec`, `eval()`, `new Function()`, `os.system()`, or `subprocess(..., shell=True)` |
+| `SEC-08` | **Command & Code Injection** | High | Unsanitized input passed to `child_process.exec`, `eval()`, `new Function()`, `os.system()` / `os.popen()` (anything but a single fixed string literal), or `subprocess(..., shell=True)` |
 | `SEC-09` | **Cross-Site Scripting (XSS)** | High | Unsanitized `dangerouslySetInnerHTML`, `v-html`, `innerHTML`, or `javascript:` URLs in user-controlled hrefs |
 | `SEC-10` | **JWT & Session Flaws** | High | `jwt.decode()` used without `jwt.verify()`, weak JWT secrets, or sensitive auth tokens stored in `localStorage` |
 | `SEC-11` | **Server-Side Request Forgery (SSRF)** | High | Server endpoints fetching user-supplied URLs without allowlisting or private-IP (`127.0.0.1`, `169.254.169.254`) blocking |
@@ -449,6 +449,7 @@ Source code says what you wrote. The build output says what ships. Because the s
 | :--- | :--- | :--- | :--- |
 | `DEP-01` | Known dependency vulnerability | Low–Crit | Package versions with OSV advisories (npm, PyPI, crates.io, Go). Severity is the highest of every signal in each advisory's own record: its CVSS v3.x and v2 vectors (scored here), and its database or Ubuntu rating. A `MAL-` (malicious package) advisory is `CRITICAL`; an advisory whose severity cannot be read is `HIGH` at `MEDIUM` confidence, never guessed lower |
 | `HIST-01` | Credential in git history | Critical–Medium | A key committed at any point — **even if deleted later**, it is still readable and still compromised |
+| `HIST-02` | Environment file in git history | High | A `.env` / `.env.*` file with values in it that was committed and has since left the tree, so no credential pattern is needed: `DB_PASSWORD=hunter2` counts. Judged per file, so a `.env.example` beside it never stands in for it; templates and files with only empty values are not reported, and a file still tracked is `SEC-01C` |
 
 ### Rule Variants
 
@@ -522,7 +523,7 @@ parentheses. They are checked in this order, and the first that applies wins:
 
 | # | Verdict | When |
 | :--- | :--- | :--- |
-| 1 | `INCOMPLETE_SCAN` | Zero source files were scanned. Score forced to `0` |
+| 1 | `INCOMPLETE_SCAN` | Zero source files were scanned. Score forced to `0`. Project configuration (`package.json`, `tsconfig.json`, `jsconfig.json`, `.gitignore`, `.env*`) is still scanned but is not counted as source, so a repository holding only configuration cannot pass |
 | 2 | `BLOCKED` | Any open `CRITICAL` or `HIGH` finding. A real defect outranks a coverage gap |
 | 3 | `INCOMPLETE_SCAN` | Any check did not run or did not read what it should have. Names the checks |
 | 4 | `REVIEW_REQUIRED` | Any `MEDIUM` finding, or a score below 90 - a human decides |

@@ -293,6 +293,47 @@ plainly where static analysis stops.
   database write policy, an attempt to write a row owned by A). It is only written to
   disk; nothing is sent. With no findings it still says that no finding is not proof.
 
+### Fixed - a third review: coverage, history, dependencies and the installer
+
+Ten proposed fixes were checked one by one against this branch before anything changed.
+Several were already in place (a `!.env.example` line never protected `.env` here, commit
+messages were never read, a scan of zero files was already `INCOMPLETE_SCAN`, an existing
+`copilot-instructions.md` was already kept); those now have regression tests. What was
+still wrong:
+
+- **A configuration-only project could pass (HIGH).** `package.json`, `tsconfig.json`,
+  `jsconfig.json`, `.gitignore` and `.env*` counted as scanned source files, so a project
+  with no application code read as covered. They are still scanned, but no longer counted.
+- **A deleted `.env` left no finding (HIGH).** History was searched for credential
+  patterns only, so `DB_PASSWORD=hunter2` in a `.env` committed and later removed was
+  invisible. New rule `HIST-02`, judged per file name so a template beside it never
+  stands in for it; files with only empty values and templates are not reported.
+- **Unpinned versions read as "no vulnerabilities" (HIGH).** `*`, `latest`, ranges, git
+  URLs and `workspace:*` went to OSV, matched nothing, and counted as checked. Only exact
+  versions are queried; the rest are a named `DEP-00` gap.
+- **Pages Router mutations were not checked (HIGH).** `SEC-03` looked for exported
+  `POST`/`DELETE` functions; a Pages Router handler branches on `req.method` inside one
+  default export. Those branches are now checked, and `--idor-plan` uses their method.
+- **`os.system()` was never matched (HIGH).** `SEC-08` named it in the README but matched
+  only `subprocess(..., shell=True)`. A non-literal `os.system` / `os.popen` argument is
+  now reported (no hit in Django, Flask or DRF).
+- **The scanner failed its own gate.** Its rule table matched itself, and the `DB-00`
+  help text carried a `postgres://user:password@...` placeholder that read as a
+  credential. The scanner now skips a file only when it is byte-for-byte the running
+  scanner - a name alone would let any `aegis_scan.py` hide - and CI runs the self-scan
+  with `--fail-on-high`.
+- **The installer's missing-value errors were unhelpful.** `--target` with no value died
+  on `$2: unbound variable`, and `--agent --target x` took `--target` as the agent. Both
+  now say which option needs a value and exit `2`.
+
+Not applied, with the reason: `severity="SKIPPED"` (not a valid severity in the report
+schema), a new `SCAN-00` id (the zero-file case is `INCOMPLETE_SCAN`, with `COV-00` for
+skipped files), `git log -n 50` (fewer commits than the current 300 across every ref),
+`res.status ?? 1` in the Node wrapper (it would lose the signal exit code), a `py`
+fallback outside Windows (on Linux `py` can be an unrelated program), deduplicating on rule and line
+(two different findings on one line would merge), and a `DEP-00` gap for a project with
+no dependencies (nothing to check is not a gap).
+
 ### Changed - GitHub Actions are pinned to commit SHAs
 
 This repository's CI and the workflow shipped in `adapters/github-actions/` used movable
