@@ -1,9 +1,14 @@
+import ast
 import json
+import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 import zipfile
+from dataclasses import asdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -1381,3 +1386,709 @@ class TestMinConfidenceGate(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Redaction regression suite
+# ---------------------------------------------------------------------------
+# A report is committed, attached to issues and uploaded as a CI artifact, so nothing
+# the scanner writes anywhere may carry a credential. These tests plant canary secrets
+# - none of them real, all assembled at runtime so no valid-format key is stored in
+# this file - and then look for ANY 8-character run of each one in every output.
+#
+# A canary is the secret part only. A public format prefix (`sk_live_`, `whsec_`) is
+# allowed to appear, because the reader needs to know which kind of key to rotate.
+
+CANARY_ENTROPY = "q7Vt2Lx9" + "Rk4Wm8Zp3Nc6Hb1Jd5Fs"       # random, no provider format
+CANARY_STRIPE_BODY = "51Hq" + "Xy7Kp2Rm9Tn4Wb6Zc8Vd3Lf"
+CANARY_STRIPE = "sk_live_" + CANARY_STRIPE_BODY
+CANARY_WEBHOOK_BODY = "Mz3Qp8Lw" + "2Xn7Rk5Vt9Bj4"
+CANARY_WEBHOOK = "whsec_" + CANARY_WEBHOOK_BODY            # not in PROVIDER_SECRETS
+CANARY_URL_PASS = "Tr0ub4dor" + "Gx"                       # inside a credentialed URL
+CANARY_ENV_PASS = "hunter" + "2plum"                       # low entropy, bare .env value
+CANARY_URL = "https://deploy:" + CANARY_URL_PASS + "@registry.internal/v2"
+CANARIES = (CANARY_ENTROPY, CANARY_STRIPE_BODY, CANARY_WEBHOOK_BODY,
+            CANARY_URL_PASS, CANARY_ENV_PASS)
+
+
+def leaked(blob, canaries=CANARIES, window=8):
+    """Every canary of which some `window`-character run appears in `blob`."""
+    return sorted({c[:4] + "..." for c in canaries
+                   for i in range(len(c) - window + 1) if c[i:i + window] in blob})
+
+
+def finding_blob(findings):
+    return json.dumps([f.__dict__ for f in findings], default=str)
+
+
+E, K, W = CANARY_ENTROPY, CANARY_STRIPE, CANARY_WEBHOOK
+
+# One fixture per rule that quotes source, with a canary on the triggering line itself,
+# because that line is exactly what a careless rule would copy into its snippet.
+REDACTION_CORPUS = {
+    ".env": "SESSION_SECRET=%s\n" % E,
+    ".env.production": ("NEXT_PUBLIC_API_SECRET=%s\nNEXT_PUBLIC_DB_PASSWORD=%s\n"
+                        % (E, CANARY_ENV_PASS)),
+    "db/schema.sql": (
+        "CREATE TABLE notes (id int, token text DEFAULT '%s');\n"
+        'CREATE POLICY "%s" ON notes FOR ALL USING (true);\n' % (E, E)),
+    "lib/rules.js": "allow read, write: if true; const k = \"%s\";\n" % E,
+    "lib/keys.ts": (
+        'const NEXT_PUBLIC_STRIPE_SECRET = "%s";\n'
+        'const stripe = new Stripe("%s");\n'
+        'const registry = "%s";\n' % (E, K, CANARY_URL)),
+    "lib/session.ts": (
+        'localStorage.setItem("token", "%s");\n'
+        'app.use(cors({ origin: "*", k: "%s" }));\n'
+        'const f = new Function("return \'%s\'");\n'
+        'try { run(); } catch (e) { console.log("%s"); }\n' % (E, E, E, E)),
+    "lib/render.ts": (
+        "export function render(req) {\n"
+        "  const html = req.query.html;\n"
+        '  document.body.innerHTML = html + "%s";\n'
+        "}\n" % E),
+    "app/api/checkout/route.ts": (
+        'const API_KEY = "%s";\n'
+        "export async function POST(req) {\n"
+        "  const body = await req.json();\n"
+        '  const s = await stripe.checkout.sessions.create({ line_items: [{ price_data: '
+        '{ unit_amount: body.price, currency: "%s" } }] });\n'
+        '  const r = await openai.chat.completions.create({ model: "%s", messages: [] });\n'
+        "  const rows = await prisma.$queryRawUnsafe(`SELECT * FROM t WHERE k = '%s' "
+        "AND id = ${body.id}`);\n"
+        '  eval(body.code + "%s");\n'
+        '  const page = await fetch(body.url + "%s");\n'
+        '  const data = await readFile(body.path + "%s");\n'
+        '  console.log("password", body.password, "%s");\n'
+        '  const all = await prisma.user.findMany(); const k2 = "%s";\n'
+        '  for (const id of body.ids) { await prisma.item.update({ data: { n: "%s" } }); }\n'
+        '  await prisma.note.update({ where: { id: body.id, note: "%s" } });\n'
+        '  await db.wallet.update({ data: { balance: wallet.balance - 1, memo: "%s" } });\n'
+        '  res.status(500).json({ error: err.stack, k: "%s" });\n'
+        '  const headers = { "Access-Control-Allow-Origin": "*", "X-K": "%s" };\n'
+        '  const h = crypto.createHash("md5").update("%s");\n'
+        '  const claims = jwt.decode(body.token + "%s");\n'
+        "  return Response.json(s);\n"
+        "}\n" % ((E,) * 16)),
+    "app/api/login/route.ts": (
+        "export async function POST(req) { const k = \"%s\"; return Response.json({}); }\n" % E),
+    "app/api/upload/route.ts": (
+        "export async function POST(req) {\n"
+        "  const form = await req.formData(); const file = form.get(\"f\");\n"
+        "  const x = formData.get(\"%s\");\n"
+        "  return Response.json({ ok: getUser() });\n"
+        "}\n" % E),
+    "app/api/webhooks/stripe/route.ts": (
+        'const STRIPE_WEBHOOK_SECRET = "%s";\n'
+        'import Stripe from "stripe";\n'
+        "export async function POST(req) { const event = await req.json(); "
+        "return Response.json({ ok: true }); }\n" % W),
+    "components/Checkout.tsx": (
+        "export default function Checkout({ items }) {\n"
+        "  return (\n"
+        '    <form onSubmit={async () => { await fetch("/api/checkout"); }}>\n'
+        '      <a href="#" data-k="%s">Dead</a>\n'
+        '      <a href="#" onClick={go} data-k="%s">Act</a>\n'
+        '      <div onClick={go} data-k="%s">Click</div>\n'
+        '      <input placeholder="%s" />\n'
+        '      <img src="/a.png" data-k="%s" />\n'
+        '      <button className="outline-none k-%s" type="submit">Pay</button>\n'
+        "      <p>Lorem ipsum %s</p>\n"
+        '      <div className="z-[99999] w-[800px]" data-k="%s" />\n'
+        '      <div dangerouslySetInnerHTML={{ __html: "%s" }} />\n'
+        "      {items.map(i => <span key={i.id}>{i.name}</span>)}\n"
+        '      <button onClick={() => {}} data-k="%s">Noop</button>\n'
+        "    </form>\n"
+        "  );\n"
+        "}\n" % ((E,) * 10)),
+    # A minified bundle is skipped and reported as a coverage gap (COV-00).
+    "public/vendor.min.js": "var k=\"%s\";\n" % E,
+    # Build output: the source key ships (ART-01), is found again (ART-03), plus a map.
+    "dist/assets/index.js": 'const K="%s";export default K;' % K,
+    "dist/assets/index.js.map": '{"version":3,"sourcesContent":["%s"]}' % E,
+}
+
+# Rules this corpus does not fire, and where each one's redaction is proved instead.
+# Listed explicitly so a NEW rule cannot silently skip the leak check: it has to fire
+# in the corpus, or be named here with the test that covers it.
+REDACTION_EXEMPT = {
+    "SEC-17": "live headers - TestLiveAndNetworkOutputIsRedacted",
+    "SEC-17B": "live exposure probe - TestLiveAndNetworkOutputIsRedacted",
+    "DEP-00": "OSV unreachable - TestLiveAndNetworkOutputIsRedacted",
+    "DEP-01": "OSV advisory - snippet is package names only; TestLiveAndNetworkOutputIsRedacted",
+    "GIT-00": "constant reason strings only; covered by the static guard",
+    "ART-10": "TestMobilePackageOutputIsRedacted",
+    "ART-11": "TestMobilePackageOutputIsRedacted",
+    "ART-12": "TestMobilePackageOutputIsRedacted",
+    "ART-13": "TestMobilePackageOutputIsRedacted",
+    "ART-14": "TestMobilePackageOutputIsRedacted",
+    "ART-15": "TestMobilePackageOutputIsRedacted",
+}
+
+
+def build_redaction_corpus(root):
+    for rel, body in REDACTION_CORPUS.items():
+        write(root, rel, body)
+
+
+def scanner_rule_ids():
+    """Every literal rule id the scanner can emit, read from its own source."""
+    tree = ast.parse(Path(aegis_scan.__file__).read_text(encoding="utf-8"))
+    ids = set()
+
+    def take(node):
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str) \
+                    and re.fullmatch(r"[A-Z]+-\d{2}[A-Z]?", sub.value):
+                ids.add(sub.value)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg == "rule_id":
+            take(node.value)
+        elif isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Attribute) and t.attr == "rule_id" for t in node.targets):
+            take(node.value)
+    for table in (aegis_scan.SECURITY_PATTERNS, aegis_scan.UIUX_PATTERNS,
+                  aegis_scan.DOMAIN_PATTERNS, aegis_scan.TAINT_SINKS):
+        ids.update(row[0] for row in table)
+    return ids
+
+
+_FAKE_ENGINE_SCRIPTS = {
+    # Valid JSON, with the secret in every text field the parser reads.
+    "semgrep": json.dumps({"results": [{
+        "check_id": "generic.secrets.hardcoded", "path": "lib/keys.ts",
+        "start": {"line": 1},
+        "extra": {"severity": "ERROR", "message": "Hardcoded secret %s" % E,
+                  "lines": 'password = "%s"' % E, "fix": 'password = "%s"' % E,
+                  "metadata": {"cwe": ["CWE-798"]}}}]}),
+    # Not JSON at all - the text lands in an ENG-00 coverage gap.
+    "gitleaks": "Finding: password=%s\nSecret: %s\nRuleID: generic" % (E, K),
+}
+
+
+def install_fake_engines(bin_dir):
+    """Stand-ins for installed engines. Written at runtime; POSIX shells only."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    for name, out in _FAKE_ENGINE_SCRIPTS.items():
+        payload = bin_dir / (name + ".out")
+        payload.write_text(out, encoding="utf-8")
+        script = bin_dir / name
+        script.write_text("#!/bin/sh\ncat '%s'\n" % payload, encoding="utf-8")
+        script.chmod(0o755)
+    # Crashes with no stdout and the secret on stderr.
+    trivy = bin_dir / "trivy"
+    trivy.write_text("#!/bin/sh\necho 'fatal: auth failed for token %s' >&2\nexit 2\n" % E,
+                     encoding="utf-8")
+    trivy.chmod(0o755)
+
+
+@unittest.skipUnless(os.name == "posix" and shutil.which("git"),
+                     "needs a POSIX shell for fake engines and git for history")
+class TestNoOutputChannelCarriesASecret(unittest.TestCase):
+    """End to end: run the real CLI with every stage on, and read everything it wrote.
+
+    Channels checked: the JSON report file, SARIF, the SBOM, JSON on stdout, the
+    human terminal report, and stderr - with git history, build artifacts, a
+    credentialed `--url` and three external engines all feeding in.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls._tmp.name) / "app"
+        build_redaction_corpus(cls.root)
+        git = ["git", "-c", "user.name=dev", "-c", "user.email=dev@localhost",
+               "-c", "commit.gpgsign=false"]
+        subprocess.run(git + ["init", "-q"], cwd=cls.root, check=True)
+        subprocess.run(git + ["add", "-A"], cwd=cls.root, check=True)
+        subprocess.run(git + ["commit", "-q", "-m", "add config %s" % E],
+                       cwd=cls.root, check=True)
+        bin_dir = Path(cls._tmp.name) / "bin"
+        install_fake_engines(bin_dir)
+        cls.env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+        out = Path(cls._tmp.name) / "out"
+        cls.report_path, cls.sarif_path, cls.sbom_path = (
+            out / "report.json", out / "scan.sarif", out / "sbom.json")
+        script = str(Path(aegis_scan.__file__))
+        common = [sys.executable, "-B", script, str(cls.root), "--artifact", "dist",
+                  "--git-history", "20", "--url", "http://admin:%s@127.0.0.1:9/" % CANARY_URL_PASS,
+                  "--engine", "semgrep", "--engine", "gitleaks", "--engine", "trivy"]
+        cls.terminal = subprocess.run(
+            common + ["--output", str(cls.report_path), "--sarif", str(cls.sarif_path),
+                      "--sbom", str(cls.sbom_path)],
+            capture_output=True, text=True, encoding="utf-8", env=cls.env, timeout=300)
+        cls.json_run = subprocess.run(common + ["--json"], capture_output=True, text=True,
+                                      encoding="utf-8", env=cls.env, timeout=300)
+        cls.report = json.loads(cls.report_path.read_text(encoding="utf-8"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def assertClean(self, channel, text):
+        self.assertEqual(leaked(text), [], "a secret reached %s" % channel)
+
+    def test_the_corpus_actually_contains_the_canaries(self):
+        """Guards the guard: a fixture that lost its canary would prove nothing."""
+        on_disk = "".join(REDACTION_CORPUS.values())
+        self.assertEqual(len(leaked(on_disk)), len(CANARIES))
+
+    def test_the_scan_ran_and_saw_the_secrets(self):
+        ids = {f["rule_id"] for f in self.report["findings"]}
+        for required in ("SEC-01", "SEC-01B", "ART-01", "ART-03", "HIST-01"):
+            self.assertIn(required, ids)
+        self.assertTrue(any(r.startswith("EXT-SEMGREP:") for r in ids))
+
+    def test_json_report_file(self):
+        self.assertClean("the JSON report", self.report_path.read_text(encoding="utf-8"))
+
+    def test_sarif(self):
+        self.assertClean("SARIF", self.sarif_path.read_text(encoding="utf-8"))
+
+    def test_sbom(self):
+        self.assertClean("the SBOM", self.sbom_path.read_text(encoding="utf-8"))
+
+    def test_terminal_report(self):
+        self.assertIn("Evidence", self.terminal.stdout)
+        self.assertClean("the terminal report", self.terminal.stdout)
+
+    def test_json_on_stdout(self):
+        json.loads(self.json_run.stdout)
+        self.assertClean("JSON on stdout", self.json_run.stdout)
+
+    def test_stderr(self):
+        self.assertClean("stderr", self.terminal.stderr + self.json_run.stderr)
+
+    def test_credentialed_url_never_appears(self):
+        raw = self.report_path.read_text(encoding="utf-8")
+        self.assertNotIn("admin:", raw)
+        self.assertIn("[REDACTED]@127.0.0.1", raw)
+
+    def test_external_engine_output_is_redacted(self):
+        ext = [f for f in self.report["findings"] if f["rule_id"].startswith("EXT-")]
+        gaps = [f for f in self.report["skipped_checks"] if f["rule_id"] == "ENG-00"]
+        self.assertTrue(ext)
+        self.assertEqual({g["title"] for g in gaps},
+                         {"External Engine Not Run: gitleaks", "External Engine Not Run: trivy"})
+        self.assertClean("imported engine findings", json.dumps(ext + gaps))
+
+    def test_every_rule_is_exercised_or_explicitly_exempt(self):
+        """A new rule must prove its own redaction, here or in a named test."""
+        fired = {f["rule_id"] for f in self.report["findings"] + self.report["skipped_checks"]}
+        known = scanner_rule_ids()
+        unproven = sorted(known - fired - set(REDACTION_EXEMPT))
+        self.assertEqual(unproven, [],
+                         "add a canary fixture to REDACTION_CORPUS for these rules, or "
+                         "exempt them with the test that proves their redaction")
+        stale = sorted(set(REDACTION_EXEMPT) - known)
+        self.assertEqual(stale, [], "exemptions for rules that no longer exist")
+
+
+class TestRedactionDoesNotChangeDetection(unittest.TestCase):
+    """Masking evidence must never change WHAT is found - only how it is printed."""
+
+    def test_same_findings_with_and_without_masking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build_redaction_corpus(root)
+            masked, _ = aegis_scan.scan_repository(root)
+            real = aegis_scan.evidence
+            aegis_scan.evidence = lambda text, limit=140: str(text).strip()[:limit]
+            try:
+                unmasked, _ = aegis_scan.scan_repository(root)
+            finally:
+                aegis_scan.evidence = real
+        where = lambda fs: sorted((f.rule_id, f.file, f.line, f.severity) for f in fs)
+        self.assertEqual(where(masked), where(unmasked))
+        self.assertGreater(len(masked), 30)
+        # ...and without masking, the corpus really would have leaked.
+        self.assertNotEqual(leaked(finding_blob(unmasked)), [])
+        self.assertEqual(leaked(finding_blob(masked)), [])
+
+
+def snippet_violations(source):
+    """Every place `source` builds a Finding snippet other than through `evidence()`.
+
+    Allowed: a string constant, `redact(...)`, `evidence(...)` - and inside
+    `evidence(...)`, no slicing, because cutting before masking is how a partial key
+    escaped its own pattern.
+    """
+    tree = ast.parse(source)
+    problems = []
+
+    def ok(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return True
+        if isinstance(node, ast.IfExp):
+            return ok(node.body) and ok(node.orelse)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id in ("evidence", "redact"):
+            if node.func.id == "evidence" and node.args:
+                return not any(isinstance(s, ast.Subscript) and isinstance(s.slice, ast.Slice)
+                               for s in ast.walk(node.args[0]))
+            return True
+        return False
+
+    def flag(node, why):
+        problems.append("line %d: %s" % (node.lineno, why))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", getattr(node.func, "attr", ""))
+            if name == "Finding" and len(node.args) > 6:
+                flag(node, "snippet passed positionally")
+            if name == "setattr" and len(node.args) >= 2 and \
+                    isinstance(node.args[1], ast.Constant) and node.args[1].value == "snippet":
+                flag(node, "snippet set via setattr")
+            for kw in node.keywords:
+                if kw.arg is None and name == "Finding":
+                    flag(node, "Finding built from **kwargs")
+                elif kw.arg == "snippet" and not ok(kw.value):
+                    flag(kw.value, "snippet not built through evidence()")
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            if isinstance(node, ast.AnnAssign) and node.value is None:
+                continue  # a declaration (`snippet: str`), not a value
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                if (isinstance(t, ast.Name) and t.id == "snippet") or \
+                        (isinstance(t, ast.Attribute) and t.attr == "snippet"):
+                    if isinstance(node, ast.AugAssign) or not ok(node.value):
+                        flag(node, "snippet assigned from raw text")
+    return problems
+
+
+class TestEverySnippetIsBuiltThroughEvidence(unittest.TestCase):
+    """The guard against the next leak: no rule may build a snippet from a raw line.
+
+    Reads the scanner's own source. A rule that writes `snippet=lines[i].strip()`,
+    `snippet=f"... {line}"`, or slices before masking fails here, before it ships.
+    """
+
+    def test_scanner_has_no_raw_snippets(self):
+        source = Path(aegis_scan.__file__).read_text(encoding="utf-8")
+        self.assertEqual(snippet_violations(source), [])
+
+    def test_guard_catches_the_original_leak(self):
+        bad = ("Finding(rule_id='X-01', snippet=lines[line_no - 1].strip()[:140])\n"
+               "Finding(rule_id='X-02', snippet=f'used here: {stripped}')\n"
+               "Finding(rule_id='X-03', snippet=evidence(line[:140]))\n"
+               "snippet = line.strip()\n"
+               "f.snippet += extra\n"
+               "Finding(**fields)\n"
+               "setattr(f, 'snippet', raw)\n")
+        self.assertEqual(len(snippet_violations(bad)), 7)
+
+    def test_guard_accepts_the_safe_forms(self):
+        good = ("Finding(rule_id='X-01', snippet=evidence(lines[i] if lines else path))\n"
+                "Finding(rule_id='X-02', snippet='constant text')\n"
+                "Finding(rule_id='X-03', snippet=redact(value))\n"
+                "Finding(rule_id='X-04', snippet='a' if flag else 'b')\n"
+                "f.snippet = evidence(f'{x} and {y}', 300)\n")
+        self.assertEqual(snippet_violations(good), [])
+
+
+class TestEvidenceMasking(unittest.TestCase):
+    """`evidence()` - what it must hide, and what it must leave alone."""
+
+    def assertHidden(self, line, *secrets):
+        out = aegis_scan.evidence(line)
+        self.assertEqual(leaked(out, secrets), [], out)
+        return out
+
+    def test_every_provider_format_is_masked(self):
+        for key in (AWS_KEY, STRIPE_KEY, GH_TOKEN, GOOGLE_KEY, CANARY_STRIPE):
+            self.assertHidden('const k = "%s";' % key, key[4:])
+
+    def test_non_provider_secret_assigned_to_a_secret_name(self):
+        self.assertHidden('const STRIPE_WEBHOOK_SECRET = "%s";' % W, CANARY_WEBHOOK_BODY)
+        self.assertHidden('"apiKey": "%s"' % CANARY_ENV_PASS, CANARY_ENV_PASS)
+        self.assertHidden("dbPassword: '%s'," % CANARY_ENV_PASS, CANARY_ENV_PASS)
+
+    def test_bare_env_and_yaml_values(self):
+        self.assertHidden("DB_PASSWORD=%s" % CANARY_ENV_PASS, CANARY_ENV_PASS)
+        self.assertHidden("password: %s" % CANARY_ENV_PASS, CANARY_ENV_PASS)
+
+    def test_credentialed_url_of_any_scheme(self):
+        for scheme in ("https", "postgres", "redis", "amqp", "ftp"):
+            out = self.assertHidden("%s://user:%s@host/x" % (scheme, CANARY_URL_PASS),
+                                    CANARY_URL_PASS)
+            self.assertIn("[REDACTED]@host", out)
+
+    def test_auth_header_value(self):
+        self.assertHidden("Authorization: Bearer " + CANARY_ENV_PASS + "x9", CANARY_ENV_PASS)
+
+    def test_random_token_with_no_name_at_all(self):
+        self.assertHidden('<div data-k="%s">' % E, E)
+
+    def test_masking_happens_before_truncation(self):
+        """The cut used to land inside a key, so the fragment no longer matched."""
+        for pad in range(120, 145):
+            self.assertHidden("x" * pad + " " + CANARY_STRIPE, CANARY_STRIPE_BODY)
+
+    def test_a_key_at_the_input_cap_leaves_no_fragment(self):
+        cap = aegis_scan._EVIDENCE_INPUT_CAP
+        for offset in (cap - 10, cap - 30, cap - 1):
+            line = "a " * (offset // 2) + E + " tail"
+            out = aegis_scan.evidence(line, limit=10_000)
+            self.assertEqual(leaked(out, (E,)), [])
+
+    def test_long_runs_stay_linear(self):
+        """Unanchored, each masking regex restarted inside a run: 1.2s per 8kB line."""
+        import time
+        start = time.perf_counter()
+        for line in ("a" * 8192, "a.b" * 2730, "Ab1" * 2730, "aB3_" * 2048, "a-" * 4096):
+            aegis_scan.evidence(line, 10_000)
+        self.assertLess(time.perf_counter() - start, 1.0)
+
+    def test_masking_is_idempotent(self):
+        line = 'K="%s" url="%s" t="%s"' % (K, CANARY_URL, E)
+        once = aegis_scan.evidence(line, 400)
+        self.assertEqual(aegis_scan.evidence(once, 400), once)
+
+    def test_ordinary_code_is_left_readable(self):
+        """Negative cases: evidence is useless if every line comes back masked."""
+        for line in (
+            '<a href="#">Home</a>',
+            "const users = await prisma.user.findMany();",
+            '<div className="w-[600px] outline-none" onClick={() => {}}>',
+            "password: hashedPassword,",
+            "const apiKey = process.env.OPENAI_API_KEY;",
+            "token: string;",
+            "maxTokens: 1000,",
+            "credits: user.credits - 1",
+            "await fetch(url, { signal: AbortSignal.timeout(10000) });",
+            "const NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY = x",
+            'cursor.execute(f"SELECT * FROM t WHERE id={uid}")',
+            'import { useCallback, useMemo } from "react";',
+            '<img src="/images/hero-banner-2024.png">',
+            "if (password === confirm) {",
+            "const session = await getServerSession(authOptions);",
+            "NEXT_PUBLIC_API_SECRET=",
+        ):
+            self.assertEqual(aegis_scan.evidence(line), line)
+
+    def test_long_ordinary_lines_are_truncated_not_masked(self):
+        line = "const label = " + "word " * 60
+        self.assertEqual(aegis_scan.evidence(line), line.strip()[:140])
+
+
+class TestRedactRevealsNothingSecret(unittest.TestCase):
+
+    def test_only_the_public_prefix_and_length_survive(self):
+        self.assertEqual(aegis_scan.redact(CANARY_STRIPE),
+                         "sk_live_...[REDACTED %d chars]" % len(CANARY_STRIPE))
+        self.assertEqual(aegis_scan.redact(E), "...[REDACTED %d chars]" % len(E))
+
+    def test_short_values_reveal_nothing(self):
+        for value in ("abc", "hunter2", "sixteen-chars-ok"):
+            out = aegis_scan.redact(value)
+            self.assertFalse(any(ch in out.split("[")[0] for ch in value.strip(".")), out)
+
+    def test_redacted_output_matches_no_provider_pattern(self):
+        for key in (AWS_KEY, STRIPE_KEY, GH_TOKEN, GOOGLE_KEY):
+            out = aegis_scan.redact(key)
+            for _label, _sev, pattern in aegis_scan.PROVIDER_SECRETS:
+                self.assertIsNone(pattern.search(out), (out, _label))
+
+    def test_redact_findings_sweeps_every_text_field(self):
+        f = aegis_scan.Finding(
+            rule_id="X-01", domain="SECURITY", severity="LOW",
+            title="key %s" % K, file="https://u:%s@host/%s" % (CANARY_URL_PASS, K),
+            line=1, snippet="s", cwe_or_standard="std %s" % K, remediation="r %s" % K,
+            confidence="HIGH")
+        aegis_scan.redact_findings([f])
+        self.assertEqual(leaked(finding_blob([f]), (CANARY_STRIPE_BODY, CANARY_URL_PASS)), [])
+
+
+class TestSecretsAreMatchedExactlyNotByFragment(unittest.TestCase):
+    """Full redaction moved the exact value into an in-memory vault. Prove it works."""
+
+    def _scan(self, source_key, bundle_key):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, ".env.local", "STRIPE_SECRET_KEY=%s\n" % source_key)
+            write(root, "dist/assets/index.js", 'const K="%s";' % bundle_key)
+            found, _ = aegis_scan.scan_repository(root)
+            src = [f for f in found if f.rule_id.startswith("SEC-01")]
+            return aegis_scan.scan_build_artifacts(root, str(root / "dist"), src)
+
+    def test_the_same_key_in_the_bundle_is_a_confirmed_leak(self):
+        art = self._scan(CANARY_STRIPE, CANARY_STRIPE)
+        self.assertIn("ART-01", {f.rule_id for f in art})
+        self.assertEqual(leaked(finding_blob(art)), [])
+
+    def test_a_different_key_with_the_same_prefix_is_not_a_confirmed_leak(self):
+        """The old 6-character fragment (`sk_liv`) matched every Stripe key."""
+        other = "sk_live_" + "99ZzYyXxWwVvUuTtSsRrQqPp"
+        self.assertNotIn("ART-01", {f.rule_id for f in self._scan(CANARY_STRIPE, other)})
+
+    def test_vault_handle_never_reaches_a_report(self):
+        findings = aegis_scan.scan_secrets_in_text("a.js", 'k = "%s"' % CANARY_STRIPE)
+        self.assertTrue(findings)
+        self.assertNotIn("_secret_handle", json.dumps([asdict(f) for f in findings]))
+
+    def test_two_different_keys_keep_distinct_fingerprints(self):
+        a = "sk_live_" + "51Hq" + "Xy7Kp2Rm9Tn4Wb6Zc8Vd3Lf"
+        b = "sk_live_" + "88Pp" + "Qq7Rr6Ss5Tt4Uu3Vv2Ww1Xy"
+        self.assertEqual(len(a), len(b))
+        fs = aegis_scan.scan_secrets_in_text("a.js", 'x = "%s"\ny = "%s"\n' % (a, b))
+        self.assertEqual(fs[0].snippet, fs[1].snippet, "fully redacted text is identical")
+        aegis_scan.assign_fingerprints(fs)
+        self.assertNotEqual(fs[0].fingerprint, fs[1].fingerprint)
+
+    def test_fingerprints_are_stable_across_runs(self):
+        src = 'x = "%s"\n' % CANARY_STRIPE
+        one = aegis_scan.scan_secrets_in_text("a.js", src)
+        two = aegis_scan.scan_secrets_in_text("a.js", src)
+        aegis_scan.assign_fingerprints(one)
+        aegis_scan.assign_fingerprints(two)
+        self.assertEqual(one[0].fingerprint, two[0].fingerprint)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_history_keeps_two_different_keys_apart(self):
+        a = "sk_live_" + "51Hq" + "Xy7Kp2Rm9Tn4Wb6Zc8Vd3Lf"
+        b = "sk_live_" + "88Pp" + "Qq7Rr6Ss5Tt4Uu3Vv2Ww1Xy"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "a.js", 'x = "%s"\ny = "%s"\n' % (a, b))
+            git = ["git", "-c", "user.name=dev", "-c", "user.email=dev@localhost",
+                   "-c", "commit.gpgsign=false"]
+            subprocess.run(git + ["init", "-q"], cwd=root, check=True)
+            subprocess.run(git + ["add", "-A"], cwd=root, check=True)
+            subprocess.run(git + ["commit", "-q", "-m", "keys"], cwd=root, check=True)
+            hist = aegis_scan.scan_git_history(root, 5)
+        self.assertEqual(len([f for f in hist if f.rule_id == "HIST-01"]), 2)
+        self.assertEqual(leaked(finding_blob(hist), (a[8:], b[8:])), [])
+
+
+class _FakeResponse:
+    def __init__(self, headers, body=b"", status=200):
+        self.headers, self.status, self._body = headers, status, body
+
+    def read(self, n=-1):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestLiveAndNetworkOutputIsRedacted(unittest.TestCase):
+    """`--url`, the exposure probe and OSV - including their exception messages."""
+
+    URL = "https://admin:%s@staging.example.com/" % CANARY_URL_PASS
+
+    def _with_urlopen(self, fake, fn):
+        real = aegis_scan.urllib.request.urlopen
+        aegis_scan.urllib.request.urlopen = fake
+        try:
+            return fn()
+        finally:
+            aegis_scan.urllib.request.urlopen = real
+
+    def test_header_findings_and_exposed_env_probe(self):
+        def fake(req, timeout=None, context=None):
+            if req.full_url.endswith("/.env"):
+                return _FakeResponse({}, ("SESSION_SECRET=%s" % E).encode())
+            return _FakeResponse({"access-control-allow-origin": "*"})
+        found = self._with_urlopen(fake, lambda: aegis_scan.check_live_url_posture(self.URL))
+        ids = {f.rule_id for f in found}
+        self.assertTrue({"SEC-17", "SEC-13", "SEC-17B"} <= ids, ids)
+        self.assertEqual(leaked(finding_blob(found)), [])
+
+    def test_unreachable_url_exception_message(self):
+        def fake(req, timeout=None, context=None):
+            raise aegis_scan.urllib.error.URLError(
+                "cannot reach %s with token=%s" % (self.URL, E))
+        found = self._with_urlopen(fake, lambda: aegis_scan.check_live_url_posture(self.URL))
+        self.assertEqual([f.rule_id for f in found], ["LIVE-00"])
+        self.assertEqual(leaked(finding_blob(found)), [])
+
+    def test_osv_failure_exception_message(self):
+        def fake(req, timeout=None, context=None):
+            raise RuntimeError("proxy rejected Authorization: Bearer %s" % E)
+        found = self._with_urlopen(
+            fake, lambda: aegis_scan.check_dependency_vulnerabilities([("npm", "left-pad", "1.0.0")]))
+        self.assertEqual([f.rule_id for f in found], ["DEP-00"])
+        self.assertEqual(leaked(finding_blob(found)), [])
+
+    def test_osv_advisory_finding(self):
+        def fake(req, timeout=None, context=None):
+            return _FakeResponse({}, json.dumps({"results": [{"vulns": [{"id": "GHSA-x"}]}]}).encode())
+        found = self._with_urlopen(
+            fake, lambda: aegis_scan.check_dependency_vulnerabilities([("npm", "left-pad", "1.0.0")]))
+        self.assertEqual([f.rule_id for f in found], ["DEP-01"])
+        self.assertIn("left-pad@1.0.0", found[0].snippet)
+
+
+class TestExternalEngineOutputIsRedacted(unittest.TestCase):
+    """Another tool's output is untrusted text. It is masked at the import boundary."""
+
+    def test_semgrep(self):
+        found = aegis_scan.parse_semgrep(json.loads(_FAKE_ENGINE_SCRIPTS["semgrep"]))
+        self.assertEqual(found[0].rule_id, "EXT-SEMGREP:generic.secrets.hardcoded")
+        self.assertEqual(leaked(finding_blob(found)), [])
+
+    def test_gitleaks(self):
+        found = aegis_scan.parse_gitleaks([{
+            "RuleID": "stripe-access-token", "Description": "Stripe key",
+            "File": "lib/keys.ts", "StartLine": 2, "Secret": K,
+            "Match": 'new Stripe("%s")' % K, "Commit": "a" * 40}])
+        self.assertEqual(found[0].rule_id, "EXT-GITLEAKS:stripe-access-token")
+        self.assertEqual(leaked(finding_blob(found)), [])
+
+    def test_trivy(self):
+        found = aegis_scan.parse_trivy({"Results": [{
+            "Target": "Dockerfile",
+            "Vulnerabilities": [{"VulnerabilityID": "CVE-1", "PkgName": "x",
+                                 "Title": "leaks %s" % E, "Severity": "HIGH"}],
+            "Misconfigurations": [{"ID": "DS001", "Title": "t", "Severity": "LOW",
+                                   "Message": "ENV API_KEY=%s" % E,
+                                   "Resolution": "remove %s" % E}]}]})
+        self.assertEqual(len(found), 2)
+        self.assertEqual(leaked(finding_blob(found)), [])
+
+    def test_scorecard(self):
+        found = aegis_scan.parse_scorecard({"checks": [{
+            "name": "Token-Permissions", "score": 2,
+            "reason": "token %s has write access" % E, "details": ["uses %s" % E]}]})
+        self.assertEqual(len(found), 1)
+        self.assertEqual(leaked(finding_blob(found)), [])
+
+    @unittest.skipUnless(os.name == "posix", "fake engines are POSIX shell scripts")
+    def test_unparseable_and_crashing_engines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "bin"
+            install_fake_engines(bin_dir)
+            real_path = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(bin_dir) + os.pathsep + real_path
+            try:
+                results = [aegis_scan.run_engine(n, Path(tmp)) for n in ("gitleaks", "trivy")]
+            finally:
+                os.environ["PATH"] = real_path
+        gaps = [gap for _found, gap in results]
+        self.assertTrue(all(g is not None and g.rule_id == "ENG-00" for g in gaps))
+        self.assertEqual(leaked(finding_blob(gaps)), [])
+
+
+class TestMobilePackageOutputIsRedacted(unittest.TestCase):
+
+    def test_package_assets_and_bundled_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = root / "app.apk"
+            with zipfile.ZipFile(pkg, "w") as zf:
+                zf.writestr("assets/config.json",
+                            json.dumps({"stripe": K, "apiSecret": E, "dsn": CANARY_URL}))
+                zf.writestr("assets/.env", "API_SECRET=%s\n" % E)
+                zf.writestr("AndroidManifest.xml", "usesCleartextTraffic debuggable")
+            found = aegis_scan.scan_mobile_package(root, pkg)
+            bad = root / "broken.apk"
+            bad.write_bytes(b"not a zip " + E.encode())
+            found += aegis_scan.scan_mobile_package(root, bad)
+        ids = {f.rule_id for f in found}
+        self.assertTrue({"ART-10", "ART-11", "ART-12", "ART-13", "ART-14", "ART-15"} <= ids, ids)
+        self.assertEqual(leaked(finding_blob(found)), [])

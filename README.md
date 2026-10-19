@@ -226,9 +226,9 @@ there is no telemetry, ever. Exactly two flags make a network request, and both 
 coverage gap (`DEP-00` / `LIVE-00`) and **blocks** a `READY TO PUBLISH` verdict rather than
 silently passing.
 
-**Credentials in reports are redacted** to first 6 + last 4 characters before anything is
-written, so `.aegis/scan-report.json` is safe to commit, attach to an issue, or upload as a
-CI artifact.
+**Credentials in reports are redacted** before anything is written: only the provider's
+public prefix (`sk_live_`, `AKIA`) and the length remain - no character of the secret itself.
+`.aegis/scan-report.json` is safe to commit, attach to an issue, or upload as a CI artifact.
 
 **Exit codes:** `0` success · `1` blocking findings with a gate flag · `2` target path does not exist.
 
@@ -349,7 +349,7 @@ Some rules have narrower sub-variants, reported with their own id so you can sup
 
 A noisy scanner gets uninstalled. Credential rules only fire on real provider key shapes (AWS, Stripe, GitHub, Google, Slack, OpenAI, Anthropic, SendGrid, Twilio, Razorpay, npm, PEM private keys, Supabase service-role JWTs, database URLs with inline credentials) or on secret-named variables holding high-entropy values. Placeholders such as `your-api-key-here`, `changeme`, `${process.env.X}` and AWS's own documentation key `AKIAIOSFODNN7EXAMPLE` are rejected.
 
-**Every credential in every report is redacted** to its first 6 and last 4 characters, so `.aegis/scan-report.json` is safe to commit, attach to an issue, or hand to an agent.
+**Every credential in every report is redacted** down to its public provider prefix and its length, so `.aegis/scan-report.json` is safe to commit, attach to an issue, or hand to an agent. This covers credentials the scanner can recognise - provider key formats, secret-named values, credentialed URLs and long random tokens; a short password with nothing to mark it as one cannot be told apart from code.
 
 ### Fail-Closed: Coverage Is Not Severity
 

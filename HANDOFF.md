@@ -31,8 +31,10 @@ build output, before you publish.
    scanner is uninstalled within a week.
 4. **Never print a credential.** Reports get committed and attached to issues. Provider
    secrets are detected in exactly **one** place — `scan_secrets_in_text()`, which
-   redacts at construction. Never add a second detector whose snippet is a raw source
-   line; that was a real credential leak, fixed in 2.5.0.
+   redacts at construction. Every snippet is a constant, `redact(...)`, or
+   `evidence(...)` — never a raw source line, and never sliced before masking. A test
+   parses the scanner and enforces this; a raw-line snippet was a real credential leak
+   in 2.5.0, and again in seven more rules until the redaction suite went in.
 5. **Never claim a rule you did not implement.** `test_every_readme_rule_is_implemented`
    parses the README matrix and fails if a documented rule is missing.
 6. **No AI-assistant attribution** in commit messages or pull requests.
@@ -75,7 +77,7 @@ with every stage in `RELEASE_STAGES` actually completed, returns `RELEASE_AUDIT_
 
 ## Already done on this branch — do not redo
 
-112 tests pass; CI is green on all three jobs.
+159 tests pass; CI is green on all three jobs.
 
 - **`CoverageLedger`** — every skipped file, line and package is recorded and surfaced
   as a `COV-00` gap. Wired into oversized files (`--max-file-size`), unreadable files,
@@ -100,17 +102,22 @@ with every stage in `RELEASE_STAGES` actually completed, returns `RELEASE_AUDIT_
 > The scanner here can never emit `READY TO PUBLISH`, yet `README.md` still promises it
 > six times, and `--profile`, `--engine` and the new verdict names are undocumented.
 > Shipping that to `main` would mean the docs describe a tool that no longer exists —
-> the same defect `test_every_readme_rule_is_implemented` exists to prevent. Items 1–4
-> then follow in the order given.
+> the same defect `test_every_readme_rule_is_implemented` exists to prevent. Items 2–4
+> then follow in the order given (item 1 is done).
 
 Do **one item per session**. Finish it completely, with tests and docs, before starting
 the next. `aegis_scan.py` is a single large file, so parallel branches will conflict
 badly — work sequentially.
 
-### 1. Redaction regression suite
-Prove secrets never reach findings, the JSON report, SARIF, terminal output, stderr,
-exception messages, or imported external-engine output. Include a guard test that fails
-if any future rule builds a snippet from a raw source line.
+### 1. Redaction regression suite — DONE
+Secrets are proved absent from findings, the JSON report, SARIF, the SBOM, terminal
+output, stderr, exception messages and imported external-engine output
+(`TestNoOutputChannelCarriesASecret` and the classes after it). `TestEverySnippetIsBuiltThroughEvidence`
+fails if any rule builds a snippet from raw text. `redact()` now prints only the public
+provider prefix and the length; exact-value matching (`ART-01`, history dedupe, baseline
+fingerprints) reads an in-memory vault instead of the snippet. Known limit: only
+*recognisable* secrets are masked. Trivy's `Secrets` array is not imported at all — a
+coverage gap, not a leak; worth an `ENG`-level fix later.
 
 ### 2. Test fixture corpus
 `tests/fixtures/{vulnerable,safe}/` — matched pairs per rule, where the safe fixture is

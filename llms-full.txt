@@ -269,9 +269,9 @@ there is no telemetry, ever. Exactly two flags make a network request, and both 
 coverage gap (`DEP-00` / `LIVE-00`) and **blocks** a `READY TO PUBLISH` verdict rather than
 silently passing.
 
-**Credentials in reports are redacted** to first 6 + last 4 characters before anything is
-written, so `.aegis/scan-report.json` is safe to commit, attach to an issue, or upload as a
-CI artifact.
+**Credentials in reports are redacted** before anything is written: only the provider's
+public prefix (`sk_live_`, `AKIA`) and the length remain - no character of the secret itself.
+`.aegis/scan-report.json` is safe to commit, attach to an issue, or upload as a CI artifact.
 
 **Exit codes:** `0` success · `1` blocking findings with a gate flag · `2` target path does not exist.
 
@@ -392,7 +392,7 @@ Some rules have narrower sub-variants, reported with their own id so you can sup
 
 A noisy scanner gets uninstalled. Credential rules only fire on real provider key shapes (AWS, Stripe, GitHub, Google, Slack, OpenAI, Anthropic, SendGrid, Twilio, Razorpay, npm, PEM private keys, Supabase service-role JWTs, database URLs with inline credentials) or on secret-named variables holding high-entropy values. Placeholders such as `your-api-key-here`, `changeme`, `${process.env.X}` and AWS's own documentation key `AKIAIOSFODNN7EXAMPLE` are rejected.
 
-**Every credential in every report is redacted** to its first 6 and last 4 characters, so `.aegis/scan-report.json` is safe to commit, attach to an issue, or hand to an agent.
+**Every credential in every report is redacted** down to its public provider prefix and its length, so `.aegis/scan-report.json` is safe to commit, attach to an issue, or hand to an agent. This covers credentials the scanner can recognise - provider key formats, secret-named values, credentialed URLs and long random tokens; a short password with nothing to mark it as one cannot be told apart from code.
 
 ### Fail-Closed: Coverage Is Not Severity
 
@@ -1006,8 +1006,8 @@ The score starts at `100` and subtracts a weight per finding, floored at `0`:
 
 ## Reports Are Safe To Share
 
-Every credential in every output format is redacted to its first 6 and last 4 characters plus a
-length. `.aegis/scan-report.json` can be committed, attached to an issue, or handed to an agent
+Every credential in every output format is redacted to its public provider prefix and its
+length - no character of the secret itself. `.aegis/scan-report.json` can be committed, attached to an issue, or handed to an agent
 without leaking the value it is warning about.
 
 ---
@@ -1104,7 +1104,7 @@ Findings arrive pre-sorted: severity first (CRITICAL to LOW), then domain, file,
       "maximum": 100
     },
     "release_verdict": {
-      "description": "Fail-closed release gate. One of: 'INCOMPLETE_SCAN (...)' when no source files were scanned; 'BLOCKED (...)' when any CRITICAL/HIGH is open; 'VERIFIED_PARTIAL - INCOMPLETE_SCAN (...)' when any check was skipped or errored; 'NEEDS REVIEW (...)' below 90; 'READY TO PUBLISH' only when files were scanned, nothing was skipped, there are no CRITICAL/HIGH findings and the score is >= 90.",
+      "description": "One of BLOCKED, INCOMPLETE_SCAN, REVIEW_REQUIRED, STATIC_CHECKS_PASSED or RELEASE_AUDIT_PASSED, followed by an explanation in parentheses. STATIC_CHECKS_PASSED is NOT a release-readiness claim: only --profile release, with every release stage actually completed, can return RELEASE_AUDIT_PASSED.",
       "type": "string",
       "minLength": 1,
       "examples": [
@@ -1229,6 +1229,14 @@ Findings arrive pre-sorted: severity first (CRITICAL to LOW), then domain, file,
         },
         "note": {
           "type": "string"
+        },
+        "items_not_examined": {
+          "type": "integer",
+          "description": "How many files, lines or packages the scanner declined to read."
+        },
+        "not_examined": {
+          "type": "object",
+          "description": "Reason -> {count, examples, material}. A material skip is one that could plausibly have hidden a finding, and raises a COV-00 gap."
         }
       }
     },
@@ -1266,7 +1274,7 @@ Findings arrive pre-sorted: severity first (CRITICAL to LOW), then domain, file,
           "pattern": "^(SEC|UX|LIVE|DEP|ART|HIST|GIT|FLOW|PAY|REL)-[0-9]{2}[A-Z]?$"
         },
         "domain": {
-          "description": "Which analysis stage produced this finding.",
+          "description": "COVERAGE marks something that was not examined, not a defect. EXTERNAL marks a finding imported from an installed third-party engine, which keeps that engine's own rule id behind an EXT-<ENGINE>: prefix.",
           "enum": [
             "SECURITY",
             "UI_UX",
@@ -1275,7 +1283,9 @@ Findings arrive pre-sorted: severity first (CRITICAL to LOW), then domain, file,
             "SUPPLY_CHAIN",
             "ARTIFACT",
             "HISTORY",
-            "DATAFLOW"
+            "DATAFLOW",
+            "COVERAGE",
+            "EXTERNAL"
           ]
         },
         "severity": {
@@ -1303,7 +1313,7 @@ Findings arrive pre-sorted: severity first (CRITICAL to LOW), then domain, file,
           "minimum": 0
         },
         "snippet": {
-          "description": "Trimmed evidence excerpt. Credentials are always redacted (first 6 and last 4 characters only) so reports are safe to commit and share.",
+          "description": "Trimmed evidence excerpt. Credentials are always redacted (public provider prefix and length only) so reports are safe to commit and share.",
           "type": "string"
         },
         "cwe_or_standard": {

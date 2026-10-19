@@ -281,7 +281,7 @@
           "minimum": 0
         },
         "snippet": {
-          "description": "Trimmed evidence excerpt. Credentials are always redacted (first 6 and last 4 characters only) so reports are safe to commit and share.",
+          "description": "Trimmed evidence excerpt. Credentials are always redacted (public provider prefix and length only) so reports are safe to commit and share.",
           "type": "string"
         },
         "cwe_or_standard": {

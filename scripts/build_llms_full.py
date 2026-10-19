@@ -193,8 +193,8 @@ The score starts at `100` and subtracts a weight per finding, floored at `0`:
 
 ## Reports Are Safe To Share
 
-Every credential in every output format is redacted to its first 6 and last 4 characters plus a
-length. `.aegis/scan-report.json` can be committed, attached to an issue, or handed to an agent
+Every credential in every output format is redacted to its public provider prefix and its
+length - no character of the secret itself. `.aegis/scan-report.json` can be committed, attached to an issue, or handed to an agent
 without leaking the value it is warning about.
 
 ---

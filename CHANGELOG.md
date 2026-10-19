@@ -4,6 +4,53 @@ All notable changes to Vibe Aegis are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed - eight more routes put a credential in the report (CRITICAL)
+
+2.5.0 removed one rule that quoted a raw source line. `redact_findings()` was still the
+only defence for every other rule, and it knows only the provider formats - and it ran
+after each rule had already cut the line to 140 characters. Reproduced, each leaking the
+full value unless noted:
+
+- `SEC-01` on an unquoted `.env` value (`NEXT_PUBLIC_API_SECRET=...`).
+- `SEC-03` and `SEC-06` quoted **line 1 of the file**, typically `const API_KEY = "..."`,
+  even while `SEC-01` reported the same key redacted.
+- Every raw-line rule (`SEC-07`, `FLOW-*`, `UX-*` ...) carried any secret on its line.
+- A provider key split by the 140-character cut no longer matched its pattern, so the
+  fragment shipped (part of a Twilio SID, reproduced).
+- `--url https://user:password@host` put the password in the `LIVE-00` title, `file`,
+  SARIF URI and the report's `live_url`.
+- `ENG-00` copied an engine's raw stdout/stderr; imported semgrep findings copied the
+  matched source line and message.
+- `redact()` itself kept the first 6 and last 4 characters: 10 of a 16-character secret.
+
+Every snippet is now built by `evidence()`, which masks provider keys, secret-named
+values (quoted, bare, `.env`, JSON, YAML), credentialed URLs, auth-header values and long
+random tokens, and only then truncates. `redact_findings()` remains as a backstop over
+every text field. `redact()` prints only the public prefix and length:
+`sk_live_...[REDACTED 48 chars]`.
+
+### Changed
+
+- `ART-01` matches the exact source value, held in memory only, instead of a 6-character
+  fragment of the redacted snippet. The fragment (`sk_liv`) matched every Stripe key, so a
+  different key in a bundle was reported as a confirmed leak of yours.
+- Fingerprints of findings whose evidence contained a credential change once, because the
+  evidence is now redacted differently. Those findings reappear once after upgrading even
+  if baselined; re-run `--write-baseline` after reviewing them. Two different keys of the
+  same provider and length in one file keep distinct fingerprints, so accepting one never
+  accepts the other.
+
+### Added - redaction regression suite
+
+47 tests. An end-to-end run with git history, build artifacts, a credentialed `--url` and
+three fake external engines checks the JSON report, SARIF, SBOM, terminal output, JSON on
+stdout and stderr for any 8-character run of five canary secrets. A static guard parses
+the scanner and fails if any snippet is built from raw text or sliced before masking, and
+a completeness check fails if a new rule is neither exercised by the canary corpus nor
+explicitly exempted with the test that covers it.
+
 ## [2.6.0] - 2026-10-19
 
 The fail-closed contract was correct inside `compute_readiness_score()` and wrong
