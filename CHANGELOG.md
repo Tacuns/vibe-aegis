@@ -4,7 +4,51 @@ All notable changes to Vibe Aegis are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.7.0] - 2026-10-19
+
+### Migration - `READY TO PUBLISH` no longer exists
+
+A plain source scan used to end in `READY TO PUBLISH`, which claimed far more than a source
+scan can know. The verdict is now one of five, and **any pipeline that compares
+`release_verdict` with `READY TO PUBLISH` will never match again** - it silently treats
+every run as not ready, or, if it tested for the absence of `BLOCKED`, as ready. `NEEDS
+REVIEW` and `VERIFIED_PARTIAL - INCOMPLETE_SCAN` are gone too.
+
+| Old | New |
+| :--- | :--- |
+| `READY TO PUBLISH` | `STATIC_CHECKS_PASSED` for a source scan - **not** a release claim. Only `--profile release` can return `RELEASE_AUDIT_PASSED` |
+| `NEEDS REVIEW (...)` | `REVIEW_REQUIRED (...)` |
+| `VERIFIED_PARTIAL - INCOMPLETE_SCAN (...)` | `INCOMPLETE_SCAN (...)` |
+| `BLOCKED (...)` | unchanged |
+
+Match the **leading word**, never the whole string - the text in parentheses carries counts
+and check names that change between runs. Better, gate on the exit code:
+
+```bash
+# Before
+grep -q '"release_verdict": "READY TO PUBLISH"' .aegis/scan-report.json
+# After: fails on any incomplete stage, and on CRITICAL/HIGH
+python3 .aegis/scripts/aegis_scan.py . --profile release --fail-on-high
+```
+
+`--profile release` exits `1` on an incomplete stage but not on findings, which are a
+separate axis: keep `--fail-on-high` for a merge gate.
+
+### Added
+
+- `--profile quick|code|full|release`, five verdicts, external engine adapters
+  (`--engine`, `--list-engines`, `--authorize-network-scan`), `--max-file-size`, and the
+  coverage ledger (`COV-00`) - all documented in the README for the first time.
+
+### Fixed - documentation
+
+- README, `AGENTS.md`, the orchestrator and pre-flight skills, the full-audit prompt, the
+  schema and `llms-full.txt` described verdicts the scanner can no longer return.
+- The schema's `rule_id` pattern rejected `COV-00`, `ENG-00` and every `EXT-*` id the
+  scanner already emits, so a real JSON Schema validator rejected real reports. CI checked
+  only for required keys, which is why it passed.
+- `llms-full.txt` documented the old exit codes, called `LIVE-00` "informational only"
+  (it is a coverage gap), and omitted most gate flags.
 
 ### Fixed - `--profile release` certified stages that examined nothing (CRITICAL)
 

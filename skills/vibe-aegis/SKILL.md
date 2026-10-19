@@ -118,7 +118,7 @@ Switch perspective to the **Skeptic**. For every candidate finding from Stages 1
 ### Stage 5: Evidence Referee & Release Readiness Report
 
 Switch perspective to the **Referee**. Evaluate all surviving claims and write `.aegis/AUDIT_REPORT.md` containing:
-1. **Release Readiness Score (0–100)** and Release Gate Status (`READY TO PUBLISH` vs `BLOCKED`).
+1. **Release Readiness Score (0–100)** and Release Gate Status. Gate status is the scanner's `release_verdict`. Report its leading word exactly - `BLOCKED`, `INCOMPLETE_SCAN`, `REVIEW_REQUIRED`, `STATIC_CHECKS_PASSED` or `RELEASE_AUDIT_PASSED` - and never call the app release-ready unless it is `RELEASE_AUDIT_PASSED` from `--profile release` with zero open `CRITICAL`/`HIGH`. `STATIC_CHECKS_PASSED` means only that the source checks which ran found nothing.
 2. **Confirmed Security Findings Table** (ordered `CRITICAL` -> `HIGH` -> `MEDIUM` -> `LOW` with `file:line`, CWE, trigger explanation, and exact code fix).
 3. **Confirmed UI/UX & Accessibility Findings Table** (ordered `HIGH` -> `MEDIUM` -> `LOW` with component location, visual/interaction impact, and exact code fix).
 4. **Dismissed False Positives Log** (showing why each dismissed item is already safe).

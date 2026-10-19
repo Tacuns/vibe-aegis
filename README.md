@@ -62,8 +62,8 @@ flowchart TD
     C["🎨 Stage 3 — UI/UX Hunter<br/>Dead controls · Async states<br/>Mobile overflow · WCAG 2.2 AA"]
     D["🤔 Stage 4 — Adversarial Skeptic<br/>Try to DISPROVE every claim<br/>middleware · ORM · auto-escaping"]
     E["⚖️ Stage 5 — Evidence Referee<br/>CONFIRMED · MANUAL_REVIEW · DISMISSED<br/>CWE · CVSS · Readiness Score 0-100"]
-    F{"Score >= 90 and zero<br/>CRITICAL / HIGH?"}
-    G["✅ READY TO PUBLISH"]
+    F{"Every release stage ran<br/>and nothing is open?"}
+    G["✅ RELEASE_AUDIT_PASSED<br/>--profile release only"]
     H["🔧 Stage 6 — Guarded Fixer --fix<br/>Branch · patch one at a time<br/>re-scan + rebuild · auto-revert regressions"]
 
     A --> B
@@ -148,6 +148,9 @@ python3 scripts/aegis_scan.py /path/to/your/app --json --output .aegis/scan-repo
 
 # 4. CI gate — exit code 1 if any CRITICAL or HIGH finding exists
 python3 scripts/aegis_scan.py /path/to/your/app --fail-on-high
+
+# 5. Release gate — every stage must run AND nothing high may be open
+python3 scripts/aegis_scan.py /path/to/your/app --profile release --fail-on-high
 ```
 
 ### Scanner CLI Reference
@@ -167,19 +170,15 @@ python3 scripts/aegis_scan.py /path/to/your/app --fail-on-high
 
 | Argument | Description |
 | :--- | :--- |
+| `--profile <name>` | `quick` / `code` (default) / `full` / `release` — which stages run by default. Only `release` can return `RELEASE_AUDIT_PASSED`. See [Profiles](#profiles) |
 | `--fail-on-high` | Exit `1` if any `CRITICAL` or `HIGH` finding exists |
 | `--fail-on <level>` | Exit `1` at or above `critical`/`high`/`medium`/`low` |
 | `--include-tests` | Also audit test and fixture files (excluded by default — they contain deliberately insecure code) |
 | `--fail-on-incomplete` | Exit `1` if any check could not run, **or if zero source files were scanned** — use when a green pipeline must mean *fully audited*, not merely *nothing found* |
 | `--min-confidence <level>` | `high` / `medium` / `low` (default `low`). Only findings at or above this confidence affect the **exit code**; everything is still reported |
 
-**Three axes, not one.** A release gate is lied to in three different ways, so they are kept apart:
-
-| Axis | Question | Gate |
-| :--- | :--- | :--- |
-| **Coverage** | Did the check actually run? | `--fail-on-incomplete` |
-| **Severity** | If this is real, how bad is it? | `--fail-on-high` / `--fail-on` |
-| **Confidence** | How sure are we it is real? | `--min-confidence` |
+**Three axes, not one** - coverage, severity and confidence each have their own gate flag;
+see [Coverage, Severity, Confidence - and the Verdict](#coverage-severity-confidence---and-the-verdict).
 
 Some rules cannot prove their case — `SEC-03` matches a list of known auth helpers and
 cannot recognise a guard it has never seen; `REL-*` cannot know your data volume. Those are
@@ -191,46 +190,79 @@ reported at `MEDIUM` confidence. `--min-confidence high` gates only on what is d
 python3 scripts/aegis_scan.py . --fail-on-high --min-confidence high --fail-on-incomplete
 ```
 
-A coverage gap can never be suppressed. `.aegis-ignore` and `--baseline` accept known
-*defects*; a check that did not run carries nothing to accept, so gaps are always reported
-and `--write-baseline` refuses to record them.
-
 **Scope — how you adopt this on a real codebase**
 
 | Argument | Description |
 | :--- | :--- |
 | `--diff [REF]` | Scan only files changed vs `REF` (default `origin/main`). Ideal for pull requests |
 | `--baseline <PATH>` | Suppress findings recorded in a baseline file |
-| `--write-baseline <PATH>` | Accept every current finding as pre-existing, so future scans show only new issues |
+| `--write-baseline <PATH>` | Accept every current finding as pre-existing, so future scans show only new issues. Coverage gaps are never recorded |
+| `--max-file-size <BYTES>` | Skip source files larger than this (default `1500000`). Each skipped file is reported as a `COV-00` coverage gap, never as clean |
 
 **Deep analysis**
 
 | Argument | Description |
 | :--- | :--- |
-| `--artifact [PATH]` | Verify a build directory or an `.apk`/`.aab`/`.ipa`. Auto-detects `dist/`, `build/`, `.next/` |
+| `--artifact [PATH]` | Verify a build directory or an `.apk`/`.aab`/`.ipa`. With no value, auto-detects `dist/`, `build/`, `out/`, `.next/`, `.output/`, `.svelte-kit/`, `www/`, `public/`, `release/`. Finding none is an `ART-00` gap |
 | `--git-history [N]` | Hunt credentials committed in the last `N` commits (default 300) |
 | `--deps` | Check dependencies against the OSV vulnerability database |
 | `--url <URL>` | Passive, read-only live header & exposure checks |
 | `--all` | Enable artifacts + git history + dependencies |
-| `--offline` | Never make a network request |
+| `--offline` | Disable this scanner's own network requests (`--deps`, `--url`). Does not reach inside external engines — see below |
 
-**What leaves your machine.** The scanner is offline by default and sends nothing anywhere —
-there is no telemetry, ever. Exactly two flags make a network request, and both are opt-in:
+**External engines (optional)**
 
-| Flag | Request | What is disclosed |
+Vibe Aegis is complete with nothing else installed. If you already have one of these
+tools, `--engine` also runs it and imports its findings. Engines are found on `PATH` and
+**never downloaded or installed for you**. A requested engine that is missing, crashes,
+times out or prints something unparseable becomes an `ENG-00` coverage gap — *"semgrep did
+not run"* is never reported as *"semgrep found nothing"*.
+
+| Argument | Description |
+| :--- | :--- |
+| `--engine <name>` | Also run an installed engine. Repeatable |
+| `--list-engines` | Show which engines are installed, with role and licence, and exit |
+| `--authorize-network-scan` | Required, together with `--url`, before any engine that sends traffic to a live target |
+
+| Engine | Role | Licence | Command Vibe Aegis runs |
+| :--- | :--- | :--- | :--- |
+| `semgrep` | AST pattern analysis across languages | LGPL-2.1-only (CLI) | `semgrep scan --config auto --json --quiet --timeout 300 <target>` |
+| `gitleaks` | Secrets across full git history | MIT | `gitleaks detect --source <target> --report-format json --report-path - --no-banner --exit-code 0` |
+| `trivy` | Dependencies, IaC misconfiguration | Apache-2.0 | `trivy fs --format json --quiet --scanners vuln,misconfig,secret <target>` |
+| `osv-scanner` | Lockfile-accurate vulnerability scan | Apache-2.0 | `osv-scanner --format json -r <target>` |
+| `scorecard` | Supply-chain posture of the repository | Apache-2.0 | `scorecard --local <target> --format json` |
+| `codeql` | Interprocedural data flow | GitHub CodeQL Terms (restricted for some commercial use) | **No adapter.** Needs a prebuilt database; requesting it records an `ENG-00` gap |
+| `zap` | Dynamic scan of a running deployment | Apache-2.0 | **No adapter yet.** Without `--authorize-network-scan` *and* `--url` it is refused; with both it records an `ENG-00` gap |
+
+Imported findings keep the engine's own rule id behind an `EXT-<ENGINE>:` prefix (for
+example `EXT-SEMGREP:generic.secrets...`) in the `EXTERNAL` domain, so another tool's output
+is never presented as ours, and their text is masked for credentials like everything else.
+Trivy's separate `Secrets` results are not imported yet. Licences apply to the tools you
+install; Vibe Aegis copies no code from them and only reads their documented JSON output.
+
+**What leaves your machine.** A default scan (`--profile code`) makes no network request,
+and there is no telemetry, ever. The scanner itself has exactly two network features, both
+opt-in:
+
+| Enabled by | Request | What is disclosed |
 | :--- | :--- | :--- |
-| `--deps` (also via `--all`) | `POST https://api.osv.dev/v1/querybatch` | Your dependency **names and versions** — not your source, not your file names |
-| `--url <URL>` | `GET` against the URL you supply | Nothing of yours; it reads your own deployment's headers |
+| `--deps`, `--all`, `--profile full` or `--profile release` | `POST https://api.osv.dev/v1/querybatch` | Your dependency **names and versions** — not your source, not your file names |
+| `--url <URL>` | One `GET` to that URL, plus one `GET` each to `/.env` and `/.git/config` on the **same host** | Nothing of yours; it reads your own deployment's response headers and the first 512 bytes of those two paths |
 
-`--offline` hard-disables both. A stage that could not reach the network is recorded as a
-coverage gap (`DEP-00` / `LIVE-00`) and **blocks** a `READY TO PUBLISH` verdict rather than
+`--offline` disables both. A stage that could not reach the network is recorded as a
+coverage gap (`DEP-00` / `LIVE-00`), so the verdict becomes `INCOMPLETE_SCAN` instead of
 silently passing.
+
+**External engines are separate programs with their own network behaviour, and
+`--offline` does not apply to them.** Check each tool's documentation before using
+`--engine` on a machine that must stay offline - for example, `semgrep --config auto`
+fetches its ruleset from the Semgrep registry.
 
 **Credentials in reports are redacted** before anything is written: only the provider's
 public prefix (`sk_live_`, `AKIA`) and the length remain - no character of the secret itself.
 `.aegis/scan-report.json` is safe to commit, attach to an issue, or upload as a CI artifact.
 
-**Exit codes:** `0` success · `1` blocking findings with a gate flag · `2` target path does not exist.
+**Exit codes:** see [Exit codes](#exit-codes) — the verdict alone never sets them.
 
 Also honoured: a `.aegis-ignore` file in the repo root, one entry per line — either a rule id (`SEC-03`) or a path glob (`src/legacy/**`).
 
@@ -343,7 +375,7 @@ Some rules have narrower sub-variants, reported with their own id so you can sup
 | `SEC-02B` | Permissive Firebase / Firestore rule (`allow read, write: if true`) |
 | `SEC-10B` | Auth token stored in `localStorage` rather than an HttpOnly cookie |
 | `SEC-17B` | `/.env` or `/.git/config` publicly reachable on the live server |
-| `DEP-00`, `LIVE-00`, `GIT-00`, `ART-10` | **Coverage gaps**, not defects — a check that could not run. Any id ending `-00` is always a gap |
+| `DEP-00`, `LIVE-00`, `GIT-00`, `ART-00`, `ART-10`, `COV-00`, `ENG-00` | **Coverage gaps**, not defects — a check that could not run, or something it did not read. Any id ending `-00` is always a gap |
 
 ### Secret Detection Precision
 
@@ -351,41 +383,97 @@ A noisy scanner gets uninstalled. Credential rules only fire on real provider ke
 
 **Every credential in every report is redacted** down to its public provider prefix and its length, so `.aegis/scan-report.json` is safe to commit, attach to an issue, or hand to an agent. This covers credentials the scanner can recognise - provider key formats, secret-named values, credentialed URLs and long random tokens; a short password with nothing to mark it as one cannot be told apart from code.
 
-### Fail-Closed: Coverage Is Not Severity
+### Coverage, Severity, Confidence - and the Verdict
 
-A check that **could not run** is an unknown, not a pass. The gate fails closed:
+A release gate can be wrong in three separate ways, so the scanner keeps them apart and
+never folds them into one number:
 
-| Condition | Verdict |
-| :--- | :--- |
-| 0 source files scanned | `INCOMPLETE_SCAN` — score forced to 0 |
-| Any `CRITICAL` / `HIGH` open | `BLOCKED` |
-| Any check skipped or errored | `VERIFIED_PARTIAL - INCOMPLETE_SCAN` |
-| Score < 90, nothing skipped | `NEEDS REVIEW` |
-| Files scanned · nothing skipped · no `CRITICAL`/`HIGH` · score ≥ 90 | **`READY TO PUBLISH`** |
+| Axis | Question | Gate flag |
+| :--- | :--- | :--- |
+| **Coverage** | Did the check actually run, and read what it claims to have read? | `--fail-on-incomplete` |
+| **Severity** | If this finding is real, how bad is it? | `--fail-on-high` / `--fail-on <level>` |
+| **Confidence** | How sure are we that it is real? | `--min-confidence <level>` |
 
-`READY TO PUBLISH` requires **all four** conditions. Pass `allow_skipped=True` to `compute_readiness_score()` to override deliberately.
+A check that **could not run** is an unknown, never a pass. Every such gap is reported in
+`skipped_checks` (rule ids ending `-00`), never counted in the score, and can never be
+suppressed by `.aegis-ignore` or `--baseline` - suppression accepts known *defects*, and a
+check that did not run carries nothing to accept.
 
-Called in isolation, `compute_readiness_score([DEP-00])` also fails closed — any rule id ending `-00` is treated as a coverage gap regardless of how the `Finding` was built. Skipped checks (offline mode, an unreachable URL or OSV, an unopenable package) are reported separately in `skipped_checks`, never counted in the score, and they force the verdict to `INCOMPLETE`:
+#### Profiles
 
-```text
-Readiness Score  : 100/100 - INCOMPLETE (1 check did not run: Dependency
-                   Vulnerability Check Skipped). Not certified.
+A profile is a default set of stages. It is never a ceiling: an explicit flag
+(`--deps`, `--git-history`, `--artifact`, `--all`) always adds its stage.
 
-CHECKS THAT DID NOT RUN (1) - result UNKNOWN, not clean:
-  - Dependency Vulnerability Check Skipped (offline mode)
+| Profile | Stages run by default | Can return `RELEASE_AUDIT_PASSED`? |
+| :--- | :--- | :--- |
+| `quick` | Source analysis only - currently **identical** to `code` | No |
+| `code` *(default)* | Source analysis: patterns, data-flow and secret detection | No |
+| `full` | `code` + dependencies + git history + build artifacts | No |
+| `release` | Everything in `full`, and forces `--fail-on-incomplete` | **Yes** - the only one |
+
+`--profile release` exits `1` when any stage was incomplete. It does **not** fail on
+findings by itself - severity is a separate axis. For a merge gate, combine them:
+
+```bash
+python3 scripts/aegis_scan.py . --profile release --fail-on-high
 ```
 
-`READY TO PUBLISH` is only ever issued for a **complete** audit. Use `--fail-on-incomplete` to enforce that in CI.
+A release stage that had nothing to read is a gap, not a pass: no build output, a missing
+`--artifact` path, a bundle over 12 MB, files past the first 4000, no dependency manifest,
+a lockfile format the scanner does not parse (`yarn.lock`, `pnpm-lock.yaml`,
+`poetry.lock`, ...), a lockfile in a subdirectory, a `package.json` without
+`package-lock.json`, or a `requirements.txt` line not pinned with `==`.
 
-### Release Readiness Score
+#### Verdicts
 
-The scanner starts at **100** and subtracts **25** per `CRITICAL`, **10** per `HIGH`, **4** per `MEDIUM` and **1** per `LOW`, floored at `0`.
+`release_verdict` starts with one of five words, followed by an explanation in
+parentheses. They are checked in this order, and the first that applies wins:
 
-| Condition | Verdict |
+| # | Verdict | When |
+| :--- | :--- | :--- |
+| 1 | `INCOMPLETE_SCAN` | Zero source files were scanned. Score forced to `0` |
+| 2 | `BLOCKED` | Any open `CRITICAL` or `HIGH` finding. A real defect outranks a coverage gap |
+| 3 | `INCOMPLETE_SCAN` | Any check did not run or did not read what it should have. Names the checks |
+| 4 | `REVIEW_REQUIRED` | Any `MEDIUM` finding, or a score below 90 - a human decides |
+| 5 | `RELEASE_AUDIT_PASSED` | `--profile release`, and the dependency, git-history and artifact stages all ran and read what they needed, with nothing found |
+| 6 | `STATIC_CHECKS_PASSED` | Anything else that is clean |
+
+**`STATIC_CHECKS_PASSED` is not a release-readiness claim.** It means only that the checks
+which ran found nothing. A source scan reads no lockfile, no git history, no built bundle
+and no running deployment, so it can never certify a release.
+
+One more string can appear: with `--diff`, a changeset containing no scannable source files
+returns `NO CODE CHANGES TO REVIEW (diff contained no scannable source files)` at `100/100`.
+A docs-only pull request is the normal case, not a failed audit.
+
+**Matching verdicts in CI.** Match the leading word, never the full string - the
+explanation in parentheses names counts and checks and changes from run to run. Better
+still, use the exit code, which already applies the gate flags you chose:
+
+```bash
+verdict=$(jq -r .release_verdict .aegis/scan-report.json)
+case "$verdict" in
+  RELEASE_AUDIT_PASSED*|STATIC_CHECKS_PASSED*) echo "clean" ;;
+  *) echo "not clean: $verdict"; exit 1 ;;
+esac
+```
+
+#### Exit codes
+
+| Code | Meaning |
 | :--- | :--- |
-| Any open `CRITICAL` or `HIGH` | `BLOCKED (Fix Critical/High findings before publishing)` |
-| Score ≥ 90, no blockers | `READY TO PUBLISH` |
-| Score < 90, no blockers | `NEEDS REVIEW (Address Medium/Low polish items)` |
+| `0` | No gate flag tripped. **The verdict alone never sets the exit code** - `BLOCKED` exits `0` unless `--fail-on-high` or `--fail-on` is set |
+| `1` | `--fail-on-high` / `--fail-on` met a finding at or above `--min-confidence`; or `--fail-on-incomplete` (forced by `--profile release`) met a gap or a scan of zero files |
+| `2` | The target path does not exist |
+
+#### Release Readiness Score
+
+The score starts at **100** and subtracts **25** per `CRITICAL`, **10** per `HIGH`, **4**
+per `MEDIUM` and **1** per `LOW`, floored at `0`. Coverage gaps are not scored - ten
+skipped checks do not cost ten points, they make the verdict `INCOMPLETE_SCAN`.
+
+Called directly, `compute_readiness_score([DEP-00])` also fails closed: any rule id ending
+`-00` is a gap however the `Finding` was built. `allow_skipped=True` is the explicit opt-out.
 
 ## 🖥️ How to Use Across Every AI Coding Agent
 

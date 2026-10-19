@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-SCANNER_VERSION = "2.6.0"
+SCANNER_VERSION = "2.7.0"
 
 IGNORE_DIRS: Set[str] = {
     ".git", "node_modules", ".next", "dist", "build", "out", ".vercel",
@@ -3119,9 +3119,10 @@ def compute_readiness_score(
 
     Fail-closed contract:
       * `scanned_files == 0`                -> INCOMPLETE_SCAN, score 0.
-      * any skipped / errored check         -> never READY (unless allow_skipped).
-      * READY TO PUBLISH requires ALL of    -> files were scanned, no CRITICAL/HIGH,
-                                               nothing skipped, score >= 90.
+      * any skipped / errored check         -> never a passing verdict (unless allow_skipped).
+      * a passing verdict requires ALL of   -> files were scanned, no CRITICAL/HIGH,
+                                               nothing skipped, no MEDIUM, score >= 90.
+        It is STATIC_CHECKS_PASSED, or RELEASE_AUDIT_PASSED only when `release_audit`.
 
     A check that could not run is an UNKNOWN, not a clean result. Counting one as
     a 1-point LOW meant an offline run with every deep stage skipped still scored

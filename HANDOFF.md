@@ -4,7 +4,8 @@ Context for anyone (human or agent) picking up this branch. Read this, then
 `CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`, and the `2.5.0` / `2.6.0` entries in
 `CHANGELOG.md`. Read `scripts/aegis_scan.py` in full before editing it.
 
-> This branch is **work in progress**. `SCANNER_VERSION` is deliberately still `2.6.0`.
+> This branch is **work in progress**. `SCANNER_VERSION`, `package.json` and both
+> `.claude-plugin/*.json` are `2.7.0` — bump all four together if that changes.
 > Do not release from it and do not merge it to `main` until the items below are done.
 
 ---
@@ -98,12 +99,9 @@ with every stage in `RELEASE_STAGES` actually completed, returns `RELEASE_AUDIT_
 
 ## Remaining work
 
-> **Start with item 5 (documentation).** This branch cannot be merged until it is done.
-> The scanner here can never emit `READY TO PUBLISH`, yet `README.md` still promises it
-> six times, and `--profile`, `--engine` and the new verdict names are undocumented.
-> Shipping that to `main` would mean the docs describe a tool that no longer exists —
-> the same defect `test_every_readme_rule_is_implemented` exists to prevent. Items 2–4
-> then follow in the order given (item 1 is done).
+> Items 1 and 5 are done. Item 5 was the one blocking the merge: the documentation now
+> describes the tool this branch actually builds, and `TestDocumentationMatchesTheScanner`
+> fails if it drifts again. Items 2–4 follow in the order given.
 
 Do **one item per session**. Finish it completely, with tests and docs, before starting
 the next. `aegis_scan.py` is a single large file, so parallel branches will conflict
@@ -136,28 +134,23 @@ magic. `.aab` and `.ipa` use different signing models. Never report a signature 
 absent or invalid without platform-correct verification — emit `ART-10` (coverage gap)
 when the format cannot be verified.
 
-### 5. Documentation — DO THIS FIRST, it is what blocks the merge
-`README.md` and `AGENTS.md` still describe the older model. Required:
+### 5. Documentation — DONE
+README, `AGENTS.md`, the orchestrator and pre-flight skills, the full-audit prompt, the
+schema and `llms-full.txt` now describe the three axes, four profiles, five verdicts (plus
+`--diff`'s `NO CODE CHANGES TO REVIEW`), exit codes, engines with licences, and what leaves
+the machine. `CHANGELOG.md` `2.7.0` carries the migration note. Three checklist claims were
+tested and found inaccurate, so the docs say what the code does instead:
 
-- **Remove every stale `READY TO PUBLISH`.** It appears in `README.md` (6×),
-  `skills/vibe-aegis/SKILL.md`, `docs/prompts/01-full-prelaunch-audit.md` and
-  `schemas/scan-report.schema.json`. That verdict no longer exists.
-- Document the **three axes** (coverage, severity, confidence) and the gate flag for each.
-- Document the **four profiles** (`--profile quick|code|full|release`) and state plainly
-  that only `release` can return `RELEASE_AUDIT_PASSED`.
-- Document the **five verdicts**, including that `STATIC_CHECKS_PASSED` is not a
-  release-readiness claim.
-- Document `--engine`, `--list-engines`, `--authorize-network-scan`, `--max-file-size`,
-  and each engine's licence. Say that engines are never auto-installed and that a
-  missing engine is a coverage gap.
-- Document what leaves the machine: `--deps` queries `api.osv.dev`; `--url` touches only
-  the supplied URL; `--offline` disables both; there is no telemetry.
-- Add a **migration note to `CHANGELOG.md`**: any CI that greps `release_verdict` for
-  `READY TO PUBLISH` breaks. Tell users what to match instead.
-- Bump `SCANNER_VERSION`, `package.json` and both `.claude-plugin/*.json` **together**.
-  Leaving `main` and this branch both on `2.6.0` with different behaviour is not an
-  option.
-- Regenerate `llms-full.txt` (`python scripts/build_llms_full.py .`) last.
+- `--url` also requests `/.env` and `/.git/config` on the same host, not only the URL.
+- `--offline` does **not** apply to external engines; `semgrep --config auto` fetches its
+  ruleset from the network.
+- ZAP has no adapter: with both flags it records an `ENG-00` gap and never runs.
+
+Documenting the profiles exposed real defects, fixed in `9073e8b` before the docs were
+written: `--profile release` certified build-artifact and dependency stages that had read
+nothing; `quick` dropped `--all`; `--artifact` with no value was rejected. Still true and
+documented, not changed: `quick` is identical to `code`, and `--profile release` does not
+fail on findings without `--fail-on-high`.
 
 ---
 

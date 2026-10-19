@@ -2307,3 +2307,105 @@ class TestProfilesAndFlagsDoWhatTheHelpSays(unittest.TestCase):
     def test_artifact_with_no_value_auto_detects(self):
         """The help promised this; argparse rejected `--artifact` without a path."""
         self.assertIn("artifacts", self._stages(["--artifact"]))
+
+
+# ---------------------------------------------------------------------------
+# The documentation is a promise. Hold it to the code.
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+class TestDocumentationMatchesTheScanner(unittest.TestCase):
+    """A README that describes a tool which no longer exists is a defect, not a typo.
+
+    `test_every_readme_rule_is_implemented` stops the docs promising a rule the code
+    lacks. These stop the reverse - the code changing while the docs keep describing
+    the old tool, which is how six stale `READY TO PUBLISH` claims reached this branch.
+    """
+
+    USER_FACING = ["README.md", "AGENTS.md", "CLAUDE.md", "llms.txt", "llms-full.txt",
+                   "schemas/scan-report.schema.json", "scripts/build_llms_full.py"]
+    USER_FACING_DIRS = ["skills", "docs", "adapters"]
+    RETIRED_VERDICTS = ("READY TO PUBLISH", "NEEDS REVIEW", "VERIFIED_PARTIAL")
+
+    def _read(self, rel):
+        return (REPO_ROOT / rel).read_text(encoding="utf-8")
+
+    def _user_facing_files(self):
+        files = [REPO_ROOT / rel for rel in self.USER_FACING]
+        for d in self.USER_FACING_DIRS:
+            files += [p for p in (REPO_ROOT / d).rglob("*") if p.is_file()]
+        return files
+
+    def test_no_retired_verdict_is_documented(self):
+        stale = ["%s: %s" % (p.relative_to(REPO_ROOT).as_posix(), v)
+                 for p in self._user_facing_files()
+                 for v in self.RETIRED_VERDICTS
+                 if v in p.read_text(encoding="utf-8", errors="ignore")]
+        self.assertEqual(stale, [], "documents a verdict the scanner can no longer return")
+
+    def test_every_verdict_is_documented(self):
+        readme, schema = self._read("README.md"), self._read("schemas/scan-report.schema.json")
+        for v in (aegis_scan.VERDICT_BLOCKED, aegis_scan.VERDICT_INCOMPLETE,
+                  aegis_scan.VERDICT_REVIEW, aegis_scan.VERDICT_STATIC_OK,
+                  aegis_scan.VERDICT_RELEASE_OK, "NO CODE CHANGES TO REVIEW"):
+            self.assertIn(v, readme)
+            self.assertIn(v, schema)
+
+    def test_every_cli_flag_is_documented(self):
+        # From the source, not `--help`: argparse wraps long lines mid-flag.
+        source = Path(aegis_scan.__file__).read_text(encoding="utf-8")
+        flags = set(re.findall(r'add_argument\(\s*"(--[a-z][a-z-]+)"', source))
+        readme, full = self._read("README.md"), self._read("llms-full.txt")
+        self.assertEqual(len(flags), source.count('add_argument("--'))
+        self.assertEqual(sorted(f for f in flags if "`%s" % f not in readme), [],
+                         "flags missing from the README CLI reference")
+        self.assertEqual(sorted(f for f in flags if "`%s" % f not in full), [],
+                         "flags missing from the llms-full.txt CLI reference")
+
+    def test_engine_table_matches_the_adapters(self):
+        readme = self._read("README.md")
+        for name, spec in aegis_scan.ENGINE_SPECS.items():
+            row = next((ln for ln in readme.splitlines() if ln.startswith("| `%s` |" % name)), "")
+            self.assertIn(spec["licence"], row, "licence for %s" % name)
+            if name in aegis_scan.ENGINE_COMMANDS:
+                cmd = " ".join(aegis_scan.ENGINE_COMMANDS[name](Path("<target>"), None))
+                self.assertIn("`%s`" % cmd, row, "command for %s" % name)
+            else:
+                self.assertIn("No adapter", row, "%s has no adapter - say so" % name)
+
+    def test_auto_detected_artifact_directories_are_listed(self):
+        listed = ", ".join("`%s/`" % d for d in aegis_scan.ARTIFACT_DIRS)
+        self.assertIn(listed, self._read("README.md"))
+        self.assertIn(listed, self._read("llms-full.txt"))
+
+    def test_versions_agree_across_all_four_files(self):
+        versions = {"scripts/aegis_scan.py": aegis_scan.SCANNER_VERSION,
+                    "package.json": json.loads(self._read("package.json"))["version"],
+                    "plugin.json": json.loads(self._read(".claude-plugin/plugin.json"))["version"]}
+        market = json.loads(self._read(".claude-plugin/marketplace.json"))
+        versions["marketplace.json metadata"] = market["metadata"]["version"]
+        versions.update({"marketplace.json %s" % p["name"]: p["version"] for p in market["plugins"]})
+        self.assertEqual(len(set(versions.values())), 1, versions)
+        self.assertIn("## [%s]" % aegis_scan.SCANNER_VERSION, self._read("CHANGELOG.md"))
+
+    def test_schema_rule_id_pattern_accepts_every_emitted_id(self):
+        """The old pattern rejected COV-00, ENG-00 and every EXT-* id real reports carry."""
+        schema = json.loads(self._read("schemas/scan-report.schema.json"))
+        pattern = re.compile(schema["$defs"]["finding"]["properties"]["rule_id"]["pattern"])
+        emitted = scanner_rule_ids() | {"EXT-SEMGREP:generic.secrets.x", "EXT-OSV-SCANNER:GHSA-1"}
+        self.assertEqual(sorted(r for r in emitted if not pattern.match(r)), [])
+        for junk in ("sec-01", "SEC-1", "EXT-:x", "README", ""):
+            self.assertIsNone(pattern.match(junk), junk)
+
+    def test_llms_full_is_regenerated(self):
+        """Stale by one commit already happened on this branch; catch it in CI instead."""
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = Path(tmp) / "repo"
+            shutil.copytree(REPO_ROOT, copy, ignore=shutil.ignore_patterns(".git", "__pycache__"))
+            subprocess.run([sys.executable, "-B", str(copy / "scripts" / "build_llms_full.py"), str(copy)],
+                           capture_output=True, check=True)
+            fresh = (copy / "llms-full.txt").read_text(encoding="utf-8")
+        self.assertEqual(fresh, self._read("llms-full.txt"),
+                         "run `python scripts/build_llms_full.py .` and commit the result")
