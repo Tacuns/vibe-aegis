@@ -186,6 +186,32 @@ Reproduced on this branch before each change; each has matched vulnerable and sa
   signature validity in every case. Test fixtures in `tests/fixtures/android/` are real
   `aapt`/`apksigner` output built from manifests in the same directory.
 
+### Fixed - repository handling, engines and the Node wrapper (checklist E)
+
+- **Symlinks out of the repository were followed (HIGH).** A file link such as
+  `src/k.ts -> ~/.ssh/id_rsa` was read and quoted as if it were project code, in the
+  source walk, the build-output walk and the dependency manifests. A link whose target
+  lies outside the repository is now not followed and is recorded as not examined
+  (`COV-00` / `ART-00`); links that stay inside the repository are read as before.
+- **An engine that failed could be read as a clean scan (MEDIUM).** Output that parsed
+  as JSON was accepted whatever the exit status. Each engine's statuses were observed on
+  the real binary with our exact command: semgrep exits `2` on a bad rule or missing path
+  and still prints a valid, empty result; osv-scanner exits `1` when it finds
+  vulnerabilities and `128` when it finds no packages. Anything but a status meaning
+  "finished" is now an `ENG-00` gap, osv-scanner's `128` included, and a semgrep run that
+  lists `errors` is a partial run. `gitleaks detect` outside a git repository scanned "0
+  commits" and reported nothing; it now runs with `--no-git` there.
+- **The Node wrapper turned failures into success (MEDIUM).** An unknown command printed
+  usage and exited `0`, so a typo passed a CI step; a scanner killed by a signal (`status`
+  null) exited `0` through `?? 0`, and so did an installer whose `bash` could not start.
+  An unknown command now exits `2`, a signal `128 + n` as a shell reports it, and a child
+  that cannot start `127`; `help` still exits `0`.
+- **Installer (re-verified).** On the three paths the review named, an existing
+  `.github/copilot-instructions.md` is left untouched (our copy goes to
+  `.aegis/suggested/`), and `.claude/commands/aegis.md` and `.cursor/rules/vibe-aegis.mdc`
+  are backed up byte for byte before being replaced; a re-run with nothing changed
+  creates no new backup.
+
 ### Changed - GitHub Actions are pinned to commit SHAs
 
 This repository's CI and the workflow shipped in `adapters/github-actions/` used movable

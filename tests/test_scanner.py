@@ -4172,3 +4172,182 @@ class TestSignatureIsVerifiedOrSaidToBeUnverified(unittest.TestCase):
     def test_against_the_real_apksigner(self):
         self.assertFalse({self.UNVERIFIED, self.FAILS} & self._scan("signed.apk", "real"))
         self.assertIn(self.FAILS, self._scan("tampered.apk", "real"))
+
+
+# ---------------------------------------------------------------------------
+# Checklist E: repository handling, engines, the Node wrapper and the installer
+# ---------------------------------------------------------------------------
+
+@unittest.skipIf(os.name == "nt", "creating symlinks needs extra privileges on Windows")
+class TestSymlinksOutOfTheRepositoryAreNotFollowed(unittest.TestCase):
+    """A link out of the repository had the scanner read, and quote, a foreign file."""
+
+    def _layout(self, tmp):
+        outside = Path(tmp) / "outside"
+        write(outside, "secret.ts", 'const k = "%s";\n' % STRIPE_KEY)
+        write(outside, "requirements.txt", "django==1.2\n")
+        repo = Path(tmp) / "repo"
+        write(repo, "src/real.ts", "export const x = 1\n")
+        return outside, repo
+
+    def test_a_source_link_out_is_a_gap_not_a_finding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside, repo = self._layout(tmp)
+            os.symlink(outside / "secret.ts", repo / "src" / "link.ts")
+            ledger = aegis_scan.CoverageLedger()
+            found, scanned = aegis_scan.scan_repository(repo, ledger=ledger)
+        self.assertEqual([f for f in found if f.rule_id.startswith("SEC-01")], [])
+        self.assertEqual(scanned, 1)
+        self.assertEqual([g.title for g in ledger.gaps()],
+                         ["Not Examined: symlink pointing outside the repository - not followed (1 item(s))"])
+
+    def test_a_link_inside_the_repository_is_still_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _outside, repo = self._layout(tmp)
+            write(repo, "config/keys.ts", 'const k = "%s";\n' % STRIPE_KEY)
+            os.symlink(repo / "config" / "keys.ts", repo / "src" / "keys.ts")
+            ledger = aegis_scan.CoverageLedger()
+            found, _ = aegis_scan.scan_repository(repo, ledger=ledger)
+        self.assertEqual({f.file for f in found if f.rule_id == "SEC-01"}, {"config/keys.ts", "src/keys.ts"})
+        self.assertEqual(ledger.gaps(), [])
+
+    def test_a_build_output_link_out_is_a_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside, repo = self._layout(tmp)
+            write(repo, "dist/ok.js", "var a=1;")
+            os.symlink(outside / "secret.ts", repo / "dist" / "app.js")
+            found = aegis_scan.scan_build_artifacts(repo, None, [])
+        self.assertEqual([(f.rule_id, f.title) for f in found],
+                         [("ART-00", "Build Output Links Outside The Repository")])
+
+    def test_a_dependency_manifest_link_out_is_not_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside, repo = self._layout(tmp)
+            os.symlink(outside / "requirements.txt", repo / "requirements.txt")
+            self.assertEqual(aegis_scan.parse_dependencies(repo), [])
+
+
+@unittest.skipIf(os.name == "nt", "stand-in engines are shell scripts")
+class TestEngineExitStatusIsChecked(unittest.TestCase):
+    """Parseable output was accepted whatever the engine's exit status said."""
+
+    def _run(self, name, script, git=False):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            write(root, "a.py", "x = 1\n")
+            if git:
+                _git_init(root)
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            exe = bin_dir / aegis_scan.ENGINE_SPECS[name]["bin"]
+            exe.write_text("#!/bin/sh\n" + script)
+            exe.chmod(0o755)
+            old = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(bin_dir) + os.pathsep + old
+            try:
+                return aegis_scan.run_engine(name, root)
+            finally:
+                os.environ["PATH"] = old
+
+    def test_semgrep_failure_with_valid_json_is_a_gap(self):
+        # Observed on semgrep 1.99: a bad rule or missing path exits 2 and still prints
+        # {"results": [], "errors": [...]}.
+        found, gap = self._run("semgrep", """echo '{"results": [], "errors": [{"message": "bad rule"}]}'\nexit 2\n""")
+        self.assertEqual(found, [])
+        self.assertIn("engine exited 2", gap.snippet)
+
+    def test_semgrep_errors_on_a_finished_run_mark_it_partial(self):
+        found, gap = self._run("semgrep", """echo '{"results": [], "errors": [{"message": "parse error in a.py"}]}'\n""")
+        self.assertIsNotNone(gap)
+        self.assertIn("partial", gap.snippet)
+
+    def test_a_clean_semgrep_run_is_clean(self):
+        found, gap = self._run("semgrep", """echo '{"results": [], "errors": []}'\n""")
+        self.assertEqual((found, gap), ([], None))
+
+    def test_osv_scanner_exit_1_means_vulnerabilities_found(self):
+        payload = json.dumps(_osv_scanner_payload([TestOsvScannerSeverity.CRITICAL], []))
+        found, gap = self._run("osv-scanner", "echo '%s'\nexit 1\n" % payload)
+        self.assertIsNone(gap)
+        self.assertEqual([f.severity for f in found], ["CRITICAL"])
+
+    def test_osv_scanner_no_packages_is_a_gap(self):
+        found, gap = self._run("osv-scanner", "exit 128\n")
+        self.assertIn("found no packages to scan", gap.snippet)
+
+    def test_any_other_failure_is_a_gap_even_with_output(self):
+        for name in ("gitleaks", "trivy"):
+            found, gap = self._run(name, "echo '[]'\nexit 1\n")
+            self.assertIsNotNone(gap, name)
+
+    def test_gitleaks_reads_files_outside_a_git_repository(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plain, repo = Path(tmp) / "plain", Path(tmp) / "repo"
+            write(plain, "a.py", "x = 1\n")
+            write(repo, "a.py", "x = 1\n")
+            _git_init(repo)
+            self.assertIn("--no-git", aegis_scan.ENGINE_COMMANDS["gitleaks"](plain, None))
+            self.assertNotIn("--no-git", aegis_scan.ENGINE_COMMANDS["gitleaks"](repo, None))
+
+
+@unittest.skipUnless(shutil.which("node"), "node is not installed")
+@unittest.skipIf(os.name == "nt", "stand-in interpreter is a shell script")
+class TestNodeWrapperExitStatus(unittest.TestCase):
+    """An unknown command and a killed scanner both exited 0."""
+
+    WRAPPER = str(Path(__file__).resolve().parent.parent / "bin" / "vibe-aegis.mjs")
+
+    def _node(self, args, path=None):
+        env = dict(os.environ)
+        if path is not None:
+            env["PATH"] = path
+        return subprocess.run([shutil.which("node"), self.WRAPPER] + args, capture_output=True,
+                              text=True, env=env, timeout=120)
+
+    def test_an_unknown_command_fails(self):
+        r = self._node(["scna", "."])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('unknown command "scna"', r.stderr)
+
+    def test_help_succeeds(self):
+        self.assertEqual(self._node(["--help"]).returncode, 0)
+
+    def test_a_scanner_killed_by_a_signal_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "python3"
+            fake.write_text("#!/bin/sh\nkill -TERM $$\n")
+            fake.chmod(0o755)
+            r = self._node(["scan", tmp], path=tmp + os.pathsep + os.environ.get("PATH", ""))
+        self.assertEqual(r.returncode, 128 + 15)
+        self.assertIn("SIGTERM", r.stderr)
+
+    def test_the_scanner_exit_status_is_passed_through(self):
+        self.assertEqual(self._node(["scan", "/nonexistent-target-path"]).returncode, 2)
+
+    def test_an_installer_that_cannot_start_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.symlink(shutil.which("node"), Path(tmp) / "node")
+            r = self._node(["setup", "--target", tmp], path=tmp)
+        self.assertEqual(r.returncode, 127)
+
+
+class TestInstallerKeepsEveryReplacedFile(unittest.TestCase):
+    """The three paths the review named: shared config kept, our files backed up."""
+
+    def test_each_named_path(self):
+        if not shutil.which("bash"):
+            self.skipTest("bash is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, ".github/copilot-instructions.md", "TEAM RULES\n")
+            write(root, ".claude/commands/aegis.md", "MY COMMAND\n")
+            write(root, ".cursor/rules/vibe-aegis.mdc", "MY CURSOR RULE\n")
+            r = subprocess.run(["bash", str(REPO_ROOT / "install.sh"), "--target", tmp, "--agent", "all"],
+                               capture_output=True, text=True, timeout=300)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual((root / ".github/copilot-instructions.md").read_text(), "TEAM RULES\n")
+            backups = list((root / ".aegis" / "backup").iterdir())
+            self.assertEqual(len(backups), 1)
+            self.assertEqual((backups[0] / ".claude/commands/aegis.md").read_text(), "MY COMMAND\n")
+            self.assertEqual((backups[0] / ".cursor/rules/vibe-aegis.mdc").read_text(), "MY CURSOR RULE\n")
+

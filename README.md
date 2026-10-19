@@ -225,8 +225,13 @@ python3 scripts/aegis_scan.py . --fail-on-high --min-confidence high --fail-on-i
 Vibe Aegis is complete with nothing else installed. If you already have one of these
 tools, `--engine` also runs it and imports its findings. Engines are found on `PATH` and
 **never downloaded or installed for you**. A requested engine that is missing, crashes,
-times out or prints something unparseable becomes an `ENG-00` coverage gap — *"semgrep did
-not run"* is never reported as *"semgrep found nothing"*.
+times out, prints something unparseable, or **exits with a status that does not mean
+"finished"** becomes an `ENG-00` coverage gap — *"semgrep did not run"* is never reported
+as *"semgrep found nothing"*. Valid JSON is not enough: semgrep exits `2` on a bad rule or a
+missing path and still prints a well-formed, empty result. Each engine's accepted exit
+statuses were observed on the real binary (`osv-scanner` exits `1` when it finds
+vulnerabilities, and `128` - a gap - when it finds no packages); a semgrep run that lists
+`errors` is a partial run and a gap too.
 
 | Argument | Description |
 | :--- | :--- |
@@ -237,7 +242,7 @@ not run"* is never reported as *"semgrep found nothing"*.
 | Engine | Role | Licence | Command Vibe Aegis runs |
 | :--- | :--- | :--- | :--- |
 | `semgrep` | AST pattern analysis across languages | LGPL-2.1-only (CLI) | `semgrep scan --config auto --json --quiet --timeout 300 <target>` |
-| `gitleaks` | Secrets across full git history | MIT | `gitleaks detect --source <target> --report-format json --report-path - --no-banner --exit-code 0` |
+| `gitleaks` | Secrets across full git history | MIT | `gitleaks detect --source <target> --report-format json --report-path - --no-banner --exit-code 0 --no-git` (`--no-git` only when the target is not a git repository: there, `detect` scans zero commits and reports nothing) |
 | `trufflehog` | Secrets in git history and files | AGPL-3.0 | `trufflehog filesystem <target> --no-verification --no-update --json` — or `trufflehog git file://<target> ...` with the same flags when `<target>` is a git repository |
 | `trivy` | Dependencies, IaC misconfiguration, secrets | Apache-2.0 | `trivy fs --format json --quiet --scanners vuln,misconfig,secret <target>` |
 | `osv-scanner` | Lockfile-accurate vulnerability scan | Apache-2.0 | `osv-scanner --format json -r <target>` |

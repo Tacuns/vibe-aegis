@@ -1440,6 +1440,15 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
                 rel_for_log = fpath.relative_to(root).as_posix()
             except ValueError:
                 rel_for_log = fpath.as_posix()
+            if fpath.is_symlink() and _escapes(root, fpath):
+                # A link out of the repository would have us read - and quote - a file
+                # that is not part of it (`src/k.ts -> ~/.ssh/id_rsa`). It is not
+                # followed, and it is said so: what it points at was not examined.
+                ledger.record("symlink pointing outside the repository - not followed",
+                              rel_for_log,
+                              detail="Replace the link with the file it points to, or review "
+                                     "the target by hand: it was not read.")
+                continue
             if only_files is not None and rel_for_log not in only_files:
                 # Diff mode reviews only what this branch changed. Checked before any
                 # skip is recorded: an unchanged bundle is outside the review, not a
@@ -2375,7 +2384,7 @@ def parse_dependencies(root: Path) -> List[Tuple[str, str, str]]:
             deps.append(key)
 
     lock = root / "package-lock.json"
-    if lock.exists():
+    if lock.exists() and not _escapes(root, lock):
         try:
             data = json.loads(lock.read_text(encoding="utf-8", errors="ignore"))
             for path, meta in (data.get("packages") or {}).items():
@@ -2390,7 +2399,7 @@ def parse_dependencies(root: Path) -> List[Tuple[str, str, str]]:
             pass
 
     pkg = root / "package.json"
-    if pkg.exists() and not deps:
+    if pkg.exists() and not _escapes(root, pkg) and not deps:
         try:
             data = json.loads(pkg.read_text(encoding="utf-8", errors="ignore"))
             for section in ("dependencies", "devDependencies"):
@@ -2400,7 +2409,7 @@ def parse_dependencies(root: Path) -> List[Tuple[str, str, str]]:
             pass
 
     req = root / "requirements.txt"
-    if req.exists():
+    if req.exists() and not _escapes(root, req):
         for line in req.read_text(encoding="utf-8", errors="ignore").splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
@@ -2410,7 +2419,7 @@ def parse_dependencies(root: Path) -> List[Tuple[str, str, str]]:
                 add("PyPI", m.group(1), m.group(2))
 
     cargo = root / "Cargo.lock"
-    if cargo.exists():
+    if cargo.exists() and not _escapes(root, cargo):
         text = cargo.read_text(encoding="utf-8", errors="ignore")
         for block in text.split("[[package]]"):
             n = re.search(r'name\s*=\s*"([^"]+)"', block)
@@ -2419,7 +2428,7 @@ def parse_dependencies(root: Path) -> List[Tuple[str, str, str]]:
                 add("crates.io", n.group(1), v.group(1))
 
     gomod = root / "go.mod"
-    if gomod.exists():
+    if gomod.exists() and not _escapes(root, gomod):
         for line in gomod.read_text(encoding="utf-8", errors="ignore").splitlines():
             m = re.match(r"^\s*([a-zA-Z0-9_.\-/]+)\s+v([0-9][0-9A-Za-z.\-+]*)", line.strip())
             if m and not line.strip().startswith(("module", "go ", "//")):
@@ -2827,6 +2836,15 @@ def _artifact_gap(title: str, file: str, detail: str, remediation: str) -> Findi
     )
 
 
+def _escapes(base: Path, path: Path) -> bool:
+    """Does `path`, with every symlink resolved, lie outside `base`?"""
+    try:
+        path.resolve().relative_to(base.resolve())
+        return False
+    except (ValueError, OSError, RuntimeError):
+        return True
+
+
 def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secrets: List[Finding]) -> List[Finding]:
     """Read what actually ships. Anything this stage could not read is a coverage gap.
 
@@ -2886,6 +2904,7 @@ def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secret
     examined = 0
     oversized: List[str] = []
     unreadable: List[str] = []
+    escaped: List[str] = []
     for target in targets:
         if target.is_file() and target.suffix.lower() in MOBILE_PACKAGE_EXT:
             findings.extend(scan_mobile_package(root, target))
@@ -2901,7 +2920,11 @@ def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secret
                 f"{len(files) - ARTIFACT_FILE_LIMIT} in path order were NOT examined.",
                 "Point --artifact at the deployable output only (for example the client "
                 "bundle directory), so every shipped file is read."))
+        boundary = root if not _escapes(root, target) else target
         for fpath in files[:ARTIFACT_FILE_LIMIT]:
+            if fpath.is_symlink() and _escapes(boundary, fpath):
+                escaped.append(fpath.name)
+                continue
             ext = fpath.suffix.lower()
             if ext in MOBILE_PACKAGE_EXT and ext != ".zip":
                 # A package inside the build directory ships too.
@@ -2996,6 +3019,12 @@ def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secret
             "Build Files Could Not Be Read", unreadable[0],
             f"{len(unreadable)} file(s) could not be read: {', '.join(unreadable[:5])}",
             "Check file permissions on the build output and re-run."))
+    if escaped:
+        findings.append(_artifact_gap(
+            "Build Output Links Outside The Repository", escaped[0],
+            f"{len(escaped)} symlink(s) point outside the repository and were not followed: "
+            + ", ".join(escaped[:5]),
+            "Copy the real files into the build output, or review the link targets by hand."))
     if not examined:
         findings.append(_artifact_gap(
             "No Readable Build Files", targets[0].name,
@@ -4062,9 +4091,13 @@ ENGINE_PARSERS = {
 ENGINE_COMMANDS = {
     "semgrep": lambda root, _a: ["semgrep", "scan", "--config", "auto", "--json",
                                  "--quiet", "--timeout", "300", str(root)],
+    # `detect` reads git history; outside a git repository it scanned "0 commits",
+    # printed `[]` and exited 0 - a clean result for a scan of nothing. --no-git reads
+    # the files instead.
     "gitleaks": lambda root, _a: ["gitleaks", "detect", "--source", str(root),
                                   "--report-format", "json", "--report-path", "-",
-                                  "--no-banner", "--exit-code", "0"],
+                                  "--no-banner", "--exit-code", "0"]
+                                 + ([] if (Path(root) / ".git").exists() else ["--no-git"]),
     "trufflehog": lambda root, _a: (
         ["trufflehog", "git", Path(root).resolve().as_uri()] if (Path(root) / ".git").exists()
         else ["trufflehog", "filesystem", str(root)]) + ["--no-verification", "--no-update", "--json"],
@@ -4076,6 +4109,23 @@ ENGINE_COMMANDS = {
 
 
 NDJSON_ENGINES = {"trufflehog"}
+
+# The exit statuses that mean "the engine finished". Anything else is a failed or
+# partial run, whatever it printed: semgrep exits 2 on a bad rule or a missing path and
+# still prints valid JSON with zero results, which this once accepted as a clean scan.
+# Each value was observed with our exact command on the real binary (semgrep 1.99,
+# gitleaks 8, trivy, osv-scanner 2.2, trufflehog 3): 0 = finished; osv-scanner exits 1
+# when it FOUND vulnerabilities. scorecard could not be run here, so only 0 is trusted.
+ENGINE_OK_EXIT: Dict[str, Set[int]] = {
+    "semgrep": {0}, "gitleaks": {0}, "trufflehog": {0}, "trivy": {0},
+    "osv-scanner": {0, 1}, "scorecard": {0},
+}
+# Exit statuses that are a known, named outcome rather than a crash.
+ENGINE_EXIT_MEANING: Dict[str, Dict[int, str]] = {
+    "osv-scanner": {128: "found no packages to scan", 127: "general error (often: the OSV API "
+                    "was unreachable)"},
+    "semgrep": {2: "fatal error (bad rule, missing path, or rules could not be fetched)"},
+}
 
 # Engines that may run under --offline. Each was run with our exact command inside a
 # network namespace with no network at all and produced its normal results. The rest
@@ -4137,11 +4187,13 @@ def run_engine(name: str, root: Path, timeout: int = 600) -> Tuple[List[Finding]
         return [], gap("engine failed to execute", f"{type(exc).__name__}")
 
     raw = (proc.stdout or "").strip()
+    if proc.returncode not in ENGINE_OK_EXIT.get(name, {0}):
+        meaning = ENGINE_EXIT_MEANING.get(name, {}).get(proc.returncode, "")
+        return [], gap(f"engine exited {proc.returncode}" + (f": {meaning}" if meaning else ""),
+                       proc.stderr or "")
     if name in NDJSON_ENGINES:
         # One object per line, and NOTHING at all when clean - so an empty stdout is a
-        # pass only together with a zero exit status; a failure exits non-zero.
-        if proc.returncode != 0:
-            return [], gap(f"engine exited {proc.returncode}", proc.stderr or "")
+        # pass only together with a zero exit status (checked above).
         try:
             rows = [json.loads(ln) for ln in raw.splitlines() if ln.strip()]
         except Exception:
@@ -4164,9 +4216,16 @@ def run_engine(name: str, root: Path, timeout: int = 600) -> Tuple[List[Finding]
             return [], gap("engine output was not parseable JSON")
 
     try:
-        return _relative_to(root, ENGINE_PARSERS[name](payload)), None
+        found = _relative_to(root, ENGINE_PARSERS[name](payload))
     except Exception as exc:
         return [], gap("engine output had an unexpected shape", type(exc).__name__)
+    # A run that finished but could not analyse everything is a partial run: semgrep
+    # lists files it failed to parse, and rules it could not run, under `errors`.
+    errors = payload.get("errors") if isinstance(payload, dict) and name == "semgrep" else None
+    if errors:
+        return found, gap(f"engine reported {len(errors)} error(s); its results are partial",
+                          "; ".join(str((e or {}).get("message", e))[:120] for e in errors[:3]))
+    return found, None
 
 
 def fingerprint(f: Finding) -> str:
