@@ -263,6 +263,36 @@ Five findings from a second review of this branch, each reproduced before it was
   (a clean trivy scan omits `Results`, so only its header is required) - or it is an
   `ENG-00` gap.
 
+### Added - checks for what leaves no trace: the live database, and a two-account test
+
+A leaked key is a string you can grep for. Missing row-level security and IDOR are not:
+every response is a normal `200` with another user's data in it. Two additions, and a
+README section, [What a scan cannot prove](README.md#-what-a-scan-cannot-prove), saying
+plainly where static analysis stops.
+
+- **`--db-check`: read the live database, not only the migrations.** A table created in
+  the dashboard, a hand-edited policy or a migration that never ran is invisible to a
+  source scan. With `AEGIS_DATABASE_URL` set, the scanner reads `pg_class`, `pg_roles` and
+  `pg_policies` through `psql` and reports `DB-01` (a table the API roles can reach - table
+  grant and schema `USAGE` - with RLS off), `DB-02` (a permissive policy whose `USING` or
+  `WITH CHECK` is `true`; a `SELECT` one is MEDIUM, because a public-read table is a
+  legitimate pattern, and a `RESTRICTIVE` one is not reported) and `DB-03` (a view without
+  `security_invoker`). `--db-schemas` and `--db-roles` name what the API exposes.
+  - The session is read-only (`default_transaction_read_only=on`, 30 s statement timeout)
+    and reads no row of application data.
+  - The password goes to `psql` in its environment, never argv, and is removed from any
+    error message before it is recorded.
+  - Every failure - no URL, no `psql`, a bad identifier, no API role, a query error, or
+    `--offline` - is a `DB-00` gap, never a pass.
+  - `tests/sql/db_posture.sql` builds one example of each rule and each silent case;
+    `TestLiveDatabaseCheck` was run against PostgreSQL 16 and gives exactly the expected
+    findings.
+- **`--idor-plan <PATH>`: the test a scanner cannot run.** Writes a Markdown plan for
+  every `SEC-03`, `SEC-04` and `DB-0x` finding: the route derived from the file path, the
+  handler's method, and a `curl` to run as account B against account A's record (for a
+  database write policy, an attempt to write a row owned by A). It is only written to
+  disk; nothing is sent. With no findings it still says that no finding is not proof.
+
 ### Changed - GitHub Actions are pinned to commit SHAs
 
 This repository's CI and the workflow shipped in `adapters/github-actions/` used movable

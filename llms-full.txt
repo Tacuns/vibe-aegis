@@ -217,6 +217,7 @@ python3 scripts/aegis_scan.py /path/to/your/app --profile release --fail-on-high
 | `--output <PATH>` | Write the JSON report to a file (parent directories are created) |
 | `--sarif <PATH>` | Write SARIF 2.1.0 so findings appear in GitHub's Security tab |
 | `--sbom <PATH>` | Write a CycloneDX 1.5 SBOM of all detected dependencies |
+| `--idor-plan <PATH>` | Write a Markdown two-account test (ready-to-run `curl` commands) for every `SEC-03`, `SEC-04` and `DB-0x` finding — see [What a scan cannot prove](#-what-a-scan-cannot-prove). Written to disk only; nothing is sent |
 | `--quiet` | Print only the one-line summary |
 
 **Release gate**
@@ -262,6 +263,9 @@ python3 scripts/aegis_scan.py . --fail-on-high --min-confidence high --fail-on-i
 | `--url <URL>` | Passive, read-only live header & exposure checks |
 | `--all` | Enable artifacts + git history + dependencies |
 | `--offline` | No network request from this run: disables `--deps` and `--url`, and starts only the external engines verified to work without a network (`gitleaks`, `trufflehog`) — see below |
+| `--db-check` | Read-only check of the **live** PostgreSQL database (rules `DB-01`–`DB-03`). Needs `psql` on `PATH` and the connection string in the `AEGIS_DATABASE_URL` environment variable — never as a flag, so it stays out of shell history and process lists. Opt-in, and skipped under `--offline` |
+| `--db-schemas <LIST>` | Comma-separated schemas your API exposes (default `public`) |
+| `--db-roles <LIST>` | Comma-separated roles your API connects as (default `anon,authenticated`, Supabase's API roles) |
 
 **External engines (optional)**
 
@@ -367,6 +371,42 @@ another's rows; an edited claim unlocks an admin table) and fails on the fix. A 
 revoke in the same migration sets the confidence — no grant to the API roles means it
 depends on the project's default privileges, so it is reported at `MEDIUM` confidence.
 
+#### Live database (`--db-check`)
+
+Migrations show what *should* be in the database; the catalog shows what *is*. A table
+created in a dashboard, a policy edited by hand, or a migration that never ran is invisible
+to the rules above. `--db-check` asks the live database directly:
+
+| ID | Name | Severity | What it means |
+| :--- | :--- | :--- | :--- |
+| `DB-01` | **Table Reachable With RLS Off** | Critical / High | A table in an exposed schema that an API role can read or write (table grant **and** schema `USAGE`) with row-level security disabled: every row goes to every caller. Critical when `anon` can reach it |
+| `DB-02` | **Policy Allowing Every Row** | Critical / High / Medium | A `PERMISSIVE` policy for an API role or `public` whose `USING` or `WITH CHECK` is `true`. A write (`INSERT`/`UPDATE`/`DELETE`/`ALL`) is Critical when `anon` or `public` holds it, else High. A `SELECT` is Medium: a public-read table is a legitimate pattern, so confirm it is meant to be public. `RESTRICTIVE` policies only narrow access and are not reported |
+| `DB-03` | **View Bypassing RLS** | High | A view or materialized view the API roles can read that runs with its owner's rights (no `security_invoker = true`), so RLS on the tables under it does not apply |
+
+How it stays safe:
+
+- **Read-only.** Every statement runs in a read-only transaction
+  (`default_transaction_read_only=on`) with a 30-second statement timeout. It reads
+  `pg_class`, `pg_roles` and `pg_policies` only — never a row of your data. A read-only role
+  is enough.
+- **The password never reaches argv, logs or reports.** The URL is split into libpq
+  environment variables for `psql`, and if an error message repeats the password or URL,
+  it is removed before the message is recorded.
+- **It fails closed.** No URL, a non-Postgres URL, no `psql`, an invalid schema or role
+  name, none of the API roles existing, or any query error is a `DB-00` coverage gap —
+  never *"no findings"*.
+- **Names are checked, not quoted.** `--db-schemas` and `--db-roles` accept plain
+  identifiers only; anything else is a `DB-00` gap and no query is sent.
+
+```bash
+export AEGIS_DATABASE_URL='postgresql://readonly_user:...@db.example.com:5432/postgres?sslmode=require'
+python3 scripts/aegis_scan.py . --db-check --idor-plan .aegis/idor-plan.md
+```
+
+`tests/sql/db_posture.sql` builds a database with one example of each rule plus the cases
+that must stay silent; `TestLiveDatabaseCheck` checks the exact result against a real
+PostgreSQL when `AEGIS_TEST_DATABASE_URL` points at it.
+
 ### B. UI/UX Design & Frontend QA Bug Finder
 
 **The element must match the behaviour.** If it performs an action it is a `<button>`; if it navigates it is an `<a>` with a real `href`. Get that right and the browser supplies focus, Tab order, Enter *and* Space, and the correct screen-reader role for free — no `role`, `tabIndex` or `onKeyDown` needed. These three rules are separated because each has a different fix.
@@ -464,7 +504,7 @@ Some rules have narrower sub-variants, reported with their own id so you can sup
 | `SEC-02B` | Permissive Firebase / Firestore rule (`allow read, write: if true`) |
 | `SEC-10B` | Auth token stored in `localStorage` rather than an HttpOnly cookie |
 | `SEC-17B` | `/.env` or `/.git/config` publicly reachable on the live server |
-| `DEP-00`, `LIVE-00`, `GIT-00`, `ART-00`, `ART-10`, `COV-00`, `ENG-00` | **Coverage gaps**, not defects — a check that could not run, or something it did not read. Any id ending `-00` is always a gap |
+| `DEP-00`, `LIVE-00`, `GIT-00`, `ART-00`, `ART-10`, `COV-00`, `ENG-00`, `DB-00` | **Coverage gaps**, not defects — a check that could not run, or something it did not read. Any id ending `-00` is always a gap |
 
 ### Secret Detection Precision
 
@@ -681,9 +721,32 @@ bash install.sh --target /tmp/test-app --agent all
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the rule-authoring guide and severity rubric.
 
+## 🔍 What a scan cannot prove
+
+A leaked key leaves a string you can grep for. Missing row-level security and IDOR do
+not: every response is a normal `200` with real data in it — just another user's. Nothing
+in the code or the logs looks wrong. Be clear about what each layer can and cannot see:
+
+| Question | Static scan | `--db-check` | Two-account test (`--idor-plan`) |
+| :--- | :--- | :--- | :--- |
+| Is RLS on for every table the API can reach? | Only for tables created in migrations it can read | **Yes**, for the live database | Confirms the impact |
+| Does a policy compare the row's owner with the caller? | Flags write policies with `true` (`SEC-02`) and roles read from `user_metadata` (`SEC-21`); cannot judge other expressions | Flags `true` in any permissive policy; cannot judge other expressions | **Yes** |
+| Does an API route scope its query to the signed-in user? | `SEC-04`, per file, heuristic — a check in a helper it cannot follow is missed, and a check it cannot recognise is reported | No | **Yes** |
+| Does a route that writes check who is calling? | `SEC-03`, per handler, Next.js only | No | **Yes** |
+
+So:
+
+1. **No finding is not proof.** `SEC-03`/`SEC-04` look for patterns; an access check
+   written differently, or a hole in code the scanner cannot follow, is not seen.
+2. **Run `--db-check` against the real database**, not only the migrations.
+3. **Run the two-account test before release.** `--idor-plan` writes it for you: create
+   accounts A and B on a staging deployment you control, create a record as A, then run
+   each generated request as B. Any answer other than `401`/`403`/`404` or an empty result
+   is a confirmed finding — and for a write, check as A that the record is unchanged.
+
 ## ⚖️ Responsible Use & Scope
 
-Vibe Aegis is a **defensive pre-deployment security and UI/UX quality assurance framework**. Its live URL posture checks (`--url`) perform strictly passive, read-only HTTP `GET` requests to inspect security headers and accidental file exposure. It sends no payloads and no credentials.
+Vibe Aegis is a **defensive pre-deployment security and UI/UX quality assurance framework**. Its live URL posture checks (`--url`) perform strictly passive, read-only HTTP `GET` requests to inspect security headers and accidental file exposure. It sends no payloads and no credentials. `--db-check` connects only to the database named in `AEGIS_DATABASE_URL`, in a read-only session, and reads only catalog tables. `--idor-plan` only writes a file: the requests in it are for you to run, against a deployment you own.
 
 **Only scan applications and deployments that you own or have explicit authorization to test.** See [`SECURITY.md`](SECURITY.md) for the full scope statement and vulnerability reporting process.
 
@@ -1495,7 +1558,7 @@ Findings arrive pre-sorted: severity first (CRITICAL to LOW), then domain, file,
         "rule_id": {
           "description": "Stable rule identifier. SEC/UX/LIVE are source and live-posture rules; PAY is payments and business logic; REL is backend reliability and scale; FLOW is data-flow (taint) analysis; DEP is dependency vulnerabilities; ART is build-artifact and mobile-package findings; HIST is git-history forensics; COV is something the scanner declined to read; ENG is an external engine that did not run. EXT-<ENGINE>:<id> is a finding imported from an external engine, keeping that engine's own rule id. A rule id ending in -00 is always a coverage gap, never a defect.",
           "type": "string",
-          "pattern": "^(?:(?:SEC|UX|LIVE|DEP|ART|HIST|GIT|FLOW|PAY|REL|COV|ENG)-[0-9]{2}[A-Z]?|EXT-[A-Z0-9-]+:.+)$"
+          "pattern": "^(?:(?:SEC|UX|LIVE|DEP|ART|HIST|GIT|FLOW|PAY|REL|COV|ENG|DB)-[0-9]{2}[A-Z]?|EXT-[A-Z0-9-]+:.+)$"
         },
         "domain": {
           "description": "COVERAGE marks something that was not examined, not a defect. EXTERNAL marks a finding imported from an installed third-party engine, which keeps that engine's own rule id behind an EXT-<ENGINE>: prefix.",

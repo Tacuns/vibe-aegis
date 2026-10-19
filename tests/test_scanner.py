@@ -1556,6 +1556,10 @@ REDACTION_EXEMPT = {
     "ART-14": "TestMobilePackageOutputIsRedacted",
     "ART-15": "TestMobilePackageOutputIsRedacted",
     "ART-00": "build-stage gaps - TestArtifactStageFailsClosed (incl. a canary bundle)",
+    "DB-00": "constant reason strings and redacted psql errors - TestLiveDatabaseCheck",
+    "DB-01": "catalog names only; the password never leaves the env - TestLiveDatabaseCheck",
+    "DB-02": "catalog names only - TestLiveDatabaseCheck",
+    "DB-03": "catalog names only - TestLiveDatabaseCheck",
 }
 
 
@@ -4381,6 +4385,8 @@ CORPUS_EXEMPT = {
     "ART-13": "TestManifestIsDecodedNotGrepped",              # needs a binary manifest
     "ART-14": "TestManifestIsDecodedNotGrepped",
     "ART-12": "TestCorpus", "ART-15": "TestCorpus",           # packages built in TestCorpus
+    "DB-00": "TestLiveDatabaseCheck", "DB-01": "TestLiveDatabaseCheck",   # need a live database
+    "DB-02": "TestLiveDatabaseCheck", "DB-03": "TestLiveDatabaseCheck",
 }
 
 
@@ -4655,3 +4661,218 @@ class TestEngineOutputMustBeAScanResult(unittest.TestCase):
                               ("scorecard", '{"checks": []}')):
             found, gap = self._run(name, "echo '%s'\n" % payload)
             self.assertIsNone(gap, (name, gap and gap.snippet))
+
+
+# ---------------------------------------------------------------------------
+# Live database posture and the two-account test plan
+# ---------------------------------------------------------------------------
+
+# Rows exactly as real PostgreSQL 16 returned them (psql -A -t -F <US>) for a database
+# with Supabase's anon/authenticated roles: an open table, a `using (true)` policy, an
+# owner-scoped policy, an insert `with check (true)`, a definer view and an invoker view.
+_PG_ROLES = "anon\nauthenticated\n"
+_PG_RELATIONS = "\n".join("\x1f".join(r) for r in [
+    ("public", "open_notes", "r", "f", "", "t", "t"),
+    ("public", "rls_ok", "r", "t", "", "f", "t"),
+    ("public", "rls_true", "r", "t", "", "t", "f"),
+    ("public", "v_definer", "v", "f", "", "t", "f"),
+    ("public", "v_invoker", "v", "f", "security_invoker=true", "t", "f")]) + "\n"
+_PG_POLICIES = "\n".join("\x1f".join(r) for r in [
+    ("public", "rls_true", "all", "anon", "SELECT", "true", "", "PERMISSIVE"),
+    ("public", "rls_ok", "pub_true", "public", "INSERT", "", "true", "PERMISSIVE"),
+    ("public", "rls_ok", "narrow", "anon", "SELECT", "true", "", "RESTRICTIVE"),
+    ("public", "rls_ok", "own", "authenticated", "SELECT", "(owner = auth.uid())", "", "PERMISSIVE")]) + "\n"
+
+
+@unittest.skipIf(os.name == "nt", "stand-in psql is a shell script")
+class TestLiveDatabaseCheck(unittest.TestCase):
+    """Missing RLS leaves no trace in code or logs; the live catalog shows it directly."""
+
+    URL = "postgresql://auditor:%s@db.example.internal:5432/app?sslmode=require" % CANARY_URL_PASS
+
+    def _run(self, url=URL, psql_body=None, schemas=("public",), roles=("anon", "authenticated")):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp)
+            log = bin_dir / "calls.log"
+            if psql_body is not False:
+                body = psql_body or (
+                    'echo "ARGV $*" >> %s\necho "ENV $PGHOST $PGUSER $PGPASSWORD $PGSSLMODE $PGOPTIONS '
+                    'HOSTADDR=$PGHOSTADDR" >> %s\n'
+                    'case "$*" in *pg_roles*) printf %%s "$ROLES";; *pg_class*) printf %%s "$RELS";;'
+                    ' *pg_policies*) printf %%s "$POLS";; esac\n' % (log, log))
+                tool = bin_dir / "psql"
+                tool.write_text("#!/bin/sh\n" + body)
+                tool.chmod(0o755)
+            saved = {k: os.environ.get(k) for k in ("PATH", "AEGIS_DATABASE_URL", "ROLES", "RELS", "POLS")}
+            os.environ.update({"ROLES": _PG_ROLES, "RELS": _PG_RELATIONS, "POLS": _PG_POLICIES,
+                               "PATH": str(bin_dir) + os.pathsep + ("" if psql_body is False else saved["PATH"] or "")})
+            if url is None:
+                os.environ.pop("AEGIS_DATABASE_URL", None)
+            else:
+                os.environ["AEGIS_DATABASE_URL"] = url
+            try:
+                found = aegis_scan.check_live_database(list(schemas), list(roles))
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+            calls = log.read_text() if log.exists() else ""
+        return found, calls
+
+    def test_each_exposure_is_reported_and_nothing_else(self):
+        found, _ = self._run()
+        self.assertEqual(sorted((f.rule_id, f.file, f.severity) for f in found), [
+            ("DB-01", "db:public.open_notes", "CRITICAL"),
+            ("DB-02", "db:public.rls_ok", "CRITICAL"),      # insert WITH CHECK (true) for public
+            ("DB-02", "db:public.rls_true", "MEDIUM"),      # select USING (true): may be meant public
+            ("DB-03", "db:public.v_definer", "HIGH")])      # v_invoker and the owner policy pass
+
+    def test_the_password_stays_in_the_environment(self):
+        found, calls = self._run()
+        argv = [ln for ln in calls.splitlines() if ln.startswith("ARGV")]
+        env = [ln for ln in calls.splitlines() if ln.startswith("ENV")]
+        self.assertTrue(argv and env)
+        self.assertFalse(any(CANARY_URL_PASS in ln for ln in argv), "password on the command line")
+        self.assertTrue(all("db.example.internal auditor %s require" % CANARY_URL_PASS in ln for ln in env))
+        self.assertEqual(leaked(finding_blob(found)), [])
+
+    def test_inherited_pg_settings_cannot_redirect_the_connection(self):
+        # libpq prefers PGHOSTADDR over PGHOST: an inherited one would query another server.
+        os.environ["PGHOSTADDR"] = "10.9.9.9"
+        try:
+            _found, calls = self._run()
+        finally:
+            os.environ.pop("PGHOSTADDR", None)
+        env = [ln for ln in calls.splitlines() if ln.startswith("ENV")]
+        self.assertTrue(env)
+        self.assertTrue(all(ln.endswith("HOSTADDR=") for ln in env), env)
+
+    def test_the_session_is_read_only(self):
+        _found, calls = self._run()
+        self.assertTrue(all("default_transaction_read_only=on" in ln
+                            for ln in calls.splitlines() if ln.startswith("ENV")))
+
+    def test_reach_needs_schema_usage_and_restrictive_policies_open_nothing(self):
+        # The catalog query must ask for schema USAGE as well as the table grant: a grant in
+        # a schema the role cannot enter is unusable (proven by test_against_a_real_database).
+        _found, calls = self._run()
+        pg_class = [ln for ln in calls.splitlines() if ln.startswith("ARGV") and "pg_class" in ln]
+        self.assertTrue(pg_class)
+        for role in ("anon", "authenticated"):
+            self.assertIn("has_schema_privilege('%s', n.oid, 'USAGE') and has_table_privilege('%s'"
+                          % (role, role), pg_class[0])
+        # The RESTRICTIVE `true` policy "narrow" in _PG_POLICIES is not reported.
+        found, _ = self._run()
+        self.assertFalse(any("narrow" in f.title for f in found))
+
+    def _gap(self, **kw):
+        found, _ = self._run(**kw)
+        self.assertEqual([f.rule_id for f in found], ["DB-00"])
+        self.assertTrue(aegis_scan._is_incomplete(found[0]))
+        return found[0].snippet
+
+    def test_every_failure_is_a_gap(self):
+        self.assertIn("AEGIS_DATABASE_URL is not set", self._gap(url=None))
+        self.assertIn("not a postgres:// URL", self._gap(url="mysql://u:p@h/db"))
+        self.assertIn("psql is not on PATH", self._gap(psql_body=False))
+        self.assertIn("could not be queried", self._gap(psql_body="echo 'FATAL: password authentication failed' >&2\nexit 2\n"))
+        self.assertIn("Invalid schema or role name", self._gap(roles=("anon; drop table x",)))
+        self.assertIn("None of the API roles", self._gap(psql_body="exit 0\n"))
+
+    def test_a_failure_message_never_carries_the_password(self):
+        found, _ = self._run(psql_body='echo "could not connect as $PGUSER:$PGPASSWORD" >&2\nexit 2\n')
+        self.assertEqual(leaked(finding_blob(found)), [])
+
+    def test_offline_never_contacts_the_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "a.ts", "export const x = 1;\n")
+            os.environ["AEGIS_DATABASE_URL"] = self.URL
+            try:
+                _code, _out = _run_main([tmp, "--db-check", "--offline", "--output", tmp + "/r.json"])
+            finally:
+                os.environ.pop("AEGIS_DATABASE_URL", None)
+            report = json.loads(Path(tmp, "r.json").read_text())
+        self.assertEqual([s["snippet"] for s in report["skipped_checks"] if s["rule_id"] == "DB-00"],
+                         ["--offline is set, so the database was not contacted."])
+
+    @unittest.skipUnless(os.environ.get("AEGIS_TEST_DATABASE_URL") and shutil.which("psql"),
+                         "set AEGIS_TEST_DATABASE_URL to a database built by tests/sql/db_posture.sql")
+    def test_against_a_real_database(self):
+        os.environ["AEGIS_DATABASE_URL"] = os.environ["AEGIS_TEST_DATABASE_URL"]
+        try:
+            found = aegis_scan.check_live_database(["public", "nousage"], ["anon", "authenticated"])
+        finally:
+            os.environ.pop("AEGIS_DATABASE_URL", None)
+        self.assertEqual(sorted((f.rule_id, f.file) for f in found), [
+            ("DB-01", "db:public.open_notes"), ("DB-02", "db:public.rls_ok"),
+            ("DB-02", "db:public.rls_true"), ("DB-03", "db:public.v_definer")])
+
+
+class TestTwoAccountTestPlan(unittest.TestCase):
+    """A scanner cannot prove ownership; --idor-plan writes the test that can."""
+
+    def _plan(self, files, findings_from_scan=True, extra=()):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel, body in files.items():
+                write(root, rel, body)
+            found, _ = aegis_scan.scan_repository(root)
+            found = list(found) + list(extra)
+            out = root / "plan.md"
+            n = aegis_scan.write_idor_plan(found, root, out)
+            return n, out.read_text()
+
+    ROUTE = ("export async function GET(req, { params }) {\n  const session = await auth();\n"
+             "  return Response.json(await db.order.findFirst({ where: { id: params.id } }));\n}\n")
+
+    def test_routes_are_derived_from_the_file_path(self):
+        self.assertEqual(aegis_scan._route_for("app/api/orders/[id]/route.ts"), "/api/orders/{id}")
+        self.assertEqual(aegis_scan._route_for("src/app/(shop)/api/carts/[cartId]/route.ts"), "/api/carts/{cartId}")
+        self.assertEqual(aegis_scan._route_for("pages/api/invoices/[invoiceId].ts"), "/api/invoices/{invoiceId}")
+        self.assertEqual(aegis_scan._route_for("pages/api/users/index.js"), "/api/users")
+        self.assertIsNone(aegis_scan._route_for("lib/db.ts"))
+
+    def test_an_idor_becomes_a_request_as_the_other_account(self):
+        n, plan = self._plan({"app/api/orders/[id]/route.ts": self.ROUTE})
+        self.assertEqual(n, 1)
+        self.assertIn('-X GET "$BASE_URL/api/orders/$A_ID" -H "Authorization: Bearer $TOKEN_B"', plan)
+        self.assertIn("must NOT return A's record", plan)
+
+    def test_a_write_policy_is_tested_by_writing(self):
+        f = aegis_scan.Finding("DB-02", "SECURITY", "CRITICAL",
+                               "Policy `p` On `public.notes` Allows Every Row (INSERT for public)",
+                               "db:public.notes", 0, "x", "CWE-639", "fix")
+        _n, plan = self._plan({}, extra=[f])
+        self.assertIn('-X POST "$BASE_URL/rest/v1/notes"', plan)
+        self.assertIn("$A_USER_ID", plan)
+        self.assertNotIn("?select=*", plan)
+
+    def test_every_command_is_valid_shell(self):
+        _n, plan = self._plan({"app/api/orders/[id]/route.ts": self.ROUTE})
+        script = "\n".join(ln for ln in re.findall(r"```bash\n(.*?)```", plan, re.S))
+        if shutil.which("bash"):
+            r = subprocess.run(["bash", "-n"], input=script, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_each_request_uses_its_own_handler_method(self):
+        delete = ("\nexport async function DELETE(req, { params }) {\n"
+                  "  await db.order.delete({ where: { id: params.id } });\n"
+                  "  return new Response(null, { status: 204 });\n}\n")
+        _n, plan = self._plan({"app/api/orders/[id]/route.ts": self.ROUTE + delete})
+        self.assertIn('-X GET "$BASE_URL/api/orders/$A_ID"', plan)       # the GET's SEC-04
+        self.assertIn('-X DELETE "$BASE_URL/api/orders/$A_ID"', plan)    # the DELETE's SEC-03/04
+        self.assertIn("check, as A, that the record is unchanged", plan)
+
+    def test_the_cli_writes_the_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "app/api/orders/[id]/route.ts", self.ROUTE)
+            out = Path(tmp, "reports", "nested", "plan.md")
+            _code, _out = _run_main([tmp, "--idor-plan", str(out), "--output", tmp + "/r.json"])
+            self.assertIn("$BASE_URL/api/orders/$A_ID", out.read_text())
+
+    def test_no_finding_still_says_no_finding_is_not_proof(self):
+        n, plan = self._plan({"src/a.ts": "export const x = 1;\n"})
+        self.assertEqual(n, 0)
+        self.assertIn("no finding is not proof", plan)

@@ -241,7 +241,7 @@
         "rule_id": {
           "description": "Stable rule identifier. SEC/UX/LIVE are source and live-posture rules; PAY is payments and business logic; REL is backend reliability and scale; FLOW is data-flow (taint) analysis; DEP is dependency vulnerabilities; ART is build-artifact and mobile-package findings; HIST is git-history forensics; COV is something the scanner declined to read; ENG is an external engine that did not run. EXT-<ENGINE>:<id> is a finding imported from an external engine, keeping that engine's own rule id. A rule id ending in -00 is always a coverage gap, never a defect.",
           "type": "string",
-          "pattern": "^(?:(?:SEC|UX|LIVE|DEP|ART|HIST|GIT|FLOW|PAY|REL|COV|ENG)-[0-9]{2}[A-Z]?|EXT-[A-Z0-9-]+:.+)$"
+          "pattern": "^(?:(?:SEC|UX|LIVE|DEP|ART|HIST|GIT|FLOW|PAY|REL|COV|ENG|DB)-[0-9]{2}[A-Z]?|EXT-[A-Z0-9-]+:.+)$"
         },
         "domain": {
           "description": "COVERAGE marks something that was not examined, not a defect. EXTERNAL marks a finding imported from an installed third-party engine, which keeps that engine's own rule id behind an EXT-<ENGINE>: prefix.",

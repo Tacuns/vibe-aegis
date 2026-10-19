@@ -1585,6 +1585,258 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
     return findings, scanned_files
 
 
+# ---------------------------------------------------------------------------
+# Live database posture (opt-in): what the database actually enforces
+# ---------------------------------------------------------------------------
+# Missing RLS and an IDOR leave no trace a pattern can find: every request is a normal
+# 200 with real rows - the wrong person's. Migrations in the repository show what was
+# INTENDED; a table changed in a dashboard, or never migrated, is invisible to them. This
+# stage asks the database itself, read-only, through `psql` (the scanner stays
+# dependency-free; without psql it is a coverage gap).
+#
+# The connection string is read from the environment, never from a flag, so it does not
+# land in shell history or the process list, and it is never printed.
+
+DB_URL_ENV = "AEGIS_DATABASE_URL"
+_SQL_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _db_gap(detail: str, remediation: str) -> "Finding":
+    return Finding(
+        rule_id="DB-00", domain="SECURITY", severity="LOW",
+        title="Live Database Check Could Not Run", file="(database)", line=0,
+        snippet=evidence(detail, 300), cwe_or_standard="Coverage",
+        remediation=remediation, confidence="HIGH", kind="skipped_check", status="SKIPPED")
+
+
+def _psql_env(url: str) -> Optional[Dict[str, str]]:
+    """libpq environment for `url`, so the password never appears in argv."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("postgres", "postgresql") or not parts.hostname:
+        return None
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
+    env.update({
+        "PGHOST": parts.hostname, "PGPORT": str(parts.port or 5432),
+        "PGUSER": urllib.parse.unquote(parts.username or ""),
+        "PGPASSWORD": urllib.parse.unquote(parts.password or ""),
+        "PGDATABASE": urllib.parse.unquote(parts.path.lstrip("/") or "postgres"),
+        "PGCONNECT_TIMEOUT": "10", "PGAPPNAME": "vibe-aegis-readonly",
+        # Every statement in a read-only transaction: this stage cannot write.
+        "PGOPTIONS": "-c default_transaction_read_only=on -c statement_timeout=30000",
+    })
+    query = dict(urllib.parse.parse_qsl(parts.query))
+    if query.get("sslmode"):
+        env["PGSSLMODE"] = query["sslmode"]
+    return env
+
+
+def _psql_rows(env: Dict[str, str], sql: str) -> List[List[str]]:
+    import subprocess
+    proc = subprocess.run(["psql", "-X", "-q", "-A", "-t", "-F", "\x1f", "-v", "ON_ERROR_STOP=1",
+                           "-c", sql], capture_output=True, text=True, env=env, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f"psql exited {proc.returncode}")
+    return [ln.split("\x1f") for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def check_live_database(schemas: List[str], roles: List[str]) -> List["Finding"]:
+    """DB-01..03 from the live catalog. Read-only; opt-in via --db-check."""
+    import shutil
+    url = os.environ.get(DB_URL_ENV, "")
+    if not url:
+        return [_db_gap(f"--db-check was given but {DB_URL_ENV} is not set.",
+                        f"Export {DB_URL_ENV}=postgres://user:password@host:5432/db (a read-only "
+                        "role is enough) and re-run.")]
+    env = _psql_env(url)
+    if env is None:
+        return [_db_gap(f"{DB_URL_ENV} is not a postgres:// URL.",
+                        "Use the connection string from your database settings.")]
+    if not shutil.which("psql"):
+        return [_db_gap("psql is not on PATH, so the database was not queried.",
+                        "Install the PostgreSQL client (psql) and re-run. Vibe Aegis never "
+                        "installs tools for you.")]
+    bad = [x for x in schemas + roles if not _SQL_IDENT.match(x)]
+    if bad:
+        return [_db_gap("Invalid schema or role name: " + ", ".join(bad), "Use plain identifiers.")]
+    schema_arr = "array[" + ",".join("'%s'" % x for x in schemas) + "]::name[]"
+    try:
+        present = [r[0] for r in _psql_rows(env, "select rolname from pg_roles where rolname = any("
+                                            "array[" + ",".join("'%s'" % x for x in roles) + "]::name[])")]
+        if not present:
+            return [_db_gap("None of the API roles (" + ", ".join(roles) + ") exist in this "
+                            "database, so which tables the API exposes cannot be judged.",
+                            "Pass the roles your API connects as with --db-roles.")]
+        # A table grant is unusable without USAGE on its schema.
+        reach_sql = ("(has_schema_privilege('%s', n.oid, 'USAGE') and "
+                     "has_table_privilege('%s', c.oid, 'SELECT,INSERT,UPDATE,DELETE'))")
+        priv = " or ".join(reach_sql % (r, r) for r in present)
+        per_role = ", ".join(reach_sql % (r, r) for r in present)
+        relations = _psql_rows(env,
+            "select n.nspname, c.relname, c.relkind, c.relrowsecurity, "
+            "coalesce(array_to_string(c.reloptions, ','), ''), " + per_role + " "
+            "from pg_class c join pg_namespace n on n.oid = c.relnamespace "
+            "where c.relkind in ('r','p','v','m') and n.nspname = any(" + schema_arr + ") "
+            "and (" + priv + ") order by 1, 2")
+        policies = _psql_rows(env,
+            "select schemaname, tablename, policyname, array_to_string(roles, ','), cmd, "
+            "coalesce(qual, ''), coalesce(with_check, ''), permissive from pg_policies "
+            "where schemaname = any(" + schema_arr + ") order by 1, 2, 3")
+    except Exception as exc:
+        # The password is short and low-entropy more often than not, so pattern masking
+        # cannot be trusted to catch it: remove the exact value (and the URL) first.
+        message = str(exc)
+        for secret in (url, env.get("PGPASSWORD", ""), urllib.parse.quote(env.get("PGPASSWORD", ""))):
+            if secret:
+                message = message.replace(secret, "[REDACTED]")
+        return [_db_gap("The database could not be queried: " + message[:200],
+                        "Check the connection string, network access and that the role can read "
+                        "pg_catalog.")]
+
+    findings: List[Finding] = []
+    for row in relations:
+        schema, name, kind, rls, options = row[:5]
+        reach = [r for r, ok in zip(present, row[5:]) if ok == "t"]
+        where = f"db:{schema}.{name}"
+        who = " and ".join(reach)
+        anon_reach = any(r in ("anon", "public") for r in reach)
+        if kind in ("r", "p") and rls != "t":
+            findings.append(Finding(
+                rule_id="DB-01", domain="SECURITY", severity="CRITICAL" if anon_reach else "HIGH",
+                title=f"Table `{schema}.{name}` Is Reachable By {who} With Row-Level Security Off",
+                file=where, line=0,
+                snippet=evidence(f"relrowsecurity = false, and {who} hold privileges on it: every "
+                                 "row is returned to any caller with that role.", 300),
+                cwe_or_standard="CWE-284 Improper Access Control / Supabase RLS",
+                remediation=(f"ALTER TABLE {schema}.{name} ENABLE ROW LEVEL SECURITY; then add a "
+                             "policy that compares the row's owner with auth.uid(). With RLS on and "
+                             "no policy, nobody can read it - safe while you write the policy."),
+                confidence="HIGH"))
+        elif kind in ("v", "m") and "security_invoker=true" not in options.replace(" ", "").lower() \
+                and "security_invoker=on" not in options.replace(" ", "").lower():
+            findings.append(Finding(
+                rule_id="DB-03", domain="SECURITY", severity="HIGH",
+                title=(f"{'Materialized View' if kind == 'm' else 'View'} `{schema}.{name}` "
+                       f"Bypasses Row-Level Security For {who}"),
+                file=where, line=0,
+                snippet=evidence("The view runs with its owner's rights (no security_invoker), so "
+                                 f"RLS on the tables under it is not applied to {who}.", 300),
+                cwe_or_standard="CWE-284 Improper Access Control / Supabase RLS",
+                remediation=(f"ALTER VIEW {schema}.{name} SET (security_invoker = true) on Postgres "
+                             "15+, or revoke SELECT from the API roles and move it out of the "
+                             "exposed schema."),
+                confidence="HIGH"))
+    api_roles = set(present) | {"public"}
+    for schema, table, policy, roles_txt, cmd, qual, check, permissive in policies:
+        targets = sorted(set(roles_txt.split(",")) & api_roles)
+        # A RESTRICTIVE policy can only narrow access, so `true` there opens nothing.
+        if not targets or permissive != "PERMISSIVE" or "true" not in (qual.strip(), check.strip()):
+            continue
+        open_to_anon = any(r in ("anon", "public") for r in targets)
+        # A public-read table (`FOR SELECT USING (true)`) is a legitimate pattern, which is why
+        # SEC-02 skips it in migrations; report it, but as something to confirm, not an attack.
+        read_only = cmd == "SELECT"
+        severity = "MEDIUM" if read_only else "CRITICAL" if open_to_anon else "HIGH"
+        findings.append(Finding(
+            rule_id="DB-02", domain="SECURITY", severity=severity,
+            title=f"Policy `{policy}` On `{schema}.{table}` Allows Every Row ({cmd} for {', '.join(targets)})",
+            file=f"db:{schema}.{table}", line=0,
+            snippet=evidence(f"USING/WITH CHECK is `true`: any {', '.join(targets)} caller gets "
+                             f"{cmd} on every row, not just their own.", 300),
+            cwe_or_standard="CWE-639 Authorization Bypass Through User-Controlled Key / OWASP A01",
+            remediation=(("If every row of this table is meant to be public, suppress this "
+                          "finding. Otherwise scope the policy to the caller, e.g. "
+                          "USING (owner_id = auth.uid())." if read_only else
+                          "Scope the policy to the caller, e.g. USING (owner_id = auth.uid()) "
+                          "WITH CHECK (owner_id = auth.uid()). `true` lets any caller with this "
+                          "role write rows that are not theirs.")),
+            confidence="HIGH"))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Two-account test plan (--idor-plan): the check a scanner cannot do for you
+# ---------------------------------------------------------------------------
+
+def _route_for(rel_path: str) -> Optional[str]:
+    m = re.match(r"^(?:src/)?app/(.+)/route\.[jt]sx?$", rel_path)
+    if m:
+        path = "/" + m.group(1)
+    else:
+        m = re.match(r"^(?:src/)?pages/(api/.+)\.[jt]sx?$", rel_path)
+        if not m:
+            return None
+        path = "/" + re.sub(r"/index$", "", m.group(1))
+    path = re.sub(r"/\([^/]+\)", "", path)                       # route groups
+    return re.sub(r"\[\.{0,3}([^\]]+)\]", r"{\1}", path)
+
+
+def write_idor_plan(findings: List["Finding"], root: Path, out: Path) -> int:
+    """A manual two-account test for every place an IDOR or missing check was flagged.
+    Written as a file; nothing is sent anywhere."""
+    targets = [f for f in findings if f.rule_id in ("SEC-03", "SEC-04", "DB-01", "DB-02", "DB-03")]
+    lines = ["# Two-account access test", "",
+             "A static scan cannot prove ownership is enforced: an IDOR returns a normal `200` with "
+             "someone else's data. Run each check below with two real accounts on a staging "
+             "deployment you control.", "",
+             "1. Create account **A** and account **B**. Sign in as each and copy its session token "
+             "or cookie into `TOKEN_A` / `TOKEN_B`.",
+             "2. As **A**, create one record of each kind below and note its id as `A_ID`.",
+             "3. Run each request as **B**. Anything but `401`/`403`/`404` (or an empty result) "
+             "is a confirmed finding.", "",
+             "```bash", "export BASE_URL=https://staging.example.com  # your own deployment",
+             "export TOKEN_A=... TOKEN_B=... A_ID=...", "export A_USER_ID=...   # A's user id",
+             "export ANON_KEY=...    # Supabase/PostgREST only: the public anon key", "```", ""]
+    if not targets:
+        lines += ["No SEC-03, SEC-04 or DB-0x finding to test. Run the test above on your most "
+                  "sensitive record type anyway: no finding is not proof."]
+    for i, f in enumerate(targets, 1):
+        lines += [f"## {i}. {f.rule_id} - {f.title}", "", f"Source: `{f.file}`" +
+                  (f" line {f.line}" if f.line else ""), ""]
+        route = _route_for(f.file) if not f.file.startswith("db:") else None
+        if route:
+            method = "GET"
+            try:
+                text = (root / f.file).read_text(encoding="utf-8", errors="ignore").splitlines()
+                for ln in reversed(text[:max(f.line, 1)]):
+                    m = re.search(r"\b(GET|POST|PUT|PATCH|DELETE)\b", ln)
+                    if m and "export" in ln:
+                        method = m.group(1)
+                        break
+            except OSError:
+                pass
+            url = "$BASE_URL" + re.sub(r"\{[^}]+\}", "$A_ID", route)
+            body = "" if method == "GET" else " -H 'Content-Type: application/json' -d \"{\\\"id\\\": \\\"$A_ID\\\"}\""
+            expect = ("# as B: must NOT return A's record" if method == "GET" else
+                      "# as B: must be refused - then check, as A, that the record is unchanged")
+            lines += ["```bash", expect,
+                      f"curl -s -o /dev/null -w '%{{http_code}}\\n' -X {method} \"{url}\" "
+                      f"-H \"Authorization: Bearer $TOKEN_B\"{body}", "```", ""]
+        elif f.file.startswith("db:"):
+            table = f.file[3:].split(".", 1)[-1]
+            api = f"\"$BASE_URL/rest/v1/{table}"
+            auth_h = " -H \"apikey: $ANON_KEY\" -H \"Authorization: Bearer $TOKEN_B\""
+            write = re.search(r"\((INSERT|UPDATE|DELETE|ALL) for", f.title)
+            if write and write.group(1) in ("INSERT", "ALL"):
+                lines += ["```bash", "# as B: try to create a row OWNED BY A (replace owner_id with the",
+                          "# table's owner column). Anything but 401/403 is a confirmed finding.",
+                          f"curl -s -o /dev/null -w '%{{http_code}}\\n' -X POST {api}\"{auth_h} "
+                          "-H 'Content-Type: application/json' -d \"{\\\"owner_id\\\": \\\"$A_USER_ID\\\"}\"",
+                          "```", ""]
+            if write and write.group(1) in ("UPDATE", "DELETE", "ALL"):
+                verb = "PATCH" if write.group(1) != "DELETE" else "DELETE"
+                lines += ["```bash", f"# as B: {verb} A's row must be refused; check as A it is unchanged",
+                          f"curl -s -X {verb} {api}?id=eq.$A_ID\"{auth_h}"
+                          + (" -H 'Content-Type: application/json' -d '{}'" if verb == "PATCH" else ""),
+                          "```", ""]
+            if not write or write.group(1) == "ALL":
+                lines += ["```bash", "# as B: must return only B's rows, never A's",
+                          f"curl -s {api}?select=*\"{auth_h}", "```", ""]
+        else:
+            lines += ["Find the endpoint that reaches this code and request A's record as B.", ""]
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return len(targets)
+
+
 def check_live_url_posture(target_url: str) -> List[Finding]:
     """
     Passive, read-only HTTP posture check for a live or local deployment URL.
@@ -4714,6 +4966,16 @@ def main() -> int:
     deep.add_argument("--all", action="store_true",
                       help="Enable every deep stage: artifacts, git history and dependencies")
     deep.add_argument("--offline", action="store_true", help="Never make a network request")
+    deep.add_argument("--db-check", action="store_true",
+                      help="Read-only check of the LIVE database: tables the API roles can reach with "
+                           "RLS off, `true` policies, views that bypass RLS. Needs psql and "
+                           "AEGIS_DATABASE_URL in the environment (never passed as a flag)")
+    deep.add_argument("--db-schemas", default="public", metavar="LIST",
+                      help="Comma-separated schemas the API exposes (default: public)")
+    deep.add_argument("--db-roles", default="anon,authenticated", metavar="LIST",
+                      help="Comma-separated roles the API connects as (default: anon,authenticated)")
+    out.add_argument("--idor-plan", metavar="PATH",
+                     help="Write a two-account manual test for every IDOR / access-control finding")
 
     args = parser.parse_args()
 
@@ -4844,6 +5106,16 @@ def main() -> int:
         findings.extend(eng_findings)
         if eng_gap is not None:
             findings.append(eng_gap)
+
+    if args.db_check:
+        stages.append("database")
+        if args.offline:
+            findings.append(_db_gap("--offline is set, so the database was not contacted.",
+                                    "Re-run without --offline to include the live database check."))
+        else:
+            findings.extend(check_live_database(
+                [x.strip() for x in args.db_schemas.split(",") if x.strip()],
+                [x.strip() for x in args.db_roles.split(",") if x.strip()]))
 
     if args.url and not args.offline:
         stages.append("live-url")
@@ -4996,6 +5268,11 @@ def main() -> int:
         sarif_path.parent.mkdir(parents=True, exist_ok=True)
         sarif_path.write_text(json.dumps(build_sarif(findings, root), indent=2), encoding="utf-8")
 
+    if args.idor_plan:
+        plan_path = Path(args.idor_plan)
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        write_idor_plan(findings, root, plan_path)
+
     if args.sbom:
         sbom_path = Path(args.sbom)
         sbom_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5058,7 +5335,7 @@ def main() -> int:
                 print(f"      {sc.snippet}")
                 print(f"      {sc.remediation}")
             print()
-        written = [p for p in (args.output, args.sarif, args.sbom) if p]
+        written = [p for p in (args.output, args.sarif, args.sbom, args.idor_plan) if p]
         if written:
             print("Reports written : " + ", ".join(written))
         print("=" * 76)
