@@ -2700,6 +2700,9 @@ class TestTruffleHogAdapter(unittest.TestCase):
         f = found[0]
         self.assertEqual((f.rule_id, f.file, f.line), ("EXT-TRUFFLEHOG:Github", "k.py", 2))
         self.assertIn("sk_live_...[REDACTED", f.snippet)
+        # Exactly the length of Raw: RawV2 appends more data, and redaction must not be
+        # the only thing keeping it out of the report.
+        self.assertIn("[REDACTED %d chars]" % len(CANARY_STRIPE), f.snippet)
         self.assertIn("commit 97b8e68b4c", f.snippet)
         self.assertEqual(leaked(finding_blob(found)), [], "RawV2 / ExtraData / email leaked")
 
@@ -2782,6 +2785,10 @@ class TestTrivySecretsAreImported(unittest.TestCase):
         self.assertEqual([(f.rule_id, f.severity, f.file, f.line) for f in found],
                          [("EXT-TRIVY:github-pat", "CRITICAL", "k.py", 1)])
         self.assertEqual(leaked(finding_blob(found)), [])
+        # Code is never read at all - masking must not be the only thing keeping it out.
+        blob = finding_blob(found)
+        self.assertNotIn("postgres", blob)
+        self.assertNotIn("other =", blob)
 
     def test_an_unmasked_match_is_still_redacted(self):
         found = aegis_scan.parse_trivy({"Results": [{"Target": "a.js", "Secrets": [{
