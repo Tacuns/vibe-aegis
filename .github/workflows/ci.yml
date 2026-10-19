@@ -166,27 +166,41 @@ jobs:
           sys.path.insert(0, "scripts")
           import aegis_scan as a
 
+          # Assert against the module's own constants, never a literal verdict string.
+          # Checks 2 and 3 used to read `!= "READY TO PUBLISH"`. When that string was
+          # retired they became VACUOUSLY TRUE and stopped guarding anything - they
+          # would have passed even with the contract completely broken. A guard that
+          # cannot fail is not a guard.
+          PASS = a.VERDICT_STATIC_OK
+          GAP = a.VERDICT_INCOMPLETE
+
           # 1. An empty directory must never certify.
           with tempfile.TemporaryDirectory() as t:
               f, n = a.scan_repository(Path(t))
           score, verdict = a.compute_readiness_score(f, scanned_files=n)
-          assert n == 0 and score == 0 and verdict.startswith("INCOMPLETE_SCAN"), verdict
+          assert n == 0 and score == 0 and verdict.startswith(GAP), verdict
 
           # 2. The reported isolation call must never certify.
           f = a.check_dependency_vulnerabilities([("PyPI", "Django", "2.2.0")], offline=True)
-          assert a.compute_readiness_score(f)[1] != "READY TO PUBLISH"
+          verdict = a.compute_readiness_score(f)[1]
+          assert verdict.startswith(GAP), verdict
 
           # 3. A hand-built -00 with no markers must never certify.
           bare = a.Finding("DEP-00", "SUPPLY_CHAIN", "LOW", "Skipped", "deps", 0,
                            "x", "Informational", "re-run")
-          assert a.compute_readiness_score([bare])[1] != "READY TO PUBLISH"
+          verdict = a.compute_readiness_score([bare])[1]
+          assert verdict.startswith(GAP), verdict
 
           # 4. A genuinely clean repo must still pass, or the gate is useless.
           with tempfile.TemporaryDirectory() as t:
-              (Path(t) / "ok.js").write_text("export const add=(a,b)=>a+b;\n", encoding="utf-8")
+              (Path(t) / "ok.js").write_text("export const add=(a,b)=>a+b;", encoding="utf-8")
               f, n = a.scan_repository(Path(t))
-          assert a.compute_readiness_score(f, scanned_files=n) == (100, "READY TO PUBLISH")
-          print("Fail-closed contract holds on all four paths.")
+          score, verdict = a.compute_readiness_score(f, scanned_files=n)
+          assert score == 100 and verdict.startswith(PASS), verdict
+
+          # 5. A static scan must never claim RELEASE readiness.
+          assert a.VERDICT_RELEASE_OK not in verdict, verdict
+          print("Fail-closed contract holds on all five paths.")
           PY
 
       - name: Verify the installer is idempotent
