@@ -64,6 +64,39 @@ simply replaced. A project's own config files are now never modified (our versio
 an update, the summary lists what was kept, and a re-run with nothing changed touches
 nothing. The same applies to `--global`.
 
+### Fixed - secret detection and sensitive data (checklist A)
+
+Each issue was reproduced against this branch before it was changed, and each fix has a
+regression test that fails on the previous code.
+
+- **Production code was treated as test code (HIGH).** `is_test_context()` matched the
+  substrings `test`, `spec` and `mock`, so `src/latest/`, `inspector/`, `contest/` and
+  `hammock.js` were "tests": their provider keys were downgraded to `MEDIUM` - passing
+  `--fail-on-high` - and data-flow analysis was switched off for the file. It now
+  matches whole path segments and file-naming conventions, and a provider-format key is
+  never downgraded for its path at all.
+- **A second credential on a line was lost (HIGH).** Each provider pattern stopped at
+  its first match, and dedupe keyed `SEC-01*` on file and line, so the second key on a
+  line was never reported. Every match is found, and credentials are deduplicated by the
+  exact value (held in memory, never in the report), so rules describing one credential
+  still collapse into one finding.
+- **`SEC-01C` searched `.gitignore` for the text `.env` (HIGH).** A comment, or a lone
+  `.env.example` line, silenced it; a later `!.env` was ignored; and a `.env` already
+  committed was never reported. Inside a git work tree the scanner now asks git
+  (`git ls-files`, `git check-ignore`) and reports a committed file as committed. Without
+  git, the root `.gitignore` is evaluated by git's documented rules at `MEDIUM`
+  confidence; a differential test checks the two agree on every one- and two-rule
+  combination of the patterns it uses.
+- **Skipped mobile package entries left the package looking clean (MEDIUM).** The
+  credential sweep stopped after 400 entries and skipped entries over 40 MB, or that
+  failed to decompress, with no record. Each is now an `ART-00` coverage gap.
+- **Token-bearing URLs reached the report (MEDIUM).** `display_url()` removed only
+  `user:password@`, so `?token=`, `&sig=`, an OAuth `#access_token=` fragment and a
+  capability token in the path reached `live_url`, titles and file fields verbatim.
+  Every query value and the fragment are now replaced, and a path segment that is a
+  recognisable key or looks random is redacted; parameter names, host and ordinary path
+  segments are kept. The live-URL failure message is passed through the same filter.
+
 ### Changed - GitHub Actions are pinned to commit SHAs
 
 This repository's CI and the workflow shipped in `adapters/github-actions/` used movable

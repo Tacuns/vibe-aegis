@@ -442,7 +442,7 @@ Some rules have narrower sub-variants, reported with their own id so you can sup
 | ID | Covers |
 | :--- | :--- |
 | `SEC-01B` | Secret-named value exposed through a client-bundled env prefix |
-| `SEC-01C` | `.env` present in the project root but not in `.gitignore` |
+| `SEC-01C` | An environment file (`.env`, `.env.local`, ...) anywhere in the project that is committed to git, or that git would commit - asked of git itself (`git ls-files`, `git check-ignore`); templates such as `.env.example` are exempt |
 | `SEC-02B` | Permissive Firebase / Firestore rule (`allow read, write: if true`) |
 | `SEC-10B` | Auth token stored in `localStorage` rather than an HttpOnly cookie |
 | `SEC-17B` | `/.env` or `/.git/config` publicly reachable on the live server |

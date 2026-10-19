@@ -1128,6 +1128,140 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
     return findings
 
 
+_ENV_FILE = re.compile(r"^\.env(?:\.[A-Za-z0-9_-]+)?$")
+_ENV_TEMPLATE = re.compile(r"\.(?:example|sample|template|dist)$")
+
+
+def _gitignore_regex(pat: str) -> "re.Pattern":
+    """A gitignore glob as a regex: `*` and `?` never cross `/`; a leading `**/`, an
+    inner `/**/` and a trailing `/**` match zero or more directories."""
+    out, i = "", 0
+    while i < len(pat):
+        if pat.startswith("**/", i) and i == 0:
+            out, i = out + "(?:.*/)?", i + 3
+        elif pat.startswith("/**/", i):
+            out, i = out + "/(?:.*/)?", i + 4
+        elif pat.startswith("/**", i) and i + 3 == len(pat):
+            out, i = out + "/.*", i + 3
+        elif pat[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif pat[i] == "?":
+            out, i = out + "[^/]", i + 1
+        elif pat[i] == "[":
+            j = pat.find("]", i + 1)
+            if j < 0:
+                out, i = out + re.escape(pat[i]), i + 1
+            else:
+                body = pat[i + 1:j]
+                out, i = out + "[" + ("^" + body[1:] if body.startswith("!") else body) + "]", j + 1
+        else:
+            out, i = out + re.escape(pat[i]), i + 1
+    return re.compile(out + r"\Z")
+
+
+def _gitignore_says_ignored(root: Path, rel: str) -> Optional[bool]:
+    """Approximate the root .gitignore for one file path, following git's documented
+    rules (https://git-scm.com/docs/gitignore): blank lines and `#` comments are
+    skipped, `!` negates, a leading `/` anchors, a trailing `/` matches directories
+    only, a pattern without `/` matches any path component, the last match wins.
+    Only used when git itself is unavailable; None when there is no .gitignore.
+    """
+    gi = root / ".gitignore"
+    if not gi.is_file():
+        return None
+    rules = []
+    for raw in gi.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.rstrip()
+        if not line or line.startswith("#"):
+            continue
+        negate = line.startswith("!")
+        pat = line[1:] if negate else line
+        dir_only = pat.endswith("/")
+        pat = pat.rstrip("/")
+        anchored = pat.startswith("/") or "/" in pat
+        rules.append((negate, dir_only, anchored, _gitignore_regex(pat.lstrip("/"))))
+
+    def ignored(parts: List[str], is_dir: bool) -> bool:
+        result = False
+        for negate, dir_only, anchored, rx in rules:
+            if dir_only and not is_dir:
+                continue
+            hit = rx.match("/".join(parts)) if anchored else rx.match(parts[-1])
+            if hit:
+                result = not negate
+        return result
+
+    parts = rel.split("/")
+    # "It is not possible to re-include a file if a parent directory of that file is
+    # excluded" - so an excluded parent decides, whatever a later `!` says.
+    for i in range(1, len(parts)):
+        if ignored(parts[:i], True):
+            return True
+    return ignored(parts, False)
+
+
+def check_env_files(root: Path) -> List[Finding]:
+    """SEC-01C: an environment file that git would commit, or already has.
+
+    This used to search .gitignore for the substring ".env", so a comment ("never
+    commit .env") or a lone `.env.example` line silenced it, and a `.env` already
+    committed to the repository was never reported. Inside a git work tree, git itself
+    answers both questions; elsewhere the root .gitignore is evaluated by git's
+    documented rules, at MEDIUM confidence.
+    """
+    env_files: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        for name in filenames:
+            if _ENV_FILE.match(name) and not _ENV_TEMPLATE.search(name):
+                env_files.append((Path(dirpath) / name).relative_to(root).as_posix())
+    if not env_files:
+        return []
+
+    import subprocess
+
+    def git(*args: str) -> Optional[int]:
+        try:
+            return subprocess.run(["git", "-C", str(root), *args], capture_output=True,
+                                  timeout=30, shell=False).returncode
+        except Exception:
+            return None
+
+    in_git = git("rev-parse", "--is-inside-work-tree") == 0
+    findings: List[Finding] = []
+    for rel in sorted(env_files):
+        if in_git:
+            tracked = git("ls-files", "--error-unmatch", "--", rel) == 0
+            # check-ignore: 0 ignored, 1 not ignored, anything else an error.
+            status = None if tracked else git("check-ignore", "-q", "--", rel)
+            if not tracked and status not in (0, 1):
+                continue
+            exposed, confidence = tracked or status == 1, "HIGH"
+        else:
+            verdict = _gitignore_says_ignored(root, rel)
+            tracked, exposed, confidence = False, not verdict, "MEDIUM"
+        if not exposed:
+            continue
+        findings.append(Finding(
+            rule_id="SEC-01C", domain="SECURITY", severity="CRITICAL",
+            title=(f"Environment File `{rel}` Is Committed To Git" if tracked else
+                   f"Environment File `{rel}` Is Not Ignored By Git"),
+            file=rel, line=1,
+            snippet=evidence(f"{rel} is tracked in the repository - every value in it is in the "
+                             "history." if tracked else
+                             f"{rel} is not matched by any ignore rule, so the next `git add .` "
+                             "commits it.", 300),
+            cwe_or_standard="CWE-540 Inclusion of Sensitive Information in Source Code / OWASP A05",
+            remediation=(f"Run `git rm --cached {rel}`, add it to .gitignore, and rotate every "
+                         "secret it contains: removing the file does not remove it from history."
+                         if tracked else
+                         f"Add `{rel}` (or `.env*`, with `!.env.example` if you keep a template) "
+                         "to .gitignore."),
+            confidence=confidence,
+        ))
+    return findings
+
+
 def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
                     include_tests: bool = False,
                     ledger: Optional[CoverageLedger] = None,
@@ -1136,25 +1270,7 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
     scanned_files = 0
     ledger = ledger if ledger is not None else CoverageLedger()
 
-    # Check if .env is tracked or missing from .gitignore
-    gitignore_path = root / ".gitignore"
-    env_path = root / ".env"
-    if env_path.exists():
-        gitignore_txt = gitignore_path.read_text(encoding="utf-8", errors="ignore") if gitignore_path.exists() else ""
-        if ".env" not in gitignore_txt:
-            findings.append(
-                Finding(
-                    rule_id="SEC-01C",
-                    domain="SECURITY",
-                    severity="CRITICAL",
-                    title="`.env` File Present in Project Root Without `.env` Entry in `.gitignore`",
-                    file=".gitignore" if gitignore_path.exists() else ".env",
-                    line=1,
-                    snippet=".env is not ignored by Git and risks being committed to version control.",
-                    cwe_or_standard="CWE-540 / OWASP A05",
-                    remediation="Add `.env`, `.env.local`, and `.env.*` to `.gitignore` and run `git rm --cached .env` if already staged.",
-                )
-            )
+    findings.extend(check_env_files(root))
 
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
@@ -1313,7 +1429,8 @@ def check_live_url_posture(target_url: str) -> List[Finding]:
                 title=f"Could Not Reach Live URL ({shown_url})",
                 file=shown_url,
                 line=0,
-                snippet=evidence(str(exc)),
+                # An exception message can quote the URL it failed on.
+                snippet=evidence(str(exc).replace(target_url, shown_url)),
                 cwe_or_standard="Live Deployment Check",
                 remediation="Verify the local or staging server is running before executing `--url` posture checks.",
                 kind="skipped_check",
@@ -1585,12 +1702,43 @@ def looks_like_placeholder(value: str) -> bool:
     return False
 
 
+_TEST_CONTEXT_SEGMENTS = {
+    "test", "tests", "__tests__", "spec", "specs", "__mocks__", "mocks", "mock", "fixture",
+    "fixtures", "testdata", "e2e", "cypress", "playwright", "__snapshots__",
+    "example", "examples", "sample", "samples",
+}
+_EXAMPLE_FILE = re.compile(r"\.(?:example|sample|template|dist)$|^\.env\.(?:example|sample|template|dist)$")
+
+
 def is_test_context(rel_path: str) -> bool:
-    low = rel_path.lower()
-    return any(
-        marker in low
-        for marker in ("test", "spec", "fixture", "mock", "__snapshots__", "example", ".env.example", "sample")
-    )
+    """Is this a test, fixture or example file? Decided by whole path segments and
+    file-naming conventions, never by substring.
+
+    A substring match on "test", "spec" or "mock" made `src/latest/`, `inspector/`,
+    `contest/` and `hammock.js` "test code": their credentials were downgraded to MEDIUM
+    (passing --fail-on-high) and data-flow analysis was switched off for the file.
+    """
+    if is_test_path(rel_path):
+        return True
+    parts = rel_path.replace("\\", "/").lower().split("/")
+    return any(seg in _TEST_CONTEXT_SEGMENTS for seg in parts[:-1]) or bool(_EXAMPLE_FILE.search(parts[-1]))
+
+
+def _provider_finding(label: str, severity: str, rel_path: str, idx: int, value: str,
+                      origin: str) -> "Finding":
+    # A provider-format key keeps its severity wherever it lives. Real keys get committed
+    # in tests too, and documentation placeholders are rejected before this point by
+    # looks_like_placeholder() - so the path is no reason to call one MEDIUM.
+    return _vault_secret(label, value, Finding(
+        rule_id="SEC-01", domain="SECURITY", severity=severity,
+        title=f"{label} Found In {origin.title()} ({rel_path})",
+        file=rel_path, line=idx, snippet=redact(value),
+        cwe_or_standard="CWE-798 Hard-Coded Credentials / OWASP A07",
+        remediation=(f"Revoke and rotate this {label} immediately - it must be assumed "
+                     "compromised. Move it to a server-only environment variable and never "
+                     "expose it to a client bundle."),
+        confidence="HIGH",
+    ))
 
 
 def scan_secrets_in_text(rel_path: str, text: str, origin: str = "source",
@@ -1599,7 +1747,7 @@ def scan_secrets_in_text(rel_path: str, text: str, origin: str = "source",
     findings: List[Finding] = []
     lines = text.splitlines()
     testish = is_test_context(rel_path)
-    seen: Set[Tuple[str, int]] = set()
+    seen: Set[Tuple] = set()
 
     for idx, line in enumerate(lines, 1):
         if len(line) > LONG_LINE_LIMIT:
@@ -1608,24 +1756,12 @@ def scan_secrets_in_text(rel_path: str, text: str, origin: str = "source",
             # The provider patterns are anchored and cheap, so scan the line for those
             # and skip only the expensive entropy pass, recording that we did so.
             for label, severity, pattern in PROVIDER_SECRETS:
-                m = pattern.search(line)
-                if not m or looks_like_placeholder(m.group(0)):
-                    continue
-                key = (label, idx)
-                if key in seen:
-                    continue
-                seen.add(key)
-                findings.append(_vault_secret(label, m.group(0), Finding(
-                    rule_id="SEC-01", domain="SECURITY",
-                    severity="MEDIUM" if testish and severity != "MEDIUM" else severity,
-                    title=f"{label} Found In {origin.title()} ({rel_path})",
-                    file=rel_path, line=idx, snippet=redact(m.group(0)),
-                    cwe_or_standard="CWE-798 Hard-Coded Credentials / OWASP A07",
-                    remediation=(f"Revoke and rotate this {label} immediately - it must be "
-                                 "assumed compromised. Move it to a server-only environment "
-                                 "variable and never expose it to a client bundle."),
-                    confidence="HIGH",
-                )))
+                for m in pattern.finditer(line):
+                    value = m.group(0)
+                    if looks_like_placeholder(value) or (label, idx, value) in seen:
+                        continue
+                    seen.add((label, idx, value))
+                    findings.append(_provider_finding(label, severity, rel_path, idx, value, origin))
             if ledger is not None:
                 ledger.record(
                     f"line longer than {LONG_LINE_LIMIT} chars - entropy analysis skipped",
@@ -1634,36 +1770,16 @@ def scan_secrets_in_text(rel_path: str, text: str, origin: str = "source",
                             "only the high-entropy heuristic was skipped."))
             continue
 
-        # 2a. Known provider key formats - highest confidence available.
+        # 2a. Known provider key formats - highest confidence available. EVERY match on
+        # the line: `pattern.search` found only the first, so a second key of the same
+        # provider on one line was never reported.
         for label, severity, pattern in PROVIDER_SECRETS:
-            m = pattern.search(line)
-            if not m:
-                continue
-            value = m.group(0)
-            if looks_like_placeholder(value):
-                continue
-            key = (label, idx)
-            if key in seen:
-                continue
-            seen.add(key)
-            sev = "MEDIUM" if testish and severity != "MEDIUM" else severity
-            findings.append(_vault_secret(
-                label, value, Finding(
-                    rule_id="SEC-01",
-                    domain="SECURITY",
-                    severity=sev,
-                    title=f"{label} Found In {origin.title()} ({rel_path})",
-                    file=rel_path,
-                    line=idx,
-                    snippet=redact(value),
-                    cwe_or_standard="CWE-798 Hard-Coded Credentials / OWASP A07",
-                    remediation=(
-                        f"Revoke and rotate this {label} immediately - it must be assumed compromised. "
-                        "Move it to a server-only environment variable and never expose it to a client bundle."
-                    ),
-                    confidence="HIGH",
-                )
-            ))
+            for m in pattern.finditer(line):
+                value = m.group(0)
+                if looks_like_placeholder(value) or (label, idx, value) in seen:
+                    continue
+                seen.add((label, idx, value))
+                findings.append(_provider_finding(label, severity, rel_path, idx, value, origin))
 
         # 2b. Secret-sounding name assigned a high-entropy literal.
         for m in SECRET_ASSIGNMENT.finditer(line):
@@ -1873,8 +1989,44 @@ def evidence(text, limit: int = 140) -> str:
 
 
 def display_url(url: Optional[str]) -> str:
-    """A URL as it may be printed: any `user:password@` is removed."""
-    return _URL_USERINFO.sub(r"\1[REDACTED]@", url or "")
+    """A URL as it may be printed in a report, a title, a log line or the terminal.
+
+    Removing `user:password@` was not enough: `?token=...`, `&sig=...`, an OAuth
+    `#access_token=...` fragment and a capability token in the path all reached the
+    report verbatim through `live_url`. Using the RFC 3986 components: the user-info is
+    removed, every query VALUE is replaced (parameter names are kept, so the report
+    still says which parameters were sent), the fragment is replaced, and a path
+    segment that is a recognisable key or looks random is redacted. Scheme, host, port
+    and ordinary path segments are kept.
+    """
+    url = url or ""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return evidence(url, 2048)
+    if not parts.scheme or not parts.netloc:
+        return evidence(url, 2048)
+    netloc = parts.netloc.rpartition("@")[2]
+    if "@" in parts.netloc:
+        netloc = "[REDACTED]@" + netloc
+
+    def segment(seg: str) -> str:
+        for _label, _sev, pattern in PROVIDER_SECRETS:
+            if pattern.search(seg):
+                return "[REDACTED]"
+        if len(seg) >= 16 and _looks_random(urllib.parse.unquote(seg)):
+            return "[REDACTED]"
+        return seg
+
+    path = "/".join(segment(seg) for seg in parts.path.split("/"))
+    # A bare item (`?k3Jx9...`) has no name to keep, and may itself be the token.
+    query = "&".join(
+        (pair.partition("=")[0] + "=[REDACTED]") if "=" in pair else
+        ("[REDACTED]" if pair else pair)
+        for pair in parts.query.split("&")
+    ) if parts.query else ""
+    fragment = "[REDACTED]" if parts.fragment else ""
+    return urllib.parse.urlunsplit((parts.scheme, netloc, path, query, fragment))
 
 
 # ---------------------------------------------------------------------------
@@ -2428,6 +2580,8 @@ ARTIFACT_TEXT_EXT = {".js", ".mjs", ".cjs", ".css", ".html", ".json", ".txt", ".
 ARTIFACT_FILE_LIMIT = 4000
 ARTIFACT_MAX_BYTES = 12_000_000
 MOBILE_PACKAGE_EXT = {".apk", ".aab", ".ipa", ".zip"}
+MOBILE_ENTRY_LIMIT = 400
+MOBILE_ENTRY_MAX_BYTES = 40_000_000
 
 
 def _artifact_gap(title: str, file: str, detail: str, remediation: str) -> Finding:
@@ -2765,26 +2919,38 @@ def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
                     )
                 )
 
-        # Credential sweep across packaged assets and code sections.
-        budget = 0
+        # Credential sweep across packaged assets and code sections. Every eligible entry
+        # this does not read is a coverage gap: entries over the size cap, entries that
+        # fail to decompress, and everything past the entry budget used to be skipped
+        # with no record, so a key in the 401st asset produced a clean package.
+        eligible = []
         for n in names:
             low = n.lower()
             base = low.rsplit("/", 1)[-1]
             is_text_asset = low.endswith(
                 (".json", ".js", ".xml", ".properties", ".txt", ".yaml", ".yml", ".cfg", ".ini", ".plist")
             )
-            if not (is_text_asset or low.endswith(".dex") or base.startswith(".env")):
-                continue
+            if is_text_asset or low.endswith(".dex") or base.startswith(".env"):
+                eligible.append(n)
+        oversized: List[str] = []
+        unreadable: List[str] = []
+        if len(eligible) > MOBILE_ENTRY_LIMIT:
+            findings.append(_artifact_gap(
+                f"Mobile Package Sweep Stopped At {MOBILE_ENTRY_LIMIT} Entries", rel,
+                f"{len(eligible)} code and text entries in {rel}; the last "
+                f"{len(eligible) - MOBILE_ENTRY_LIMIT} in archive order were NOT examined for "
+                "credentials.",
+                "Unpack the package and point --artifact at the directory, or scan the "
+                "release build's own output before it is packaged."))
+        for n in eligible[:MOBILE_ENTRY_LIMIT]:
             try:
-                info = zf.getinfo(n)
-                if info.file_size > 40_000_000:
+                if zf.getinfo(n).file_size > MOBILE_ENTRY_MAX_BYTES:
+                    oversized.append(n)
                     continue
                 blob = zf.read(n)
             except Exception:
+                unreadable.append(n)
                 continue
-            budget += 1
-            if budget > 400:
-                break
             text = blob.decode("utf-8", errors="ignore")
             for f in scan_secrets_in_text(f"{rel}!{n}", text, origin="app package"):
                 f.rule_id = "ART-15"
@@ -2795,6 +2961,20 @@ def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
                 )
                 findings.append(f)
 
+    if oversized:
+        findings.append(_artifact_gap(
+            f"{len(oversized)} Mobile Package Entries Over The Size Cap Were Not Read", rel,
+            ", ".join(oversized[:5]) + (" ..." if len(oversized) > 5 else "")
+            + f" - over {MOBILE_ENTRY_MAX_BYTES // 1_000_000} MB uncompressed, so not "
+            "examined for credentials.",
+            "Unpack the package and scan the large entries directly, or keep generated "
+            "data out of the app bundle."))
+    if unreadable:
+        findings.append(_artifact_gap(
+            f"{len(unreadable)} Mobile Package Entries Could Not Be Read", rel,
+            ", ".join(unreadable[:5]) + (" ..." if len(unreadable) > 5 else "")
+            + " - failed to decompress, so not examined for credentials.",
+            "Confirm the package is not corrupt (`unzip -t <file>`), then re-run."))
     return findings
 
 
@@ -3602,14 +3782,25 @@ def redact_findings(findings: List[Finding]) -> None:
 
 
 def dedupe(findings: List[Finding]) -> List[Finding]:
-    """One finding per (rule, file, line). Keep the most confident evidence."""
+    """One finding per (rule, file, line) - and per SECRET, not per line, for credentials.
+
+    Several SEC-01* rules can describe one credential (a provider pattern, a secret-named
+    assignment, a client-exposed variable name); those collapse into one. But two
+    DIFFERENT credentials on one line are two findings: keying on file and line alone
+    discarded the second, and nothing later could bring it back. Identity is the exact
+    value from the in-memory vault; a finding that names no value (the variable-name
+    rule) only stands alone when no identified credential shares its line.
+    """
     best: Dict[Tuple[str, str, int, str], Finding] = {}
     rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    identified_lines = {(f.file, f.line) for f in findings
+                        if f.rule_id.startswith("SEC-01") and _vaulted(f) is not None}
     for f in findings:
-        # All SEC-01* rules describe the same thing: a credential at this spot.
-        # Report it once, keeping the most precise (and redacted) evidence.
         if f.rule_id.startswith("SEC-01"):
-            key = ("SECRET", f.file, f.line, "")
+            value = _vaulted(f)
+            if value is None and (f.file, f.line) in identified_lines:
+                continue  # the same line's credential is already reported with its identity
+            key = ("SECRET", f.file, f.line, value or "")
         else:
             # Dependency / artifact / history findings all sit at line 0 of the same
             # manifest, so the title is what actually distinguishes them.

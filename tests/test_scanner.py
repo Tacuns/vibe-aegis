@@ -2468,6 +2468,14 @@ class TestPostgresPrivilegeRules(unittest.TestCase):
             "begin execute 'create view public.v as select * from auth.users'; "
             "raise notice 'security definer'; end $body$;\n"), [])
 
+    def test_keywords_inside_an_untagged_dollar_body_do_not_fire(self):
+        """The bare `$$` form is the common one, and once was never blanked."""
+        self.assertEqual(_sql_ids(
+            "create function public.f() returns void language sql set search_path = '' as $$\n"
+            "select 1;\ncreate view public.v as select * from auth.users;\n"
+            "create function public.g() returns void language sql security definer as 'select 1';\n"
+            "$$;\n"), [])
+
     # SEC-19 ---------------------------------------------------------------
     def test_public_view_over_auth_users_fires(self):
         found = _sql_findings("create view public.user_emails as select id, email from auth.users;\n"
@@ -3136,3 +3144,250 @@ class TestGitHubActionsArePinned(unittest.TestCase):
 
     def test_the_check_has_something_to_check(self):
         self.assertGreaterEqual(sum(f.read_text().count("uses:") for f in self.FILES), 7)
+
+
+# ---------------------------------------------------------------------------
+# Checklist A: secret detection and sensitive-data protection
+# ---------------------------------------------------------------------------
+
+class TestTestContextIsDecidedByPathSegment(unittest.TestCase):
+    """`test`, `spec` and `mock` as substrings made production code "test code"."""
+
+    PRODUCTION = ("src/latest/payment-service.ts", "src/inspector/keys.ts", "lib/hammock.js",
+                  "app/contest/route.ts", "src/special/billing.ts", "src/attestation/sign.ts")
+    TESTS = ("tests/billing.ts", "src/__tests__/billing.ts", "src/billing.test.ts",
+             "src/billing.spec.ts", "fixtures/keys.ts", "src/examples/demo.ts",
+             "config/.env.example", "app/settings.sample")
+
+    def test_production_paths_are_not_test_context(self):
+        for path in self.PRODUCTION:
+            self.assertFalse(aegis_scan.is_test_context(path), path)
+
+    def test_real_test_and_example_paths_still_are(self):
+        for path in self.TESTS:
+            self.assertTrue(aegis_scan.is_test_context(path), path)
+
+    def test_provider_key_keeps_its_severity_on_a_production_path(self):
+        for path in self.PRODUCTION:
+            found = aegis_scan.scan_secrets_in_text(path, 'const k = "%s";\n' % STRIPE_KEY)
+            self.assertEqual([f.severity for f in found], ["CRITICAL"], path)
+
+    def test_provider_key_is_not_downgraded_in_a_test_path_either(self):
+        found = aegis_scan.scan_secrets_in_text("tests/billing.ts", 'const k = "%s";\n' % STRIPE_KEY)
+        self.assertEqual([f.severity for f in found], ["CRITICAL"])
+
+    def test_a_placeholder_in_a_test_path_is_still_ignored(self):
+        found = aegis_scan.scan_secrets_in_text("tests/billing.ts", 'const k = "%s";\n' % ("sk_live_" + "x" * 24))
+        self.assertEqual(found, [])
+
+    def test_data_flow_runs_on_production_paths_and_not_on_tests(self):
+        code = TestDataFlowAnalysis.VULNERABLE
+        for path in self.PRODUCTION[:4]:
+            self.assertIn("FLOW-01", {f.rule_id for f in aegis_scan.analyze_data_flow(path, ".ts", code)}, path)
+        self.assertEqual(aegis_scan.analyze_data_flow("tests/route.ts", ".ts", code), [])
+
+
+class TestEveryCredentialOnALineIsReported(unittest.TestCase):
+    """Dedupe keyed on (file, line) discarded the second credential for good."""
+
+    OTHER_STRIPE = "sk_live_" + "99ZzYyXxWwVvUuTtSsRrQqPpOoNnMmLlKkJjIiHh"
+
+    def _scan(self, line):
+        return aegis_scan.dedupe(aegis_scan.scan_secrets_in_text("src/keys.ts", line + "\n"))
+
+    def test_two_keys_of_the_same_provider(self):
+        found = self._scan('const a = "%s", b = "%s";' % (STRIPE_KEY, self.OTHER_STRIPE))
+        self.assertEqual(len(found), 2)
+        self.assertEqual({aegis_scan._vaulted(f) for f in found}, {STRIPE_KEY, self.OTHER_STRIPE})
+
+    def test_keys_of_two_providers(self):
+        found = self._scan('const a = "%s", b = "%s";' % (AWS_KEY, STRIPE_KEY))
+        self.assertEqual({aegis_scan._vaulted(f) for f in found}, {AWS_KEY, STRIPE_KEY})
+
+    def test_the_same_key_twice_on_a_line_is_one_finding(self):
+        self.assertEqual(len(self._scan('f("%s", "%s");' % (STRIPE_KEY, STRIPE_KEY))), 1)
+
+    def test_rules_describing_one_credential_still_collapse(self):
+        # The provider pattern and the secret-named assignment both match this value.
+        found = self._scan('STRIPE_SECRET_KEY = "%s"' % STRIPE_KEY)
+        self.assertEqual(len(found), 1)
+
+    def test_a_full_scan_reports_one_credential_once(self):
+        # Three rules fire on this line: the provider pattern and the client-exposed
+        # name (both carry the value) and the SEC-01 line pattern (carries none).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "src/a.ts", 'const NEXT_PUBLIC_API_SECRET = "%s";\n' % STRIPE_KEY)
+            raw, _ = aegis_scan.scan_repository(root)
+        secrets = [f for f in raw if f.rule_id.startswith("SEC-01")]
+        self.assertGreaterEqual(len(secrets), 3)
+        self.assertEqual(len([f for f in aegis_scan.dedupe(raw) if f.rule_id.startswith("SEC-01")]), 1)
+
+    def test_a_key_on_a_very_long_line_is_found_every_time(self):
+        line = "x" * (aegis_scan.LONG_LINE_LIMIT + 10) + ' "%s" "%s"' % (STRIPE_KEY, self.OTHER_STRIPE)
+        self.assertEqual(len(self._scan(line)), 2)
+
+
+class TestEnvFileProtectionAsksGit(unittest.TestCase):
+    """A substring search of .gitignore for ".env" decided this before."""
+
+    def _scan(self, gitignore, env=".env", tracked=False, git=True):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, env, "SESSION_SECRET=x\n")
+            if gitignore is not None:
+                write(root, ".gitignore", gitignore)
+            if git:
+                run = ["git", "-c", "user.name=dev", "-c", "user.email=dev@localhost",
+                       "-c", "commit.gpgsign=false"]
+                subprocess.run(run + ["init", "-q"], cwd=root, check=True)
+                if tracked:
+                    subprocess.run(run + ["add", "-f", env], cwd=root, check=True)
+                    subprocess.run(run + ["commit", "-q", "-m", "x"], cwd=root, check=True)
+            return [f for f in aegis_scan.check_env_files(root) if f.rule_id == "SEC-01C"]
+
+    def test_a_comment_mentioning_env_does_not_protect_it(self):
+        found = self._scan("# never commit .env files\nnode_modules\n")
+        self.assertEqual([f.title for f in found], ["Environment File `.env` Is Not Ignored By Git"])
+
+    def test_ignoring_only_the_template_does_not_protect_it(self):
+        self.assertEqual(len(self._scan(".env.example\n")), 1)
+
+    def test_a_later_negation_un_ignores_it(self):
+        self.assertEqual(len(self._scan(".env\n!.env\n")), 1)
+
+    def test_an_ignored_but_committed_env_is_reported_as_committed(self):
+        found = self._scan(".env\n", tracked=True)
+        self.assertEqual([f.title for f in found], ["Environment File `.env` Is Committed To Git"])
+        self.assertEqual(found[0].confidence, "HIGH")
+
+    def test_properly_ignored_env_files_are_silent(self):
+        for gitignore, env in ((".env\n", ".env"), (".env*\n!.env.example\n", ".env.local"),
+                               ("**/.env\n", "apps/web/.env"), ("config/\n", "config/.env")):
+            self.assertEqual(self._scan(gitignore, env=env), [], (gitignore, env))
+
+    def test_a_template_is_never_reported(self):
+        self.assertEqual(self._scan("", env=".env.example"), [])
+
+    def test_without_git_the_fallback_is_medium_confidence(self):
+        found = self._scan("# .env\n", git=False)
+        self.assertEqual([f.confidence for f in found], ["MEDIUM"])
+        self.assertEqual(self._scan(".env\n", git=False), [])
+
+    def test_fallback_agrees_with_git_check_ignore(self):
+        """Differential test of the no-git fallback against real git on the same rules."""
+        patterns = [".env", "/.env", ".env*", "!.env", "!.env.local", "config/", "**/.env",
+                    "config/**", "!config/", "!config/.env", "*", "!*/", "app/**/*", "# .env"]
+        paths = [".env", ".env.local", "config/.env", "app/.env", "app/config/.env", "a/b/.env"]
+        differ = []
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            combos = [(p,) for p in patterns] + [(a, b) for a in patterns for b in patterns if a != b]
+            for combo in combos:
+                write(root, ".gitignore", "\n".join(combo) + "\n")
+                out = subprocess.run(["git", "check-ignore", "--stdin", "-v", "-n"], cwd=root,
+                                     input="\n".join(paths), capture_output=True, text=True,
+                                     check=False).stdout.splitlines()
+                self.assertEqual(len(out), len(paths))
+                for path, line in zip(paths, out):
+                    source = line.split("\t")[0]
+                    git_says = source != "::" and not source.split(":", 2)[2].startswith("!")
+                    if aegis_scan._gitignore_says_ignored(root, path) != git_says:
+                        differ.append((combo, path, git_says))
+        self.assertEqual(differ, [])
+
+
+class TestMobileSweepRecordsWhatItSkips(unittest.TestCase):
+    """Skipped package entries left the package looking clean."""
+
+    def _scan(self, build):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = root / "app.apk"
+            with zipfile.ZipFile(pkg, "w", zipfile.ZIP_DEFLATED) as zf:
+                build(zf)
+            return aegis_scan.scan_mobile_package(root, pkg), pkg
+
+    def test_entries_past_the_budget_are_a_gap(self):
+        def build(zf):
+            for i in range(aegis_scan.MOBILE_ENTRY_LIMIT + 5):
+                zf.writestr("assets/f%04d.json" % i, "{}")
+            zf.writestr("assets/zz_last.json", '{"k":"%s"}' % STRIPE_KEY)
+        found, _ = self._scan(build)
+        gaps = [f for f in found if f.rule_id == "ART-00"]
+        self.assertEqual([f.title for f in gaps],
+                         ["Mobile Package Sweep Stopped At %d Entries" % aegis_scan.MOBILE_ENTRY_LIMIT])
+        self.assertIn("the last 6 in archive order", gaps[0].snippet)
+        self.assertTrue(aegis_scan._is_incomplete(gaps[0]))
+
+    def test_an_oversized_entry_is_a_gap(self):
+        found, _ = self._scan(lambda zf: zf.writestr(
+            "assets/big.json", b"\0" * (aegis_scan.MOBILE_ENTRY_MAX_BYTES + 1)))
+        gaps = [f for f in found if f.rule_id == "ART-00"]
+        self.assertEqual(len(gaps), 1)
+        self.assertIn("assets/big.json", gaps[0].snippet)
+
+    def test_an_entry_that_fails_to_decompress_is_a_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = root / "app.apk"
+            with zipfile.ZipFile(pkg, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("assets/bad.json", b"x" * 1000)
+            raw = bytearray(pkg.read_bytes())
+            at = raw.find(b"assets/bad.json") + len("assets/bad.json")
+            raw[at + 2] ^= 0xFF
+            raw[at + 3] ^= 0xFF
+            pkg.write_bytes(bytes(raw))
+            found = aegis_scan.scan_mobile_package(root, pkg)
+        self.assertEqual([f.title for f in found if f.rule_id == "ART-00"],
+                         ["1 Mobile Package Entries Could Not Be Read"])
+
+    def test_a_package_read_in_full_has_no_gap(self):
+        def build(zf):
+            for i in range(aegis_scan.MOBILE_ENTRY_LIMIT - 1):   # exactly at the limit
+                zf.writestr("assets/f%04d.json" % i, "{}")
+            zf.writestr("assets/zz_last.json", '{"k":"%s"}' % STRIPE_KEY)
+            zf.writestr("res/raw/image.png", b"\0" * 100)   # not an eligible entry
+        found, _ = self._scan(build)
+        self.assertEqual([f for f in found if f.rule_id == "ART-00"], [])
+        self.assertIn("ART-15", {f.rule_id for f in found})
+
+
+class TestUrlsAreSanitisedEverywhere(unittest.TestCase):
+    """Only `user:password@` was removed; tokens in the query reached the report."""
+
+    def test_query_values_fragment_and_path_tokens_are_removed(self):
+        url = ("https://admin:%s@app.example.com:8443/share/%s/view?token=%s&sig=%s#access_token=%s"
+               % (CANARY_URL_PASS, ENTROPY_VALUE, ENTROPY_VALUE, E, ENTROPY_VALUE))
+        shown = aegis_scan.display_url(url)
+        self.assertEqual(shown, "https://[REDACTED]@app.example.com:8443/share/[REDACTED]/view"
+                                "?token=[REDACTED]&sig=[REDACTED]#[REDACTED]")
+        self.assertEqual(leaked(shown), [])
+
+    def test_a_provider_key_in_the_path_is_removed(self):
+        self.assertEqual(aegis_scan.display_url("https://x.io/hooks/%s" % STRIPE_KEY),
+                         "https://x.io/hooks/[REDACTED]")
+
+    def test_a_bare_query_item_is_removed(self):
+        self.assertEqual(aegis_scan.display_url("https://x.io/?%s" % ENTROPY_VALUE),
+                         "https://x.io/?[REDACTED]")
+
+    def test_ordinary_urls_are_unchanged(self):
+        for url in ("http://localhost:3000", "http://localhost:3000/",
+                    "https://app.example.com/docs/getting-started/installation-guide",
+                    "https://staging.example.com/api/v2/orders"):
+            self.assertEqual(aegis_scan.display_url(url), url)
+
+    def test_the_report_live_url_and_every_output_are_clean(self):
+        url = "https://staging.example.com/?token=%s#access_token=%s" % (ENTROPY_VALUE, ENTROPY_VALUE)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "README.md", "hello\n")
+            # _run_main answers every request locally, so nothing leaves the test.
+            _code, out = _run_main([str(root), "--url", url, "--output", str(root / "r.json"),
+                                    "--sarif", str(root / "r.sarif")])
+            report = json.loads((root / "r.json").read_text())
+            blob = out + (root / "r.json").read_text() + (root / "r.sarif").read_text()
+        self.assertEqual(report["live_url"], "https://staging.example.com/?token=[REDACTED]#[REDACTED]")
+        self.assertNotIn(ENTROPY_VALUE, blob)
