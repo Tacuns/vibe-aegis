@@ -3391,3 +3391,317 @@ class TestUrlsAreSanitisedEverywhere(unittest.TestCase):
             blob = out + (root / "r.json").read_text() + (root / "r.sarif").read_text()
         self.assertEqual(report["live_url"], "https://staging.example.com/?token=[REDACTED]#[REDACTED]")
         self.assertNotIn(ENTROPY_VALUE, blob)
+
+
+# ---------------------------------------------------------------------------
+# Checklist B: release gate and coverage correctness
+# ---------------------------------------------------------------------------
+
+def _osv_scanner_payload(vulns, groups):
+    return {"results": [{"source": {"path": "package-lock.json", "type": "lockfile"},
+                         "packages": [{"package": {"name": "minimist", "version": "1.2.5",
+                                                   "ecosystem": "npm"},
+                                       "vulnerabilities": vulns, "groups": groups}]}]}
+
+
+class TestOsvScannerSeverity(unittest.TestCase):
+    """The adapter called every advisory MEDIUM. Records trimmed from real
+    osv-scanner 2.2.2 output for minimist 1.2.5 and lodash 4.17.15."""
+
+    CRITICAL = {"id": "GHSA-xvch-5gv4-984h", "aliases": ["CVE-2021-44906"],
+                "summary": "Prototype Pollution in minimist",
+                "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
+                "database_specific": {"severity": "CRITICAL", "github_reviewed": True}}
+    MODERATE = {"id": "GHSA-29mw-wpgm-hmr9", "summary": "ReDoS in lodash",
+                "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L"}],
+                "database_specific": {"severity": "MODERATE"}}
+
+    def _sev(self, vulns, groups=()):
+        found = aegis_scan.parse_osv_scanner(_osv_scanner_payload(vulns, list(groups)))
+        return [(f.rule_id.split(":", 1)[1], f.severity, f.confidence) for f in found]
+
+    def test_real_records_keep_their_severity(self):
+        self.assertEqual(self._sev([self.CRITICAL, self.MODERATE],
+                                   [{"ids": ["GHSA-xvch-5gv4-984h"], "max_severity": "9.8"},
+                                    {"ids": ["GHSA-29mw-wpgm-hmr9"], "max_severity": "5.3"}]),
+                         [("GHSA-xvch-5gv4-984h", "CRITICAL", "HIGH"),
+                          ("GHSA-29mw-wpgm-hmr9", "MEDIUM", "HIGH")])
+
+    def test_the_group_score_is_a_signal_too(self):
+        bare = {"id": "GHSA-aaaa-bbbb-cccc"}
+        self.assertEqual(self._sev([bare], [{"ids": ["GHSA-aaaa-bbbb-cccc"], "max_severity": "7.5"}]),
+                         [("GHSA-aaaa-bbbb-cccc", "HIGH", "HIGH")])
+
+    def test_the_highest_signal_wins(self):
+        self.assertEqual(self._sev([self.MODERATE], [{"ids": ["GHSA-29mw-wpgm-hmr9"],
+                                                       "max_severity": "9.1"}])[0][1], "CRITICAL")
+
+    def test_no_readable_severity_is_high_at_medium_confidence(self):
+        self.assertEqual(self._sev([{"id": "GHSA-zzzz-zzzz-zzzz"}],
+                                   [{"ids": ["GHSA-zzzz-zzzz-zzzz"], "max_severity": ""}]),
+                         [("GHSA-zzzz-zzzz-zzzz", "HIGH", "MEDIUM")])
+
+    def test_malicious_package_is_critical(self):
+        self.assertEqual(self._sev([{"id": "MAL-2024-1"}])[0][1], "CRITICAL")
+
+
+class TestReleaseProfileRequiresAPass(unittest.TestCase):
+    """REVIEW_REQUIRED says a human must decide before release; it exited 0."""
+
+    def _release(self, source, extra=()):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "app"
+            write(root, "src/page.tsx", source)
+            write(root, "requirements.txt", "flask==3.0.3\n")
+            write(root, "dist/index.js", "var a=1;")
+            _git_init(root)
+            return _run_main([str(root), "--profile", "release", "--quiet"] + list(extra))
+
+    def test_review_required_fails_the_release_profile(self):
+        code, out = self._release('<img src="a.png">\n')     # UX-07, MEDIUM
+        self.assertIn(aegis_scan.VERDICT_REVIEW, out)
+        self.assertEqual(code, 1, out)
+
+    def test_a_clean_release_audit_passes(self):
+        code, out = self._release("export const x = 1;\n")
+        self.assertIn(aegis_scan.VERDICT_RELEASE_OK, out)
+        self.assertEqual(code, 0, out)
+
+    def test_an_explicit_fail_on_gates_on_severity_alone(self):
+        code, out = self._release('<img src="a.png">\n', ["--fail-on", "high"])
+        self.assertIn(aegis_scan.VERDICT_REVIEW, out)
+        self.assertEqual(code, 0, out)
+
+    def test_review_required_from_low_findings_alone_fails_too(self):
+        # Eleven LOW findings and no MEDIUM: the score drops below 90, so the verdict is
+        # REVIEW_REQUIRED although no finding reaches the MEDIUM threshold.
+        code, out = self._release('<div className="outline-none">x</div>\n' * 11)
+        self.assertIn(aegis_scan.VERDICT_REVIEW, out)
+        self.assertIn("0C 0H 0M 11L", out)
+        self.assertEqual(code, 1, out)
+
+    def test_raising_min_confidence_does_not_drop_a_confident_finding(self):
+        code, _out = self._release('<img src="a.png">\n', ["--min-confidence", "high"])
+        self.assertEqual(code, 1)
+
+
+class TestGitHistoryCoverageIsStated(unittest.TestCase):
+    """The limit, other refs, renames and failed commits were all silent."""
+
+    G = ["git", "-c", "user.name=dev", "-c", "user.email=dev@localhost", "-c", "commit.gpgsign=false"]
+    OTHER = "sk_live_" + "99ZzYyXxWwVvUuTtSsRrQqPpOoNnMmLlKkJjIiHh"
+
+    def _commit(self, root, msg):
+        subprocess.run(self.G + ["add", "-A"], cwd=root, check=True)
+        subprocess.run(self.G + ["commit", "-q", "-m", msg], cwd=root, check=True)
+
+    def _repo(self, tmp):
+        root = Path(tmp) / "r"
+        root.mkdir()
+        subprocess.run(self.G + ["init", "-q", "-b", "main"], cwd=root, check=True)
+        write(root, "a.txt", "0\n")
+        self._commit(root, "first")
+        return root
+
+    @staticmethod
+    def _keys(found):
+        return {aegis_scan._vaulted(f) for f in found if f.rule_id == "HIST-01"}
+
+    def test_a_truncated_history_is_a_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            write(root, "k.ts", 'const k = "%s";\n' % STRIPE_KEY)
+            self._commit(root, "key")
+            for i in range(4):
+                write(root, "a.txt", "change %d\n" % i)
+                self._commit(root, "c%d" % i)
+            short = aegis_scan.scan_git_history(root, 3)
+            full = aegis_scan.scan_git_history(root, 300)
+        self.assertEqual(_gap_titles(short, "GIT-00"), {"Git History Truncated At 3 Commits"})
+        self.assertIn("the 3 oldest were NOT examined", next(f for f in short if f.rule_id == "GIT-00").snippet)
+        self.assertEqual(_gap_titles(full, "GIT-00"), set())
+        self.assertEqual(self._keys(full), {STRIPE_KEY})
+
+    def test_a_key_on_another_branch_is_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            subprocess.run(self.G + ["checkout", "-q", "-b", "feature"], cwd=root, check=True)
+            write(root, "f.ts", 'const f = "%s";\n' % self.OTHER)
+            self._commit(root, "feature key")
+            subprocess.run(self.G + ["checkout", "-q", "main"], cwd=root, check=True)
+            self.assertEqual(self._keys(aegis_scan.scan_git_history(root)), {self.OTHER})
+
+    def test_a_key_added_in_a_rename_is_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            body = "".join("line %d of a stable file\n" % i for i in range(40))
+            write(root, "cfg.ts", body)
+            self._commit(root, "cfg")
+            (root / "cfg.ts").unlink()
+            write(root, "settings.ts", body + 'const z = "%s";\n' % STRIPE_KEY)
+            self._commit(root, "rename and add a key")
+            self.assertEqual(self._keys(aegis_scan.scan_git_history(root)), {STRIPE_KEY})
+
+    def test_a_key_written_while_resolving_a_merge_is_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            subprocess.run(self.G + ["checkout", "-q", "-b", "f"], cwd=root, check=True)
+            write(root, "f.txt", "f\n")
+            self._commit(root, "f")
+            subprocess.run(self.G + ["checkout", "-q", "main"], cwd=root, check=True)
+            write(root, "b.txt", "b\n")
+            self._commit(root, "b")
+            subprocess.run(self.G + ["merge", "-q", "--no-commit", "f"], cwd=root, check=True)
+            write(root, "m.ts", 'const m = "%s";\n' % STRIPE_KEY)
+            self._commit(root, "merge")
+            self.assertEqual(self._keys(aegis_scan.scan_git_history(root)), {STRIPE_KEY})
+
+    def test_a_shallow_clone_is_a_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            write(root, "a.txt", "1\n")
+            self._commit(root, "second")
+            clone = Path(tmp) / "clone"
+            subprocess.run(["git", "clone", "-q", "--depth", "1", root.as_uri(), str(clone)], check=True)
+            self.assertIn("Git History Is A Shallow Clone",
+                          _gap_titles(aegis_scan.scan_git_history(clone), "GIT-00"))
+            self.assertEqual(_gap_titles(aegis_scan.scan_git_history(root), "GIT-00"), set())
+
+    def test_a_commit_git_cannot_show_is_a_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._repo(tmp)
+            real = aegis_scan.run_git
+
+            def failing_show(r, args, timeout=60):
+                return None if args[:1] == ["show"] else real(r, args, timeout)
+            aegis_scan.run_git = failing_show
+            try:
+                found = aegis_scan.scan_git_history(root)
+            finally:
+                aegis_scan.run_git = real
+        self.assertEqual(_gap_titles(found, "GIT-00"), {"1 Commit(s) Could Not Be Read"})
+
+
+class TestStaticAssetsAreNotABuild(unittest.TestCase):
+    """A readable `public/robots.txt` satisfied the artifact stage on its own."""
+
+    def _gaps(self, files, artifact=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel, body in files.items():
+                write(root, rel, body)
+            return _gap_titles(aegis_scan.scan_build_artifacts(root, artifact, []), "ART-00")
+
+    def test_only_public_is_a_gap(self):
+        self.assertEqual(self._gaps({"public/robots.txt": "User-agent: *\n"}), {"No Build Output Found"})
+
+    def test_public_beside_a_build_is_fine(self):
+        self.assertEqual(self._gaps({"public/robots.txt": "x\n", "dist/index.js": "var a=1;"}), set())
+
+    def test_public_is_still_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "public/config.js", 'window.K="%s";' % STRIPE_KEY)
+            found = aegis_scan.scan_build_artifacts(root, None, [])
+        self.assertIn("ART-03", {f.rule_id for f in found})
+
+    def test_an_explicit_artifact_path_is_trusted(self):
+        self.assertEqual(self._gaps({"public/index.html": "<html></html>"}, "public"), set())
+
+
+class TestCoverageLedgerIsOrderIndependent(unittest.TestCase):
+    """The first occurrence's `material` flag decided for every later one."""
+
+    REASON = "minified bundle or lockfile not scanned"
+
+    def _ledger(self, order):
+        ledger = aegis_scan.CoverageLedger()
+        for name in order:
+            ledger.record(self.REASON, name, material=name.endswith(".min.js"))
+        return ledger
+
+    def test_either_order_gives_the_same_gap(self):
+        a = self._ledger(["package-lock.json", "app.min.js"])
+        b = self._ledger(["app.min.js", "package-lock.json"])
+        for ledger in (a, b):
+            gaps = ledger.gaps()
+            self.assertEqual([g.title for g in gaps], ["Not Examined: %s (1 item(s))" % self.REASON])
+            self.assertEqual(gaps[0].file, "app.min.js")
+            self.assertEqual(ledger.material_total(), 1)
+            self.assertEqual(ledger.total(), 2)
+            self.assertTrue(ledger.as_dict()[self.REASON]["material"])
+
+    def test_immaterial_skips_alone_raise_no_gap(self):
+        ledger = self._ledger(["package-lock.json", "yarn.lock"])
+        self.assertEqual(ledger.gaps(), [])
+        self.assertFalse(ledger.as_dict()[self.REASON]["material"])
+
+
+class TestLiveProbeFailuresAreGaps(unittest.TestCase):
+    """A timed-out `/.env` probe read exactly like "not exposed"."""
+
+    HEADERS = {"content-security-policy": "default-src 'self'", "x-frame-options": "DENY",
+               "x-content-type-options": "nosniff", "strict-transport-security": "max-age=63072000"}
+
+    def _probe(self, probe_error):
+        def fake(req, timeout=None, context=None):
+            if req.full_url.endswith(("/.env", "/.git/config")):
+                raise probe_error(req.full_url)
+            return _FakeResponse(self.HEADERS)
+        real = aegis_scan.urllib.request.urlopen
+        aegis_scan.urllib.request.urlopen = fake
+        try:
+            return aegis_scan.check_live_url_posture("https://app.example.com/")
+        finally:
+            aegis_scan.urllib.request.urlopen = real
+
+    def test_a_timeout_is_a_gap(self):
+        found = self._probe(lambda url: aegis_scan.urllib.error.URLError("timed out"))
+        self.assertEqual(_gap_titles(found, "LIVE-00"),
+                         {"Exposure Probe Did Not Complete (`/.env`)",
+                          "Exposure Probe Did Not Complete (`/.git/config`)"})
+        self.assertTrue(all(aegis_scan._is_incomplete(f) for f in found if f.rule_id == "LIVE-00"))
+
+    def test_a_404_is_an_answer(self):
+        found = self._probe(lambda url: aegis_scan.urllib.error.HTTPError(url, 404, "Not Found", {}, None))
+        self.assertEqual(found, [])
+
+    def test_a_server_error_is_not(self):
+        found = self._probe(lambda url: aegis_scan.urllib.error.HTTPError(url, 503, "Unavailable", {}, None))
+        self.assertEqual(len(_gap_titles(found, "LIVE-00")), 2)
+
+
+class TestChangeScopeDoesNotOverrideTheVerdict(unittest.TestCase):
+    """A docs-only diff replaced the verdict, even beside a CRITICAL from another stage."""
+
+    def _diff_scan(self, files, extra=()):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write(root, "README.md", "a\n")
+            for rel, body in files.items():
+                write(root, rel, body)
+            _git_init(root)
+            write(root, "README.md", "b\n")
+            subprocess.run(["git", "-c", "user.name=dev", "-c", "user.email=dev@localhost",
+                            "-c", "commit.gpgsign=false", "commit", "-q", "-am", "docs"],
+                           cwd=root, check=True)
+            code, _out = _run_main([str(root), "--diff", "HEAD~1", "--offline",
+                                    "--output", str(root / "r.json")] + list(extra))
+            return code, json.loads((root / "r.json").read_text())
+
+    def test_a_finding_from_another_stage_keeps_its_verdict(self):
+        code, report = self._diff_scan({"dist/app.js": 'const k="%s";' % STRIPE_KEY},
+                                       ["--artifact", "dist", "--fail-on-high"])
+        self.assertTrue(report["release_verdict"].startswith(aegis_scan.VERDICT_BLOCKED), report["release_verdict"])
+        self.assertLess(report["readiness_score"], 100)
+        self.assertEqual(code, 1)
+
+    def test_a_docs_only_diff_with_nothing_else_says_so(self):
+        code, report = self._diff_scan({})
+        self.assertTrue(report["release_verdict"].startswith("NO CODE CHANGES TO REVIEW"))
+        self.assertEqual(code, 0)
+
+    def test_an_unchanged_bundle_is_not_a_gap_in_the_diff(self):
+        _code, report = self._diff_scan({"web/vendor.min.js": "var a=1;"})
+        self.assertTrue(report["release_verdict"].startswith("NO CODE CHANGES TO REVIEW"),
+                        report["release_verdict"])

@@ -86,16 +86,25 @@ class CoverageLedger:
 
     def record(self, reason: str, path: str, *, material: bool = True,
                detail: str = "") -> None:
+        # Materiality belongs to each occurrence, not to the reason. One reason covers
+        # both a lockfile (immaterial) and a `.min.js` bundle (material); keeping the
+        # FIRST occurrence's flag made the bundle's gap vanish whenever the walk
+        # happened to reach a lockfile first.
         entry = self._skips.setdefault(
-            reason, {"count": 0, "examples": [], "material": material, "detail": detail})
+            reason, {"count": 0, "examples": [], "material_count": 0,
+                     "material_examples": [], "detail": detail})
         entry["count"] += 1
         if len(entry["examples"]) < 5:
             entry["examples"].append(path)
+        if material:
+            entry["material_count"] += 1
+            if len(entry["material_examples"]) < 5:
+                entry["material_examples"].append(path)
 
     def as_dict(self) -> Dict:
         return {
             reason: {"count": e["count"], "examples": e["examples"],
-                     "material": e["material"]}
+                     "material": e["material_count"] > 0}
             for reason, e in sorted(self._skips.items())
         }
 
@@ -103,23 +112,24 @@ class CoverageLedger:
         return sum(e["count"] for e in self._skips.values())
 
     def material_total(self) -> int:
-        return sum(e["count"] for e in self._skips.values() if e["material"])
+        return sum(e["material_count"] for e in self._skips.values())
 
     def gaps(self) -> List["Finding"]:
         """One coverage gap per material reason, so the gate can see them."""
         out: List[Finding] = []
         for reason, e in sorted(self._skips.items()):
-            if not e["material"]:
+            if not e["material_count"]:
                 continue
-            examples = ", ".join(e["examples"][:3])
+            n = e["material_count"]
+            examples = ", ".join(e["material_examples"][:3])
             out.append(Finding(
                 rule_id="COV-00",
                 domain="COVERAGE",
                 severity="LOW",
-                title=f"Not Examined: {reason} ({e['count']} item(s))",
-                file=e["examples"][0] if e["examples"] else "(repository)",
+                title=f"Not Examined: {reason} ({n} item(s))",
+                file=e["material_examples"][0],
                 line=0,
-                snippet=evidence(f"{e['count']} item(s) were not inspected. Examples: {examples}", 400),
+                snippet=evidence(f"{n} item(s) were not inspected. Examples: {examples}", 400),
                 cwe_or_standard="Coverage",
                 remediation=(e["detail"] or
                              "These were not read, so no conclusion about them is possible. "
@@ -1283,6 +1293,11 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
                 rel_for_log = fpath.relative_to(root).as_posix()
             except ValueError:
                 rel_for_log = fpath.as_posix()
+            if only_files is not None and rel_for_log not in only_files:
+                # Diff mode reviews only what this branch changed. Checked before any
+                # skip is recorded: an unchanged bundle is outside the review, not a
+                # gap in it, and counting it made every docs-only diff incomplete.
+                continue
 
             if fname.endswith((".min.js", ".min.css", ".lock", "package-lock.json", "pnpm-lock.yaml")):
                 # Minified bundles and lockfiles are excluded for noise, but a bundle is
@@ -1308,8 +1323,6 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
                 continue
 
             rel_path = fpath.relative_to(root).as_posix()  # POSIX separators so path rules match on Windows too
-            if only_files is not None and rel_path not in only_files:
-                continue  # diff mode: review only what this branch changed
 
             if is_test_path(rel_path) and not include_tests:
                 continue  # fixtures are deliberately insecure; --include-tests to audit them
@@ -1480,6 +1493,7 @@ def check_live_url_posture(target_url: str) -> List[Finding]:
 
     # Passive check for exposed .env or .git/config
     base_url = f"{parsed.scheme}://{parsed.netloc}"
+    probe_failures: List[Tuple[str, str]] = []
     for probe_path, marker in (("/.env", "="), ("/.git/config", "[core]")):
         probe_url = base_url + probe_path
         try:
@@ -1505,9 +1519,27 @@ def check_live_url_posture(target_url: str) -> List[Finding]:
                             remediation=f"Block public access to `{probe_path}` at your web server/CDN and rotate any exposed credentials.",
                         )
                     )
-        except Exception:
-            pass
+        except urllib.error.HTTPError as e:
+            # A 4xx is an answer: the server refused to serve the file. A 5xx is not -
+            # the server failed, and the file may still be served once it recovers.
+            if e.code >= 500:
+                probe_failures.append((probe_path, f"HTTP {e.code}"))
+        except Exception as exc:
+            # This used to be `pass`, so a timeout read exactly like "not exposed".
+            probe_failures.append((probe_path, type(exc).__name__))
 
+    for probe_path, reason in probe_failures:
+        findings.append(Finding(
+            rule_id="LIVE-00", domain="SECURITY", severity="LOW",
+            title=f"Exposure Probe Did Not Complete (`{probe_path}`)",
+            file=display_url(base_url + probe_path), line=0,
+            snippet=evidence(f"The request for {probe_path} failed ({reason}), so whether it "
+                             "is publicly readable is unknown.", 300),
+            cwe_or_standard="Live Deployment Check",
+            remediation=(f"Re-run when the deployment is reachable, or check `{probe_path}` "
+                         "by hand: it must not be served."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED",
+        ))
     return findings
 
 
@@ -2078,20 +2110,60 @@ def scan_git_history(root: Path, max_commits: int = 300) -> List[Finding]:
     if not (root / ".git").exists():
         return gap("No .git directory found - history was not inspected.")
 
-    log = run_git(root, ["log", f"--max-count={max_commits}", "--format=%H%x1f%an%x1f%ad%x1f%s", "--date=short"])
+    # Every ref, not just HEAD: `--all` is "as if all the refs in refs/, along with
+    # HEAD, are listed" (git-log docs) - branches, tags, remote-tracking refs and the
+    # stash. A key pushed only to a feature branch is as public as one on main.
+    log = run_git(root, ["log", "--all", f"--max-count={max_commits}",
+                         "--format=%H%x1f%an%x1f%ad%x1f%s", "--date=short"])
     if log is None:
         return gap("git could not be executed (missing binary, timeout, or not a repository).")
     if not log.strip():
         return findings
 
+    # What this run did NOT cover is stated, never implied: a commit limit, a shallow
+    # clone (CI checks out one commit by default), and every commit git failed to show.
+    total = run_git(root, ["rev-list", "--all", "--count"])
+    if total is None or not total.strip().isdigit():
+        findings.extend(gap("The number of commits could not be counted, so whether every "
+                            "commit was examined is unknown."))
+    elif int(total) > max_commits:
+        findings.append(Finding(
+            rule_id="GIT-00", domain="HISTORY", severity="LOW",
+            title=f"Git History Truncated At {max_commits} Commits",
+            file="git", line=0,
+            snippet=evidence(f"{total.strip()} commits are reachable from the repository's refs; "
+                             f"the {int(total) - max_commits} oldest were NOT examined.", 300),
+            cwe_or_standard="Coverage Gap",
+            remediation=f"Re-run with `--git-history {total.strip()}` to examine every commit.",
+            confidence="HIGH", kind="skipped_check", status="SKIPPED"))
+    if (run_git(root, ["rev-parse", "--is-shallow-repository"]) or "").strip() == "true":
+        findings.append(Finding(
+            rule_id="GIT-00", domain="HISTORY", severity="LOW",
+            title="Git History Is A Shallow Clone",
+            file="git", line=0,
+            snippet="Commits before the clone's depth were never fetched, so they were not examined.",
+            cwe_or_standard="Coverage Gap",
+            remediation=("Fetch the full history first (`git fetch --unshallow`, or "
+                         "`fetch-depth: 0` in actions/checkout)."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED"))
+
     reported: Set[str] = set()
+    failed: List[str] = []
     for entry in log.strip().splitlines():
         parts = entry.split("\x1f")
         if len(parts) != 4:
+            failed.append(entry[:10])
             continue
         sha, author, date, subject = parts
-        diff = run_git(root, ["show", sha, "--unified=0", "--no-color", "--diff-filter=AM"], timeout=30)
-        if not diff:
+        # No --diff-filter: AM hid a key added in a commit git saw as a rename. A merge
+        # is shown against its first parent, so lines written while resolving it are
+        # plain `+` lines. --no-ext-diff / --no-textconv: a repository's own config
+        # must not choose a program to run while we read it.
+        diff = run_git(root, ["show", sha, "--unified=0", "--no-color", "--no-ext-diff",
+                              "--no-textconv", "--diff-merges=first-parent", "--format="],
+                       timeout=30)
+        if diff is None:
+            failed.append(sha[:10])
             continue
         # Only added lines can introduce a secret.
         added = "\n".join(ln[1:] for ln in diff.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
@@ -2123,6 +2195,17 @@ def scan_git_history(root: Path, max_commits: int = 300) -> List[Finding]:
                     confidence="HIGH",
                 )
             ))
+    if failed:
+        shown = ", ".join(failed[:5]) + (" ..." if len(failed) > 5 else "")
+        findings.append(Finding(
+            rule_id="GIT-00", domain="HISTORY", severity="LOW",
+            title=f"{len(failed)} Commit(s) Could Not Be Read",
+            file="git", line=0,
+            snippet=evidence(f"git failed or timed out showing {shown}, so those commits "
+                             "were not examined.", 300),
+            cwe_or_standard="Coverage Gap",
+            remediation="Inspect them with `git show <sha>`, or re-run with git available.",
+            confidence="HIGH", kind="skipped_check", status="SKIPPED"))
     return findings
 
 
@@ -2574,6 +2657,11 @@ def build_sbom(root: Path, deps: List[Tuple[str, str, str]]) -> Dict:
 # read the source, it can cross-reference: it knows which secret leaked.
 
 ARTIFACT_DIRS = ("dist", "build", "out", ".next", ".output", ".svelte-kit", "www", "public", "release")
+# `public/` holds static files a framework copies into its build (Next.js, Vite, CRA).
+# They ship, so they are read - but they are not the build: a project with only
+# `public/` has no compiled bundle here, and reading one `robots.txt` once satisfied
+# this whole stage.
+STATIC_ASSET_DIRS = ("public",)
 ARTIFACT_TEXT_EXT = {".js", ".mjs", ".cjs", ".css", ".html", ".json", ".txt", ".map", ".wasm"}
 
 
@@ -2630,6 +2718,14 @@ def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secret
             "ships to users was not examined.",
             "Build the project and re-run, or point --artifact at the build output or the "
             ".apk/.aab/.ipa you publish.")]
+    if not artifact_path and all(t.name in STATIC_ASSET_DIRS for t in targets):
+        findings.append(_artifact_gap(
+            "No Build Output Found", "(repository)",
+            "Only static assets (" + ", ".join(f"{t.name}/" for t in targets) + ") exist; "
+            "they are read below, but no compiled build output was found, so the bundle "
+            "that ships to users was not examined.",
+            "Build the project and re-run, or point --artifact at the build output or the "
+            ".apk/.aab/.ipa you publish."))
 
     # What the source stage already identified as a secret, so we can prove a leak. The
     # exact value comes from the in-memory vault: snippets are fully redacted, and the
@@ -3349,20 +3445,40 @@ def parse_trufflehog(rows: List[Dict]) -> List[Finding]:
 
 
 def parse_osv_scanner(payload: Dict) -> List[Finding]:
+    """osv-scanner reports each vulnerability as a full OSV record, so its severity is
+    decided exactly as DEP-01's is - this adapter once called every one MEDIUM, and a
+    9.8 CRITICAL dependency passed --fail-on-high. The package's `groups[].max_severity`
+    (a CVSS base score osv-scanner computes) is one more signal; the highest wins, and
+    an advisory with no readable severity is HIGH at MEDIUM confidence, as DEP-01."""
     out: List[Finding] = []
     for res in payload.get("results", []) or []:
         source = (res.get("source", {}) or {}).get("path", "")
         for pkg in res.get("packages", []) or []:
             info = pkg.get("package", {}) or {}
+            group_score: Dict[str, float] = {}
+            for grp in pkg.get("groups", []) or []:
+                try:
+                    score = float(grp.get("max_severity") or "")
+                except (TypeError, ValueError):
+                    continue
+                for vid in list(grp.get("ids") or []) + list(grp.get("aliases") or []):
+                    group_score[str(vid)] = max(score, group_score.get(str(vid), 0.0))
             for v in pkg.get("vulnerabilities", []) or []:
+                vid = str(v.get("id", "OSV"))
+                severity, _how = osv_record_severity(v)
+                if vid in group_score and 0.0 < group_score[vid] <= 10.0:
+                    banded = _band(group_score[vid])
+                    if severity is None or _SEV_ORDER[banded] > _SEV_ORDER[severity]:
+                        severity = banded
                 out.append(_engine_finding(
-                    "osv-scanner", v.get("id", "OSV"), "MEDIUM",
+                    "osv-scanner", vid, severity or "HIGH",
                     f"{info.get('name', '?')} {info.get('version', '')}: "
-                    f"{v.get('summary', v.get('id', ''))}",
+                    f"{v.get('summary', vid)}",
                     source, 0,
-                    ", ".join(v.get("aliases", [])[:4]) or v.get("id", ""),
-                    v.get("id", ""),
+                    ", ".join(v.get("aliases", [])[:4]) or vid,
+                    vid,
                     "Upgrade to a version outside the affected range.",
+                    confidence="HIGH" if severity else "MEDIUM",
                 ))
     return out
 
@@ -3843,8 +3959,9 @@ def main() -> int:
                            "reachable. quick and code (default): full source, data-flow and "
                            "secret analysis, no deep stage unless you add one - the two are "
                            "currently identical. full: adds dependencies, git history and build "
-                           "artifacts. release: everything, plus --fail-on-incomplete and "
-                           "--fail-on-high unless --fail-on is given; the only profile that can "
+                           "artifacts. release: everything, plus --fail-on-incomplete and, "
+                           "unless --fail-on is given, exit 1 on any MEDIUM or worse and on any "
+                           "verdict but RELEASE_AUDIT_PASSED; the only profile that can "
                            "return RELEASE_AUDIT_PASSED. A source scan can never certify a "
                            "release.")
     gate.add_argument("--min-confidence", choices=["high", "medium", "low"], default="low",
@@ -3933,13 +4050,20 @@ def main() -> int:
         want_artifacts = args.all or args.artifact is not None
         want_history = args.all or args.git_history is not None
         want_deps = args.all or args.deps or args.sbom is not None
+    require_release_pass = False
     if args.profile == "release":
         # A release gate that tolerates an unexamined stage is not a gate.
         args.fail_on_incomplete = True
-        # Nor is one that exits 0 on a BLOCKED verdict. Severity stays its own axis: an
-        # explicit --fail-on still wins, so a team can deliberately gate on CRITICAL only.
-        if not args.fail_on and not args.fail_on_high:
-            args.fail_on_high = True
+        # Nor is one that exits 0 on a BLOCKED verdict - or on REVIEW_REQUIRED, whose own
+        # text says findings "need a human decision before release": exiting 0 there
+        # made that decision for the human. With no explicit --fail-on, the release
+        # profile fails on MEDIUM and above (at or above --min-confidence, the third
+        # axis), and at the default --min-confidence low exits 0 only on
+        # RELEASE_AUDIT_PASSED. An explicit --fail-on <level> still wins, so a team can
+        # deliberately gate on severity alone (CRITICAL only).
+        if not args.fail_on:
+            args.fail_on = "medium"
+            require_release_pass = args.min_confidence == "low"
 
     stages: List[str] = ["static"]
     findings: List[Finding] = []
@@ -4087,9 +4211,19 @@ def main() -> int:
     # normal case. Only a full scan finding nothing to read indicates a broken target
     # path or checkout. (A diff that could not be resolved falls back to a full scan
     # above and leaves `only_files` None, so it is still held to the strict rule.)
+    #
+    # Change scope is its own axis. This once replaced the verdict outright, so a
+    # docs-only diff run with --artifact or --deps reported "NO CODE CHANGES TO REVIEW"
+    # at 100/100 beside a CRITICAL finding from another stage. The empty changeset
+    # only waives the zero-files rule; every other stage's findings and gaps still
+    # decide the verdict, and only a run with nothing at all to report says so.
     diff_matched_no_source = only_files is not None and scanned_files == 0
     if diff_matched_no_source:
-        score, verdict = 100, "NO CODE CHANGES TO REVIEW (diff contained no scannable source files)"
+        if findings:
+            score, verdict = compute_readiness_score(
+                findings, scanned_files=None, release_audit=release_audit)
+        else:
+            score, verdict = 100, "NO CODE CHANGES TO REVIEW (diff contained no scannable source files)"
 
     # Coverage is a separate axis from severity: a check that did not run is not
     # a small defect, it is an unknown. Keep the two apart in the report.
@@ -4249,6 +4383,8 @@ def main() -> int:
     # just never acted on it. Coverage and severity are separate axes all the way out
     # to the process exit status, not only inside the report.
     if args.fail_on_incomplete and (skipped_checks or scan_is_incomplete):
+        return 1
+    if require_release_pass and not verdict.startswith(VERDICT_RELEASE_OK):
         return 1
     return 0
 

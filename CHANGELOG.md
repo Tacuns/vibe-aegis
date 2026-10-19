@@ -27,12 +27,13 @@ and check names that change between runs. Better, gate on the exit code:
 ```bash
 # Before
 grep -q '"release_verdict": "READY TO PUBLISH"' .aegis/scan-report.json
-# After: fails on any incomplete stage, and on CRITICAL/HIGH
-python3 .aegis/scripts/aegis_scan.py . --profile release --fail-on-high
+# After: exits 0 only on RELEASE_AUDIT_PASSED
+python3 .aegis/scripts/aegis_scan.py . --profile release
 ```
 
-`--profile release` exits `1` on an incomplete stage and on any `CRITICAL`/`HIGH` finding.
-An explicit `--fail-on <level>` overrides the severity threshold.
+`--profile release` exits `1` on an incomplete stage, on any `MEDIUM` or worse finding,
+and on any verdict other than `RELEASE_AUDIT_PASSED`. An explicit `--fail-on <level>`
+overrides the severity threshold.
 
 ### Fixed - dependency vulnerabilities were always reported MEDIUM (CRITICAL)
 
@@ -97,6 +98,39 @@ regression test that fails on the previous code.
   recognisable key or looks random is redacted; parameter names, host and ordinary path
   segments are kept. The live-URL failure message is passed through the same filter.
 
+### Fixed - release gate and coverage correctness (checklist B)
+
+Reproduced on this branch before each change; each fix has a regression test.
+
+- **`--engine osv-scanner` called every advisory MEDIUM (HIGH).** osv-scanner reports full
+  OSV records, so severity is now decided exactly as `DEP-01`'s is, with the package's
+  `groups[].max_severity` as one more signal; the highest wins. Checked against real
+  osv-scanner 2.2.2 output: all seven advisories for `lodash@4.17.15` and
+  `minimist@1.2.5` match both osv-scanner's own score and GitHub's rating.
+- **`REVIEW_REQUIRED` exited `0` under `--profile release` (HIGH).** See *Changed*.
+- **Git history covered less than it said (HIGH).** Only `HEAD` was walked, so a key on
+  another branch was missed; `--diff-filter=AM` hid a key added in a commit git saw as a
+  rename; and the 300-commit limit, a shallow clone and every commit `git show` failed on
+  were silent. History is now read from every ref (`git log --all`), merges are shown
+  against their first parent, and the limit, a shallow clone and each unreadable commit
+  are `GIT-00` gaps. `git show` runs with `--no-ext-diff --no-textconv`, so a scanned
+  repository's own config cannot choose a program to run.
+- **`public/` satisfied the artifact stage on its own (HIGH).** A lone `robots.txt` there
+  counted as build output. `public/` is still read - it ships - but with no real build
+  directory beside it the stage is an `ART-00` gap.
+- **The coverage ledger depended on file order (HIGH).** One skip reason covers both
+  lockfiles (immaterial) and `.min.js` bundles (material), and the first one recorded
+  decided for all: a walk that reached a lockfile first lost the bundle's gap.
+  Materiality is now counted per occurrence.
+- **Failed `/.env` and `/.git/config` probes were swallowed (MEDIUM).** A timeout read
+  exactly like "not exposed". A failed probe, or a 5xx, is now a `LIVE-00` gap; a 4xx is
+  an answer.
+- **A docs-only `--diff` overwrote the verdict (MEDIUM).** It reported `NO CODE CHANGES TO
+  REVIEW` at 100/100 beside a CRITICAL from `--artifact`. The empty changeset now only
+  waives the zero-files rule; other stages' findings and gaps decide the verdict. Files
+  outside the diff are no longer recorded as skipped, so an unchanged bundle is not a gap
+  in a diff review.
+
 ### Changed - GitHub Actions are pinned to commit SHAs
 
 This repository's CI and the workflow shipped in `adapters/github-actions/` used movable
@@ -128,9 +162,13 @@ test fails on any unpinned `uses:`.
 
 ### Changed
 
-- **`--profile release` now implies `--fail-on-high`.** It exited `0` on a `BLOCKED`
-  verdict unless `--fail-on-high` was also passed - a release gate that let a release with
-  an open HIGH through. An explicit `--fail-on <level>` still sets the threshold.
+- **`--profile release` fails on anything but `RELEASE_AUDIT_PASSED`.** It exited `0` on a
+  `BLOCKED` verdict unless `--fail-on-high` was also passed - a release gate that let a
+  release with an open HIGH through - and, once that was fixed, still exited `0` on
+  `REVIEW_REQUIRED`, whose own text says a human must decide before release. Without
+  `--fail-on`, it now fails on `MEDIUM` and above (at or above `--min-confidence`), and at
+  the default `--min-confidence low` on any verdict but `RELEASE_AUDIT_PASSED`. An explicit
+  `--fail-on <level>` still sets a severity-only threshold.
 - `SEC-18` is `MEDIUM`: exploiting it needs a role that can create database objects.
 
 ### Fixed - documentation

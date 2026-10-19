@@ -256,8 +256,8 @@ python3 scripts/aegis_scan.py . --fail-on-high --min-confidence high --fail-on-i
 
 | Argument | Description |
 | :--- | :--- |
-| `--artifact [PATH]` | Verify a build directory or an `.apk`/`.aab`/`.ipa`. With no value, auto-detects `dist/`, `build/`, `out/`, `.next/`, `.output/`, `.svelte-kit/`, `www/`, `public/`, `release/`. Finding none is an `ART-00` gap |
-| `--git-history [N]` | Hunt credentials committed in the last `N` commits (default 300) |
+| `--artifact [PATH]` | Verify a build directory or an `.apk`/`.aab`/`.ipa`. With no value, auto-detects `dist/`, `build/`, `out/`, `.next/`, `.output/`, `.svelte-kit/`, `www/`, `public/`, `release/`. Finding none is an `ART-00` gap, and so is finding only `public/`: static assets are read, but they are not a build |
+| `--git-history [N]` | Hunt credentials committed in the newest `N` commits (default 300) reachable from **every** ref (`git log --all`: branches, tags, remote-tracking refs, the stash). More commits than `N`, a shallow clone, or a commit git could not show is a `GIT-00` gap |
 | `--deps` | Check dependencies against the OSV vulnerability database |
 | `--url <URL>` | Passive, read-only live header & exposure checks |
 | `--all` | Enable artifacts + git history + dependencies |
@@ -480,14 +480,17 @@ A profile is a default set of stages. It is never a ceiling: an explicit flag
 | `quick` | Source analysis only - currently **identical** to `code` | No |
 | `code` *(default)* | Source analysis: patterns, data-flow and secret detection | No |
 | `full` | `code` + dependencies + git history + build artifacts | No |
-| `release` | Everything in `full`; forces `--fail-on-incomplete` and implies `--fail-on-high` | **Yes** - the only one |
+| `release` | Everything in `full`; forces `--fail-on-incomplete`, and without `--fail-on` exits `1` on anything but `RELEASE_AUDIT_PASSED` | **Yes** - the only one |
 
-`--profile release` exits `1` when any stage was incomplete, **and** on any `CRITICAL`
-or `HIGH` finding - it implies `--fail-on-high`. An explicit `--fail-on <level>` still
-wins, so a team can deliberately gate a release on `critical` only:
+`--profile release` exits `1` when any stage was incomplete, on any `MEDIUM` or worse
+finding at or above `--min-confidence`, and - at the default `--min-confidence low` - on
+any verdict other than `RELEASE_AUDIT_PASSED`. `REVIEW_REQUIRED` says a human must decide
+before release, so the gate does not decide for them by exiting `0`. An explicit
+`--fail-on <level>` still wins, so a team can deliberately gate a release on severity
+alone:
 
 ```bash
-python3 scripts/aegis_scan.py . --profile release                       # incomplete or HIGH -> exit 1
+python3 scripts/aegis_scan.py . --profile release                       # anything but RELEASE_AUDIT_PASSED -> exit 1
 python3 scripts/aegis_scan.py . --profile release --fail-on critical    # incomplete or CRITICAL -> exit 1
 ```
 
@@ -536,7 +539,7 @@ esac
 | Code | Meaning |
 | :--- | :--- |
 | `0` | No gate tripped. **The verdict alone never sets the exit code** - outside `--profile release`, `BLOCKED` exits `0` unless `--fail-on-high` or `--fail-on` is set |
-| `1` | `--fail-on-high` / `--fail-on` (implied `high` by `--profile release`) met a finding at or above `--min-confidence`; or `--fail-on-incomplete` (forced by `--profile release`) met a gap or a scan of zero files |
+| `1` | `--fail-on-high` / `--fail-on` (implied `medium` by `--profile release`) met a finding at or above `--min-confidence`; or `--fail-on-incomplete` (forced by `--profile release`) met a gap or a scan of zero files; or `--profile release` without `--fail-on`, at the default `--min-confidence low`, ended in any verdict but `RELEASE_AUDIT_PASSED` |
 | `2` | The target path does not exist |
 
 #### Release Readiness Score
@@ -731,7 +734,7 @@ Before publishing or merging major features, run the full Vibe Aegis loop:
 2. Follow the orchestration workflow in `.claude/skills/vibe-aegis/SKILL.md` (or `.agents/skills/vibe-aegis/SKILL.md`):
    - **Recon** -> **Security Hunter** -> **UI/UX Hunter** -> **Adversarial Skeptic** -> **Evidence Referee** -> **Guarded Fixer**.
 3. Write the final verified scorecard to `.aegis/AUDIT_REPORT.md`. Do not declare an app ready for production until all `CRITICAL` and `HIGH` confirmed findings are resolved.
-4. Read the scanner's `release_verdict` literally. Only `RELEASE_AUDIT_PASSED` - returned by `--profile release` when the dependency, git-history and build-artifact stages all ran and read what they needed - supports a release claim. `STATIC_CHECKS_PASSED` means only that the source checks which ran found nothing. `INCOMPLETE_SCAN` means something was not examined: say what, and never report it as clean. `--profile release` exits `1` on an incomplete stage and on any `CRITICAL`/`HIGH` finding.
+4. Read the scanner's `release_verdict` literally. Only `RELEASE_AUDIT_PASSED` - returned by `--profile release` when the dependency, git-history and build-artifact stages all ran and read what they needed - supports a release claim. `STATIC_CHECKS_PASSED` means only that the source checks which ran found nothing. `INCOMPLETE_SCAN` means something was not examined: say what, and never report it as clean. `--profile release` exits `1` on an incomplete stage, on any `MEDIUM` or worse finding, and on any verdict other than `RELEASE_AUDIT_PASSED`.
 
 ---
 
