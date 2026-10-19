@@ -114,8 +114,9 @@ output, stderr, exception messages and imported external-engine output
 fails if any rule builds a snippet from raw text. `redact()` now prints only the public
 provider prefix and the length; exact-value matching (`ART-01`, history dedupe, baseline
 fingerprints) reads an in-memory vault instead of the snippet. Known limit: only
-*recognisable* secrets are masked. Trivy's `Secrets` array is not imported at all — a
-coverage gap, not a leak; worth an `ENG`-level fix later.
+*recognisable* secrets are masked. Trivy's `Secrets` are now imported from the masked
+`Match` only; its `Code` context lines are never read, because they hold neighbouring
+source lines unmasked.
 
 ### 2. Test fixture corpus
 `tests/fixtures/{vulnerable,safe}/` — matched pairs per rule, where the safe fixture is
@@ -148,9 +149,9 @@ tested and found inaccurate, so the docs say what the code does instead:
 
 Documenting the profiles exposed real defects, fixed in `9073e8b` before the docs were
 written: `--profile release` certified build-artifact and dependency stages that had read
-nothing; `quick` dropped `--all`; `--artifact` with no value was rejected. Still true and
-documented, not changed: `quick` is identical to `code`, and `--profile release` does not
-fail on findings without `--fail-on-high`.
+nothing; `quick` dropped `--all`; `--artifact` with no value was rejected. Since then,
+`--profile release` also implies `--fail-on-high`. Still true and documented, not changed:
+`quick` is identical to `code`.
 
 ---
 

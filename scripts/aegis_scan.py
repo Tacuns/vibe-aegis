@@ -669,6 +669,151 @@ def detect_tech_stack(root: Path) -> Dict[str, List[str]]:
     return {k: sorted(v) for k, v in stack.items()}
 
 
+# ---------------------------------------------------------------------------
+# Postgres / Supabase privilege rules (SEC-18 .. SEC-21)
+# ---------------------------------------------------------------------------
+# Written from PostgreSQL's documented privilege model and Supabase's documented
+# defaults - no rule text or code from any other tool. Each targets a way a migration
+# hands data to the public API role while every table still has RLS enabled.
+
+# The tag group must always participate: a backreference to an unmatched optional
+# group never matches, so `$$ ... $$` would slip through.
+_DOLLAR_QUOTED = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*|)\$.*?\$\1\$", re.DOTALL)
+_SQL_STATEMENT = re.compile(r"[^;]+")
+_CREATE_FUNCTION = re.compile(
+    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+([A-Za-z0-9_.\"]+)", re.IGNORECASE)
+_CREATE_VIEW = re.compile(
+    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(MATERIALIZED\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+    r"([A-Za-z0-9_.\"]+)", re.IGNORECASE)
+_SECURITY_INVOKER_ON = re.compile(r"security_invoker\s*=\s*'?(?:true|on|1)\b", re.IGNORECASE)
+
+
+def _blank_dollar_quoted(text: str) -> str:
+    """Blank function bodies, keeping length so offsets still map to lines."""
+    return _DOLLAR_QUOTED.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
+def _split_name(qualified: str) -> Tuple[str, str]:
+    parts = qualified.replace('"', "").split(".")
+    return (parts[0].lower() if len(parts) > 1 else "public"), parts[-1].lower()
+
+
+def _api_role_access(sql: str, name: str) -> Optional[bool]:
+    """Does this migration give the Data API roles access to `name`?
+
+    True: an explicit GRANT to anon / authenticated / PUBLIC. False: access revoked from
+    both API roles, and never granted. None: the file does not say, so it depends on
+    the project's default privileges - which Supabase is changing (new projects no
+    longer grant the API roles access to new public objects), so it cannot be assumed.
+    """
+    target = r"(?:TABLE\s+)?(?:public\.)?\"?" + re.escape(name) + r"\"?\b"
+    granted = re.search(r"\bGRANT\b[^;]*\bON\s+" + target + r"[^;]*\bTO\b[^;]*\b(?:anon|authenticated|PUBLIC)\b",
+                        sql, re.IGNORECASE)
+    if granted:
+        return True
+    # Only the role list after FROM: `public.v` is a schema, not the PUBLIC role.
+    revokes = [m.group(1) for m in re.finditer(
+        r"\bREVOKE\b[^;]*\bON\s+" + target + r"[^;]*?\bFROM\b([^;]*)", sql, re.IGNORECASE)]
+    if any(re.search(r"\bPUBLIC\b", r, re.IGNORECASE) for r in revokes) or (
+            any(re.search(r"\banon\b", r, re.IGNORECASE) for r in revokes)
+            and any(re.search(r"\bauthenticated\b", r, re.IGNORECASE) for r in revokes)):
+        return False
+    return None
+
+
+def check_postgres_privilege_rules(rel_path: str, text: str) -> List[Finding]:
+    findings: List[Finding] = []
+    sql = _blank_dollar_quoted(text)
+    lines = text.splitlines()
+
+    def add(rule_id, severity, title, start, standard, remediation, confidence="HIGH"):
+        line_no = text[:start].count("\n") + 1
+        findings.append(Finding(
+            rule_id=rule_id, domain="SECURITY", severity=severity, title=title, file=rel_path,
+            line=line_no, snippet=evidence(lines[line_no - 1] if line_no <= len(lines) else ""),
+            cwe_or_standard=standard, remediation=remediation, confidence=confidence))
+
+    for st in _SQL_STATEMENT.finditer(sql):
+        stmt = st.group(0)
+        lead = len(stmt) - len(stmt.lstrip())
+        start = st.start() + lead
+
+        fn = _CREATE_FUNCTION.match(stmt)
+        if fn and re.search(r"\bSECURITY\s+DEFINER\b", stmt, re.IGNORECASE) \
+                and not re.search(r"\bSET\s+search_path\b", stmt, re.IGNORECASE):
+            _schema, name = _split_name(fn.group(1))
+            fixed_later = re.search(
+                r"ALTER\s+FUNCTION\s+(?:[A-Za-z0-9_\"]+\.)?\"?" + re.escape(name)
+                + r"\"?\b[^;]*\bSET\s+search_path\b", sql, re.IGNORECASE)
+            if not fixed_later:
+                add("SEC-18", "MEDIUM",
+                    f"SECURITY DEFINER Function `{name}` Without A Fixed search_path", start,
+                    "CWE-426 Untrusted Search Path / OWASP A01",
+                    "A SECURITY DEFINER function runs with its owner's privileges, and resolves "
+                    "every unqualified table and function name through the CALLER's search_path. "
+                    "Any role that can create an object earlier on that path - another database "
+                    "user, an extension, a compromised service account - runs its own code as "
+                    "the owner. Pin it: add `SET search_path = ''` to the function and "
+                    "schema-qualify every name inside (`public.orders`, `pg_catalog.now()`).")
+
+        view = _CREATE_VIEW.match(stmt)
+        if not view:
+            continue
+        materialized = bool(view.group(1))
+        schema, name = _split_name(view.group(2))
+        if schema != "public":
+            continue  # only the exposed schema is reachable through the Data API
+        access = _api_role_access(sql, name)
+        if access is False:
+            continue  # the API roles cannot read it at all
+        confidence = "HIGH" if access else "MEDIUM"
+        invoker = bool(_SECURITY_INVOKER_ON.search(stmt)) or bool(re.search(
+            r"ALTER\s+VIEW\s+(?:public\.)?\"?" + re.escape(name) + r"\"?\s+SET\s*\([^)]*"
+            r"security_invoker\s*=\s*'?(?:true|on|1)\b", sql, re.IGNORECASE))
+        if re.search(r"\bauth\s*\.\s*users\b", stmt, re.IGNORECASE) and (materialized or not invoker):
+            add("SEC-19", "CRITICAL",
+                f"Public View `{name}` Exposes auth.users", start,
+                "CWE-200 Exposure of Sensitive Information / OWASP A01",
+                "A view in the public schema is served by the Data API, and without "
+                "`security_invoker` it reads auth.users with its OWNER's rights - so anyone "
+                "holding the anon key can read every user's email, phone and metadata. Keep "
+                "auth.users out of public views: copy the fields you need into a "
+                "public.profiles table guarded by RLS, or move the view to a schema the API "
+                "does not expose." + ("" if access else " This migration does not grant the "
+                "view to anon or authenticated, so whether it is reachable depends on the "
+                "project's default privileges - verify with `\\dp public." + name + "`."),
+                confidence=confidence)
+            continue
+        if materialized or not invoker:
+            add("SEC-20", "MEDIUM",
+                f"Public {'Materialized ' if materialized else ''}View `{name}` Bypasses Row-Level Security",
+                start, "CWE-284 Improper Access Control / Supabase & Postgres RLS",
+                ("A materialized view stores a copy of the rows and has no RLS of its own, so "
+                 "every row it holds is readable through the Data API. Move it to a schema the "
+                 "API does not expose, or revoke SELECT from anon and authenticated."
+                 if materialized else
+                 "Postgres runs a view with its OWNER's privileges unless told otherwise, so "
+                 "RLS on the tables underneath is checked against the owner - usually a role "
+                 "that bypasses it - not against the caller. On Postgres 15+ create it with "
+                 "`WITH (security_invoker = true)`; otherwise revoke access from anon and "
+                 "authenticated or move it out of the public schema."),
+                confidence=confidence)
+
+    for st in _SQL_STATEMENT.finditer(sql):
+        stmt = st.group(0)
+        if re.match(r"^\s*CREATE\s+POLICY\b", stmt, re.IGNORECASE) and \
+                re.search(r"\buser_metadata\b|\braw_user_meta_data\b", stmt, re.IGNORECASE):
+            add("SEC-21", "HIGH", "RLS Policy Trusts User-Editable Metadata",
+                st.start() + len(stmt) - len(stmt.lstrip()),
+                "CWE-807 Reliance on Untrusted Inputs in a Security Decision / OWASP A01",
+                "`user_metadata` (raw_user_meta_data) can be changed by the signed-in user "
+                "themselves - `supabase.auth.updateUser({ data: { role: 'admin' } })` - so a "
+                "policy that reads a role or tenant from it lets any user grant themselves "
+                "access. Put authorization claims in `app_metadata`, which only the server can "
+                "write, or look them up from a table the user cannot modify.")
+    return findings
+
+
 def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Finding]:
     findings: List[Finding] = []
     lines = text.splitlines()
@@ -697,6 +842,9 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
                         remediation=f"Add `ALTER TABLE {table_name} ENABLE ROW LEVEL SECURITY;` and define explicit SELECT/INSERT/UPDATE/DELETE policies.",
                     )
                 )
+
+    if ext == ".sql":
+        findings.extend(check_postgres_privilege_rules(rel_path, text))
 
     # Contextual Check 2: Next.js API Route or Server Action mutating data without an obvious auth check
     is_api_route = (
@@ -2690,6 +2838,13 @@ ENGINE_SPECS: Dict[str, Dict[str, str]] = {
         "role": "Secret detection across full git history",
         "note": "Scans every commit, not just the working tree.",
     },
+    "trufflehog": {
+        "bin": "trufflehog", "licence": "AGPL-3.0",
+        "role": "Secret detection in git history and files",
+        "note": "Always run with --no-verification: verifying a credential means sending "
+                "it to its provider, so a scan would hand every secret it finds to a third "
+                "party. --no-update stops its self-update check.",
+    },
     "trivy": {
         "bin": "trivy", "licence": "Apache-2.0",
         "role": "Dependency, container, IaC and licence scanning",
@@ -2800,6 +2955,17 @@ def parse_trivy(payload: Dict) -> List[Finding]:
                 v.get("VulnerabilityID", ""),
                 f"Upgrade {v.get('PkgName', '')} to {v.get('FixedVersion') or 'a patched release'}.",
             ))
+        for sec in res.get("Secrets", []) or []:
+            # `Match` is masked by trivy itself. `Code` is NOT safe: it carries the
+            # surrounding lines verbatim, and a neighbouring line can hold another
+            # credential in full - so it is never read.
+            out.append(_engine_finding(
+                "trivy", sec.get("RuleID", "secret"), sec.get("Severity", "HIGH"),
+                f"Secret detected: {sec.get('Title', sec.get('RuleID', 'secret'))}",
+                target, sec.get("StartLine", 0), sec.get("Match", ""),
+                "CWE-798 Hard-Coded Credentials",
+                "Rotate this credential and move it to a server-side secret store.",
+            ))
         for m in res.get("Misconfigurations", []) or []:
             out.append(_engine_finding(
                 "trivy", m.get("ID", "MISCONF"), m.get("Severity", "MEDIUM"),
@@ -2807,6 +2973,32 @@ def parse_trivy(payload: Dict) -> List[Finding]:
                 (m.get("CauseMetadata", {}) or {}).get("StartLine", 0),
                 m.get("Message", ""), m.get("ID", ""), m.get("Resolution", ""),
             ))
+    return out
+
+
+def parse_trufflehog(rows: List[Dict]) -> List[Finding]:
+    """One JSON object per finding. Only `Raw` is read, and only through redact().
+
+    `RawV2`, `SecretParts`, `StructuredData` and `ExtraData` can all carry the secret
+    or parts of it, and the git metadata carries the committer's email address. None
+    of them is read.
+    """
+    out: List[Finding] = []
+    for r in rows:
+        data = (r.get("SourceMetadata") or {}).get("Data") or {}
+        loc = data.get("Git") or data.get("Filesystem") or {}
+        commit = str(loc.get("commit", ""))[:10]
+        verified = bool(r.get("Verified"))
+        out.append(_engine_finding(
+            "trufflehog", r.get("DetectorName", "secret"), "CRITICAL" if verified else "HIGH",
+            f"Secret detected: {r.get('DetectorName', 'secret')}"
+            + (" (verified live)" if verified else ""),
+            str(loc.get("file", "")), int(loc.get("line", 0) or 0),
+            f"{redact(str(r.get('Raw', '')))}" + (f" (commit {commit})" if commit else ""),
+            "CWE-798 Hard-Coded Credentials",
+            "Rotate this credential - removing it from the code does not uncompromise it.",
+            confidence="HIGH" if verified else "MEDIUM",
+        ))
     return out
 
 
@@ -2853,6 +3045,7 @@ ENGINE_PARSERS = {
     "semgrep": parse_semgrep,
     "gitleaks": parse_gitleaks,
     "trivy": parse_trivy,
+    "trufflehog": parse_trufflehog,
     "osv-scanner": parse_osv_scanner,
     "scorecard": parse_scorecard,
 }
@@ -2863,11 +3056,31 @@ ENGINE_COMMANDS = {
     "gitleaks": lambda root, _a: ["gitleaks", "detect", "--source", str(root),
                                   "--report-format", "json", "--report-path", "-",
                                   "--no-banner", "--exit-code", "0"],
+    "trufflehog": lambda root, _a: (
+        ["trufflehog", "git", Path(root).resolve().as_uri()] if (Path(root) / ".git").exists()
+        else ["trufflehog", "filesystem", str(root)]) + ["--no-verification", "--no-update", "--json"],
     "trivy": lambda root, _a: ["trivy", "fs", "--format", "json", "--quiet",
                                "--scanners", "vuln,misconfig,secret", str(root)],
     "osv-scanner": lambda root, _a: ["osv-scanner", "--format", "json", "-r", str(root)],
     "scorecard": lambda root, _a: ["scorecard", "--local", str(root), "--format", "json"],
 }
+
+
+NDJSON_ENGINES = {"trufflehog"}
+
+
+def _relative_to(root: Path, findings: List[Finding]) -> List[Finding]:
+    """Engines are given an absolute target and report absolute paths. A report should
+    not carry the scanning machine's directory layout, and SARIF wants repo paths."""
+    base = Path(root).resolve()
+    for f in findings:
+        try:
+            p = Path(f.file)
+            if p.is_absolute():
+                f.file = p.resolve().relative_to(base).as_posix()
+        except (ValueError, OSError):
+            pass
+    return findings
 
 
 def run_engine(name: str, root: Path, timeout: int = 600) -> Tuple[List[Finding], Optional[Finding]]:
@@ -2908,6 +3121,19 @@ def run_engine(name: str, root: Path, timeout: int = 600) -> Tuple[List[Finding]
         return [], gap("engine failed to execute", f"{type(exc).__name__}")
 
     raw = (proc.stdout or "").strip()
+    if name in NDJSON_ENGINES:
+        # One object per line, and NOTHING at all when clean - so an empty stdout is a
+        # pass only together with a zero exit status; a failure exits non-zero.
+        if proc.returncode != 0:
+            return [], gap(f"engine exited {proc.returncode}", proc.stderr or "")
+        try:
+            rows = [json.loads(ln) for ln in raw.splitlines() if ln.strip()]
+        except Exception:
+            return [], gap("engine output was not parseable JSON lines")
+        try:
+            return _relative_to(root, ENGINE_PARSERS[name](rows)), None
+        except Exception as exc:
+            return [], gap("engine output had an unexpected shape", type(exc).__name__)
     if not raw:
         return [], gap("engine produced no output", proc.stderr or "")
     try:
@@ -2922,7 +3148,7 @@ def run_engine(name: str, root: Path, timeout: int = 600) -> Tuple[List[Finding]
             return [], gap("engine output was not parseable JSON")
 
     try:
-        return ENGINE_PARSERS[name](payload), None
+        return _relative_to(root, ENGINE_PARSERS[name](payload)), None
     except Exception as exc:
         return [], gap("engine output had an unexpected shape", type(exc).__name__)
 
@@ -3253,9 +3479,10 @@ def main() -> int:
                            "reachable. quick and code (default): full source, data-flow and "
                            "secret analysis, no deep stage unless you add one - the two are "
                            "currently identical. full: adds dependencies, git history and build "
-                           "artifacts. release: everything, plus --fail-on-incomplete, and the "
-                           "only profile that can return RELEASE_AUDIT_PASSED. A source scan "
-                           "can never certify a release.")
+                           "artifacts. release: everything, plus --fail-on-incomplete and "
+                           "--fail-on-high unless --fail-on is given; the only profile that can "
+                           "return RELEASE_AUDIT_PASSED. A source scan can never certify a "
+                           "release.")
     gate.add_argument("--min-confidence", choices=["high", "medium", "low"], default="low",
                       help="Only let findings at or above this confidence affect the exit code. "
                            "Severity says how bad a finding would be IF real; confidence says how "
@@ -3345,6 +3572,10 @@ def main() -> int:
     if args.profile == "release":
         # A release gate that tolerates an unexamined stage is not a gate.
         args.fail_on_incomplete = True
+        # Nor is one that exits 0 on a BLOCKED verdict. Severity stays its own axis: an
+        # explicit --fail-on still wins, so a team can deliberately gate on CRITICAL only.
+        if not args.fail_on and not args.fail_on_high:
+            args.fail_on_high = True
 
     stages: List[str] = ["static"]
     findings: List[Finding] = []

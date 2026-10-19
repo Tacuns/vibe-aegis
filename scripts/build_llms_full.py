@@ -123,7 +123,7 @@ Also honoured: a `.aegis-ignore` file in the repo root, one entry per line, eith
 
 | Argument | Description |
 | :--- | :--- |
-| `--engine <name>` | Also run an installed `semgrep`, `gitleaks`, `trivy`, `osv-scanner` or `scorecard` and import its findings as `EXT-<ENGINE>:<id>`. Repeatable. Missing, crashing or unparseable is an `ENG-00` gap. `codeql` and `zap` are listed but have no adapter. |
+| `--engine <name>` | Also run an installed `semgrep`, `gitleaks`, `trufflehog` (always `--no-verification`), `trivy`, `osv-scanner` or `scorecard` and import its findings as `EXT-<ENGINE>:<id>`. Repeatable. Missing, crashing or unparseable is an `ENG-00` gap. `codeql` and `zap` are listed but have no adapter. |
 | `--list-engines` | Show which engines are installed, with role and licence, and exit. |
 | `--authorize-network-scan` | Required with `--url` before any engine that sends live traffic. |
 
@@ -134,16 +134,17 @@ Also honoured: a `.aegis-ignore` file in the repo root, one entry per line, eith
 | `quick` | Source analysis only - currently identical to `code` | No |
 | `code` (default) | Source analysis: patterns, data-flow, secret detection | No |
 | `full` | `code` + dependencies + git history + build artifacts | No |
-| `release` | Everything in `full`, and forces `--fail-on-incomplete` | Yes - the only one |
+| `release` | Everything in `full`; forces `--fail-on-incomplete`, implies `--fail-on-high` | Yes - the only one |
 
 An explicit flag always adds its stage to any profile. `--profile release` exits `1` on an
-incomplete stage but not on findings - add `--fail-on-high` for a merge gate.
+incomplete stage and on any `CRITICAL`/`HIGH` finding; an explicit `--fail-on` overrides the
+severity threshold.
 
 ## Exit Codes
 
 | Code | Meaning |
 | :--- | :--- |
-| `0` | No gate flag tripped. The verdict alone never sets the exit code: `BLOCKED` exits `0` without `--fail-on-high` / `--fail-on`. |
+| `0` | No gate tripped. The verdict alone never sets the exit code: outside `--profile release`, `BLOCKED` exits `0` without `--fail-on-high` / `--fail-on`. |
 | `1` | A severity gate met a finding at or above `--min-confidence`, or `--fail-on-incomplete` met a gap or a scan of zero files. |
 | `2` | The target path does not exist. |
 
@@ -219,7 +220,8 @@ With `--diff`, a changeset with no scannable source returns
 
 ## Rule Identifier Reference
 
-- `SEC-01` .. `SEC-17` (and `B`/`C` variants) - security rules, `domain` is `SECURITY`.
+- `SEC-01` .. `SEC-21` (and `B`/`C` variants) - security rules, `domain` is `SECURITY`.
+  `SEC-18` .. `SEC-21` are Postgres/Supabase privilege rules on `.sql` migrations.
 - `SEC-17B` - live server exposure of `/.env` or `/.git/config`, `CRITICAL`.
 - `UX-01` .. `UX-12` - UI/UX rules, `domain` is `UI_UX`.
 - `PAY-01` .. `PAY-03` - payments, `domain` is `PAYMENTS`. `REL-01` .. `REL-04` - reliability, `domain` is `RELIABILITY`.

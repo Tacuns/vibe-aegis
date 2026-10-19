@@ -31,14 +31,37 @@ grep -q '"release_verdict": "READY TO PUBLISH"' .aegis/scan-report.json
 python3 .aegis/scripts/aegis_scan.py . --profile release --fail-on-high
 ```
 
-`--profile release` exits `1` on an incomplete stage but not on findings, which are a
-separate axis: keep `--fail-on-high` for a merge gate.
+`--profile release` exits `1` on an incomplete stage and on any `CRITICAL`/`HIGH` finding.
+An explicit `--fail-on <level>` overrides the severity threshold.
 
 ### Added
 
+- **`SEC-18` .. `SEC-21`, Postgres/Supabase privilege rules** for `.sql` migrations, written
+  from PostgreSQL's privilege model with no rule text or code from any other tool: a
+  `SECURITY DEFINER` function without a fixed `search_path`; a public view exposing
+  `auth.users`; a public view bypassing RLS (no `security_invoker`, or materialized); an RLS
+  policy trusting user-editable `user_metadata`. Each attack is executed against a real
+  PostgreSQL in CI, succeeding on the flagged migration and failing on the fix. A grant or
+  revoke in the same file sets the confidence, because Supabase no longer grants the API
+  roles new public objects by default.
+- **`--engine trufflehog`**, always with `--no-verification` (verification would send each
+  credential found to its provider) and `--no-update`. Clean TruffleHog prints nothing and
+  exits `0`; that is read as clean, and a non-zero exit as a gap.
+- **Trivy `Secrets` are imported.** They were silently dropped. Only `Match`, which Trivy
+  masks, is read - never `Code`, whose context lines carry neighbouring source unmasked; a
+  real run showed a full database password there.
+- Engine findings report repository-relative paths instead of the scanning machine's.
+- `.github/dependabot.yml` keeps this repository's own Actions current.
 - `--profile quick|code|full|release`, five verdicts, external engine adapters
   (`--engine`, `--list-engines`, `--authorize-network-scan`), `--max-file-size`, and the
   coverage ledger (`COV-00`) - all documented in the README for the first time.
+
+### Changed
+
+- **`--profile release` now implies `--fail-on-high`.** It exited `0` on a `BLOCKED`
+  verdict unless `--fail-on-high` was also passed - a release gate that let a release with
+  an open HIGH through. An explicit `--fail-on <level>` still sets the threshold.
+- `SEC-18` is `MEDIUM`: exploiting it needs a role that can create database objects.
 
 ### Fixed - documentation
 

@@ -1433,6 +1433,13 @@ REDACTION_CORPUS = {
         "CREATE TABLE notes (id int, token text DEFAULT '%s');\n"
         'CREATE POLICY "%s" ON notes FOR ALL USING (true);\n' % (E, E)),
     "lib/rules.js": "allow read, write: if true; const k = \"%s\";\n" % E,
+    "db/privileges.sql": (
+        "create function public.rec(m text) returns void language plpgsql security definer "
+        "as $$ begin perform w('%s'); end $$;\n"
+        "create view public.v1 as select email, '%s' as k from auth.users;\n"
+        "create view public.v2 as select '%s' as k from public.notes;\n"
+        "create policy p on public.t using (auth.jwt()->'user_metadata'->>'k' = '%s');\n"
+        % (E, E, E, E)),
     "lib/keys.ts": (
         'const NEXT_PUBLIC_STRIPE_SECRET = "%s";\n'
         'const stripe = new Stripe("%s");\n'
@@ -1543,12 +1550,10 @@ def scanner_rule_ids():
                     and re.fullmatch(r"[A-Z]+-\d{2}[A-Z]?", sub.value):
                 ids.add(sub.value)
 
-    for node in ast.walk(tree):
-        if isinstance(node, ast.keyword) and node.arg == "rule_id":
-            take(node.value)
-        elif isinstance(node, ast.Assign) and any(
-                isinstance(t, ast.Attribute) and t.attr == "rule_id" for t in node.targets):
-            take(node.value)
+    # Every string constant that IS a rule id, wherever it appears. Looking only at
+    # `rule_id=` keywords missed rules that pass their id positionally to a helper -
+    # SEC-18..21 did exactly that and slipped past this guard when first added.
+    take(tree)
     for table in (aegis_scan.SECURITY_PATTERNS, aegis_scan.UIUX_PATTERNS,
                   aegis_scan.DOMAIN_PATTERNS, aegis_scan.TAINT_SINKS):
         ids.update(row[0] for row in table)
@@ -2416,3 +2421,396 @@ class TestDocumentationMatchesTheScanner(unittest.TestCase):
             fresh = (copy / "llms-full.txt").read_text(encoding="utf-8")
         self.assertEqual(fresh, self._read("llms-full.txt"),
                          "run `python scripts/build_llms_full.py .` and commit the result")
+
+
+# ---------------------------------------------------------------------------
+# Postgres / Supabase privilege rules (SEC-18 .. SEC-21)
+# ---------------------------------------------------------------------------
+
+def _sql_findings(sql):
+    masked = aegis_scan.mask_comments(sql, ".sql")
+    return aegis_scan.check_postgres_privilege_rules("db/migration.sql", masked)
+
+
+def _sql_ids(sql):
+    return sorted(f.rule_id for f in _sql_findings(sql))
+
+
+class TestPostgresPrivilegeRules(unittest.TestCase):
+    """Each rule fires on the vulnerable migration and stays silent on the correct one."""
+
+    # SEC-18 ---------------------------------------------------------------
+    def test_security_definer_without_search_path_fires(self):
+        sql = ("create function public.record(m text) returns void language plpgsql "
+               "security definer as $$ begin perform write_audit(m); end $$;\n")
+        found = _sql_findings(sql)
+        self.assertEqual([f.rule_id for f in found], ["SEC-18"])
+        self.assertEqual((found[0].severity, found[0].line), ("MEDIUM", 1))
+
+    def test_security_definer_with_pinned_search_path_is_silent(self):
+        self.assertEqual(_sql_ids(
+            "create or replace function public.record(m text) returns void language plpgsql\n"
+            "security definer set search_path = '' as $$ begin perform public.w(m); end $$;\n"), [])
+
+    def test_search_path_pinned_later_by_alter_function_is_silent(self):
+        self.assertEqual(_sql_ids(
+            "create function public.record() returns void language sql security definer as $$ select 1 $$;\n"
+            "alter function public.record() set search_path = '';\n"), [])
+
+    def test_security_invoker_function_is_silent(self):
+        self.assertEqual(_sql_ids(
+            "create function public.f() returns int language sql as $$ select 1 $$;\n"), [])
+
+    def test_keywords_inside_a_function_body_do_not_fire(self):
+        """A body is code, not DDL: text in $$ ... $$ or $tag$ ... $tag$ is ignored."""
+        self.assertEqual(_sql_ids(
+            "create function public.f() returns void language plpgsql set search_path = '' as $body$\n"
+            "begin execute 'create view public.v as select * from auth.users'; "
+            "raise notice 'security definer'; end $body$;\n"), [])
+
+    # SEC-19 ---------------------------------------------------------------
+    def test_public_view_over_auth_users_fires(self):
+        found = _sql_findings("create view public.user_emails as select id, email from auth.users;\n"
+                              "grant select on public.user_emails to anon;\n")
+        self.assertEqual([(f.rule_id, f.severity, f.confidence) for f in found],
+                         [("SEC-19", "CRITICAL", "HIGH")])
+
+    def test_unqualified_view_is_in_public(self):
+        self.assertEqual(_sql_ids("create view user_emails as select email from auth.users;\n"), ["SEC-19"])
+
+    def test_without_a_grant_confidence_is_medium(self):
+        """Supabase no longer grants the API roles new public objects by default."""
+        found = _sql_findings("create view public.v as select email from auth.users;\n")
+        self.assertEqual([(f.rule_id, f.confidence) for f in found], [("SEC-19", "MEDIUM")])
+
+    def test_view_over_auth_users_with_security_invoker_is_silent(self):
+        self.assertEqual(_sql_ids(
+            "create view public.v with (security_invoker = true) as select email from auth.users;\n"), [])
+
+    def test_view_in_a_private_schema_is_silent(self):
+        self.assertEqual(_sql_ids("create view private.v as select email from auth.users;\n"), [])
+
+    def test_view_revoked_from_both_api_roles_is_silent(self):
+        self.assertEqual(_sql_ids(
+            "create view public.v as select email from auth.users;\n"
+            "revoke all on public.v from anon, authenticated;\n"), [])
+
+    def test_revoking_only_anon_still_fires(self):
+        self.assertEqual(_sql_ids("create view public.v as select email from auth.users;\n"
+                                  "revoke all on public.v from anon;\n"), ["SEC-19"])
+
+    # SEC-20 ---------------------------------------------------------------
+    def test_plain_public_view_fires(self):
+        found = _sql_findings("create view public.all_notes as select * from public.notes;\n"
+                              "grant select on public.all_notes to authenticated;\n")
+        self.assertEqual([(f.rule_id, f.severity, f.confidence) for f in found],
+                         [("SEC-20", "MEDIUM", "HIGH")])
+
+    def test_materialized_view_fires_even_with_security_invoker_text(self):
+        self.assertEqual(_sql_ids("create materialized view public.stats as select count(*) from public.notes;\n"),
+                         ["SEC-20"])
+
+    def test_security_invoker_view_is_silent(self):
+        for spelling in ("security_invoker = true", "security_invoker=on", "security_invoker = 'true'"):
+            self.assertEqual(_sql_ids("create view public.v with (%s) as select * from public.notes;\n"
+                                      % spelling), [], spelling)
+
+    def test_security_invoker_set_later_by_alter_view_is_silent(self):
+        self.assertEqual(_sql_ids("create view public.v as select * from public.notes;\n"
+                                  "alter view public.v set (security_invoker = true);\n"), [])
+
+    def test_security_invoker_false_still_fires(self):
+        self.assertEqual(_sql_ids(
+            "create view public.v with (security_invoker = false) as select * from public.notes;\n"), ["SEC-20"])
+
+    # SEC-21 ---------------------------------------------------------------
+    def test_policy_reading_user_metadata_fires(self):
+        found = _sql_findings(
+            "create policy admins on public.reports for select to authenticated\n"
+            "  using ((auth.jwt() -> 'user_metadata' ->> 'role') = 'admin');\n")
+        self.assertEqual([(f.rule_id, f.severity) for f in found], [("SEC-21", "HIGH")])
+
+    def test_policy_reading_raw_user_meta_data_fires(self):
+        self.assertEqual(_sql_ids(
+            "create policy p on public.r using (exists (select 1 from auth.users u where "
+            "u.id = auth.uid() and u.raw_user_meta_data->>'role' = 'admin'));\n"), ["SEC-21"])
+
+    def test_policy_reading_app_metadata_is_silent(self):
+        self.assertEqual(_sql_ids(
+            "create policy admins on public.reports for select\n"
+            "  using ((auth.jwt() -> 'app_metadata' ->> 'role') = 'admin');\n"), [])
+
+    def test_user_metadata_outside_a_policy_is_silent(self):
+        self.assertEqual(_sql_ids(
+            "create table public.profiles (id uuid, user_metadata jsonb);\n"), [])
+
+    # general --------------------------------------------------------------
+    def test_commented_out_vulnerable_sql_is_silent(self):
+        self.assertEqual(_sql_ids(
+            "-- create view public.v as select email from auth.users;\n"
+            "/* create policy p on t using (auth.jwt()->'user_metadata'->>'r' = 'a'); */\n"), [])
+
+    def test_rules_run_through_the_repository_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "supabase/migrations/001.sql",
+                  "create view public.v as select email from auth.users;\n")
+            findings, _ = aegis_scan.scan_repository(Path(tmp))
+        self.assertIn("SEC-19", {f.rule_id for f in findings})
+
+    def test_snippets_are_masked(self):
+        found = _sql_findings("create view public.v as select email, '%s' as k from auth.users;\n" % E)
+        self.assertEqual(leaked(finding_blob(found)), [])
+
+
+def _find_postgres_bin():
+    import glob
+    for d in sorted(glob.glob("/usr/lib/postgresql/*/bin"), reverse=True) + [""]:
+        initdb = os.path.join(d, "initdb") if d else shutil.which("initdb")
+        if initdb and os.path.exists(initdb):
+            return os.path.dirname(initdb)
+    return None
+
+
+_PG_BIN = _find_postgres_bin()
+
+
+@unittest.skipUnless(_PG_BIN and hasattr(os, "geteuid") and os.geteuid() != 0,
+                     "needs PostgreSQL binaries and a non-root user (initdb refuses root)")
+class TestPostgresPrivilegeRulesAgainstARealDatabase(unittest.TestCase):
+    """Run the attacks for real, then check the scanner flags exactly what was exploitable.
+
+    `tests/sql/privilege_proofs.sql` performs each attack against a throwaway cluster:
+    anon reading auth.users, RLS bypassed through a view, a policy fooled by edited
+    metadata, and a search_path hijack that makes an ordinary role superuser - each next
+    to its documented fix. The scanner must flag every statement shown exploitable and
+    none of the fixes.
+    """
+
+    PROOF = REPO_ROOT / "tests" / "sql" / "privilege_proofs.sql"
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        data, sock = Path(cls._tmp.name) / "data", Path(cls._tmp.name) / "s"
+        sock.mkdir()
+        run = lambda *a: subprocess.run(list(a), capture_output=True, text=True, timeout=120)
+        r = run(os.path.join(_PG_BIN, "initdb"), "-D", str(data), "-A", "trust", "-U", "postgres")
+        assert r.returncode == 0, r.stderr
+        r = run(os.path.join(_PG_BIN, "pg_ctl"), "-D", str(data), "-w", "-l", str(data / "log"),
+                "-o", "-k %s -c listen_addresses=" % sock, "start")
+        assert r.returncode == 0, r.stdout + r.stderr
+        cls._stop = lambda: run(os.path.join(_PG_BIN, "pg_ctl"), "-D", str(data), "-m", "fast", "stop")
+        psql = os.path.join(_PG_BIN, "psql")
+        out = run(psql, "-h", str(sock), "-U", "postgres", "-d", "postgres", "-X", "-q",
+                  "-f", str(cls.PROOF))
+        cls.output = out.stdout + out.stderr
+        cls.results = dict(re.findall(r"NOTICE:\s+(\w+)=(\w+)", cls.output))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._stop()
+        cls._tmp.cleanup()
+
+    def test_every_attack_works_and_every_fix_blocks_it(self):
+        self.assertEqual(self.results, {
+            "SEC19_VULNERABLE_ROWS": "2", "SEC19_FIXED": "denied",
+            "SEC20_TABLE_ROWS": "1", "SEC20_VULNERABLE_ROWS": "2", "SEC20_FIXED_ROWS": "1",
+            "SEC21_VULNERABLE_ROWS": "1", "SEC21_FIXED_ROWS": "0",
+            "SEC18_FIXED_SUPERUSER": "false", "SEC18_VULNERABLE_SUPERUSER": "true",
+        }, self.output)
+
+    def test_scanner_flags_exactly_the_exploitable_statements(self):
+        sql = self.PROOF.read_text(encoding="utf-8")
+        found = _sql_findings(sql)
+        lines = sql.splitlines()
+        name = lambda ln: re.search(r"(?:function|view|policy)\s+([\w.]+)", ln).group(1)
+        flagged = sorted((f.rule_id, name(lines[f.line - 1])) for f in found)
+        self.assertEqual(flagged, [("SEC-18", "public.record_event"), ("SEC-19", "public.user_emails"),
+                                   ("SEC-20", "public.all_notes"), ("SEC-21", "meta_admin")])
+
+
+# ---------------------------------------------------------------------------
+# TruffleHog adapter, Trivy secrets, and the release profile's severity gate
+# ---------------------------------------------------------------------------
+
+def _trufflehog_row(raw, verified=False, git=True):
+    """The shape real TruffleHog v3 emits, one object per line, with a canary in every
+    field that can hold the secret or personal data."""
+    loc = ({"Git": {"commit": "97b8e68b4cb50d85b17ee5b3f76ee5098159e971", "file": "k.py",
+                    "email": "Dev <dev-%s@corp.example>" % CANARY_ENV_PASS, "line": 2,
+                    "repository": "file:///work/app", "timestamp": "2026-10-19 02:00:00 +0000"}}
+           if git else {"Filesystem": {"file": "/work/app/k.py", "line": 2}})
+    return {"SourceMetadata": {"Data": loc}, "SourceID": 1, "SourceType": 16, "SourceName": "trufflehog - git",
+            "DetectorType": 8, "DetectorName": "Github", "DetectorDescription": "GitHub token",
+            "DecoderName": "PLAIN", "Verified": verified, "VerificationFromCache": False,
+            "Raw": raw, "RawV2": raw + CANARY_WEBHOOK_BODY, "Redacted": "",
+            "ExtraData": {"username": CANARY_URL_PASS}, "StructuredData": {"token": CANARY_ENTROPY},
+            "SecretParts": {"key": CANARY_ENTROPY}}
+
+
+class TestTruffleHogAdapter(unittest.TestCase):
+
+    def test_parser_reads_only_raw_and_only_through_redact(self):
+        found = aegis_scan.parse_trufflehog([_trufflehog_row(CANARY_STRIPE)])
+        self.assertEqual(len(found), 1)
+        f = found[0]
+        self.assertEqual((f.rule_id, f.file, f.line), ("EXT-TRUFFLEHOG:Github", "k.py", 2))
+        self.assertIn("sk_live_...[REDACTED", f.snippet)
+        self.assertIn("commit 97b8e68b4c", f.snippet)
+        self.assertEqual(leaked(finding_blob(found)), [], "RawV2 / ExtraData / email leaked")
+
+    def test_unverified_is_high_and_medium_confidence_verified_is_critical(self):
+        unverified, verified = aegis_scan.parse_trufflehog(
+            [_trufflehog_row(CANARY_STRIPE), _trufflehog_row(CANARY_STRIPE, verified=True)])
+        self.assertEqual((unverified.severity, unverified.confidence), ("HIGH", "MEDIUM"))
+        self.assertEqual((verified.severity, verified.confidence), ("CRITICAL", "HIGH"))
+
+    def test_filesystem_mode_rows_parse(self):
+        f = aegis_scan.parse_trufflehog([_trufflehog_row(CANARY_STRIPE, git=False)])[0]
+        self.assertEqual((f.file, f.line), ("/work/app/k.py", 2))
+
+    def test_command_always_disables_verification_and_updates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = Path(tmp)
+            repo = Path(tmp) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            for root, mode in ((plain, "filesystem"), (repo, "git")):
+                cmd = aegis_scan.ENGINE_COMMANDS["trufflehog"](root, None)
+                self.assertEqual(cmd[1], mode)
+                self.assertIn("--no-verification", cmd)
+                self.assertIn("--no-update", cmd)
+        self.assertTrue(cmd[2].startswith("file://"))
+
+    def _run_fake(self, script):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir, root = Path(tmp) / "bin", Path(tmp) / "app"
+            bin_dir.mkdir(); root.mkdir()
+            exe = bin_dir / "trufflehog"
+            exe.write_text("#!/bin/sh\n" + script, encoding="utf-8")
+            exe.chmod(0o755)
+            real = os.environ.get("PATH", "")
+            os.environ["PATH"] = str(bin_dir) + os.pathsep + real
+            try:
+                return aegis_scan.run_engine("trufflehog", root)
+            finally:
+                os.environ["PATH"] = real
+
+    @unittest.skipUnless(os.name == "posix", "fake engines are POSIX shell scripts")
+    def test_empty_output_with_exit_zero_is_clean_not_a_gap(self):
+        """Clean TruffleHog prints nothing at all; that must not read as 'did not run'."""
+        self.assertEqual(self._run_fake("exit 0\n"), ([], None))
+
+    @unittest.skipUnless(os.name == "posix", "fake engines are POSIX shell scripts")
+    def test_non_zero_exit_is_a_gap(self):
+        found, gap = self._run_fake("echo 'fatal: repo not found' >&2\nexit 1\n")
+        self.assertEqual((found, gap.rule_id), ([], "ENG-00"))
+        self.assertIn("exited 1", gap.snippet)
+
+    @unittest.skipUnless(os.name == "posix", "fake engines are POSIX shell scripts")
+    def test_unparseable_lines_are_a_gap(self):
+        found, gap = self._run_fake("echo 'not json %s'\nexit 0\n" % E)
+        self.assertEqual((found, gap.rule_id), ([], "ENG-00"))
+        self.assertEqual(leaked(finding_blob([gap])), [])
+
+    @unittest.skipUnless(os.name == "posix", "fake engines are POSIX shell scripts")
+    def test_json_lines_are_imported(self):
+        rows = "\n".join(json.dumps(_trufflehog_row(CANARY_STRIPE, git=g)) for g in (True, False))
+        found, gap = self._run_fake("cat <<'EOF'\n%s\nEOF\n" % rows)
+        self.assertIsNone(gap)
+        self.assertEqual(len(found), 2)
+        self.assertEqual(leaked(finding_blob(found)), [])
+
+
+class TestTrivySecretsAreImported(unittest.TestCase):
+
+    def test_secrets_imported_from_match_never_from_code(self):
+        """Real trivy masks Match, but Code carries neighbouring lines verbatim."""
+        payload = {"Results": [{"Target": "k.py", "Class": "secret", "Secrets": [{
+            "RuleID": "github-pat", "Category": "GitHub", "Severity": "CRITICAL",
+            "Title": "GitHub Personal Access Token", "StartLine": 1, "EndLine": 1,
+            "Match": 'token = "****************************************"', "Offset": 9,
+            "Code": {"Lines": [
+                {"Number": 1, "Content": 'token = "****"', "IsCause": True},
+                {"Number": 2, "Content": 'url = "postgres://app:%s@db/app"' % CANARY_URL_PASS,
+                 "IsCause": False},
+                {"Number": 3, "Content": 'other = "%s"' % E, "IsCause": False}]}}]}]}
+        found = aegis_scan.parse_trivy(payload)
+        self.assertEqual([(f.rule_id, f.severity, f.file, f.line) for f in found],
+                         [("EXT-TRIVY:github-pat", "CRITICAL", "k.py", 1)])
+        self.assertEqual(leaked(finding_blob(found)), [])
+
+    def test_an_unmasked_match_is_still_redacted(self):
+        found = aegis_scan.parse_trivy({"Results": [{"Target": "a.js", "Secrets": [{
+            "RuleID": "stripe", "Severity": "HIGH", "Title": "t", "StartLine": 3,
+            "Match": 'k = "%s"' % CANARY_STRIPE}]}]})
+        self.assertEqual(leaked(finding_blob(found)), [])
+
+    def test_vulnerabilities_and_misconfigurations_still_parse(self):
+        found = aegis_scan.parse_trivy({"Results": [{"Target": "Dockerfile",
+            "Vulnerabilities": [{"VulnerabilityID": "CVE-1", "PkgName": "x", "Severity": "HIGH"}],
+            "Misconfigurations": [{"ID": "DS001", "Title": "t", "Severity": "LOW"}]}]})
+        self.assertEqual(len(found), 2)
+
+
+class TestEngineFilePathsAreRepositoryRelative(unittest.TestCase):
+
+    def test_absolute_paths_under_the_root_become_relative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            f = aegis_scan._engine_finding("x", "r", "LOW", "t", str(root / "src" / "a.py"), 1, "s", "c", "r")
+            outside = aegis_scan._engine_finding("x", "r", "LOW", "t", "/elsewhere/b.py", 1, "s", "c", "r")
+            aegis_scan._relative_to(root, [f, outside])
+        self.assertEqual((f.file, outside.file), ("src/a.py", "/elsewhere/b.py"))
+
+
+@unittest.skipUnless(all(shutil.which(b) for b in ("trufflehog", "gitleaks", "trivy", "git")),
+                     "needs the real trufflehog, gitleaks and trivy binaries on PATH")
+class TestRealEnginesThroughOurAdapters(unittest.TestCase):
+    """Run when the real tools are installed: a fake-binary test proves our assumptions
+    about their output, this proves the assumptions were right."""
+
+    def test_real_engines_find_and_redact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "app"
+            write(root, "k.py", 'token = "%s"\nurl = "postgres://app:%s@db.internal/app"\n'
+                  % (GH_TOKEN, "Zx9Qw2" + "Lp7Rt4"))
+            _git_init(root)
+            results = {n: aegis_scan.run_engine(n, root) for n in ("trufflehog", "gitleaks", "trivy")}
+        for name, (found, gap) in results.items():
+            self.assertIsNone(gap, "%s: %s" % (name, gap and gap.snippet))
+            self.assertTrue(found, name)
+            blob = finding_blob(found)
+            self.assertEqual(leaked(blob, (GH_TOKEN[4:], "Zx9Qw2" + "Lp7Rt4")), [], name)
+            self.assertNotIn("dev@localhost", blob, name)
+            self.assertTrue(all(not Path(f.file).is_absolute() for f in found), name)
+
+
+class TestReleaseProfileFailsOnHighByDefault(unittest.TestCase):
+    """`--profile release` used to exit 0 on a BLOCKED verdict unless --fail-on-high."""
+
+    def _release(self, extra):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "app"
+            write(root, "app.py", "import subprocess\nsubprocess.run(cmd, shell=True)\n")   # SEC-08 HIGH
+            write(root, "requirements.txt", "flask==3.0.3\n")
+            write(root, "dist/index.js", "var a=1;")
+            _git_init(root)
+            return _run_main([str(root), "--profile", "release", "--quiet"] + extra)
+
+    def test_a_high_finding_fails_the_release_profile_without_any_flag(self):
+        code, out = self._release([])
+        self.assertIn(aegis_scan.VERDICT_BLOCKED, out)
+        self.assertEqual(code, 1, out)
+
+    def test_an_explicit_fail_on_still_wins(self):
+        """A team may deliberately gate a release on CRITICAL only."""
+        code, out = self._release(["--fail-on", "critical"])
+        self.assertIn(aegis_scan.VERDICT_BLOCKED, out)
+        self.assertEqual(code, 0, out)
+
+    def test_other_profiles_are_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "app.py", "import subprocess\nsubprocess.run(cmd, shell=True)\n")
+            code, out = _run_main([tmp, "--quiet"])
+        self.assertIn(aegis_scan.VERDICT_BLOCKED, out)
+        self.assertEqual(code, 0, out)

@@ -228,7 +228,8 @@ not run"* is never reported as *"semgrep found nothing"*.
 | :--- | :--- | :--- | :--- |
 | `semgrep` | AST pattern analysis across languages | LGPL-2.1-only (CLI) | `semgrep scan --config auto --json --quiet --timeout 300 <target>` |
 | `gitleaks` | Secrets across full git history | MIT | `gitleaks detect --source <target> --report-format json --report-path - --no-banner --exit-code 0` |
-| `trivy` | Dependencies, IaC misconfiguration | Apache-2.0 | `trivy fs --format json --quiet --scanners vuln,misconfig,secret <target>` |
+| `trufflehog` | Secrets in git history and files | AGPL-3.0 | `trufflehog filesystem <target> --no-verification --no-update --json` — or `trufflehog git file://<target> ...` with the same flags when `<target>` is a git repository |
+| `trivy` | Dependencies, IaC misconfiguration, secrets | Apache-2.0 | `trivy fs --format json --quiet --scanners vuln,misconfig,secret <target>` |
 | `osv-scanner` | Lockfile-accurate vulnerability scan | Apache-2.0 | `osv-scanner --format json -r <target>` |
 | `scorecard` | Supply-chain posture of the repository | Apache-2.0 | `scorecard --local <target> --format json` |
 | `codeql` | Interprocedural data flow | GitHub CodeQL Terms (restricted for some commercial use) | **No adapter.** Needs a prebuilt database; requesting it records an `ENG-00` gap |
@@ -237,8 +238,12 @@ not run"* is never reported as *"semgrep found nothing"*.
 Imported findings keep the engine's own rule id behind an `EXT-<ENGINE>:` prefix (for
 example `EXT-SEMGREP:generic.secrets...`) in the `EXTERNAL` domain, so another tool's output
 is never presented as ours, and their text is masked for credentials like everything else.
-Trivy's separate `Secrets` results are not imported yet. Licences apply to the tools you
-install; Vibe Aegis copies no code from them and only reads their documented JSON output.
+Only fields that cannot carry a secret are read, plus the matched value through `redact()`:
+TruffleHog's `RawV2`, `SecretParts`, `StructuredData`, `ExtraData` and committer email,
+and Trivy's `Code` context lines (which hold neighbouring source lines unmasked), are never
+read. TruffleHog always runs with `--no-verification` - verifying a credential means
+sending it to its provider - and `--no-update`. Licences apply to the tools you install;
+Vibe Aegis copies no code or rules from them and only reads their JSON output.
 
 **What leaves your machine.** A default scan (`--profile code`) makes no network request,
 and there is no telemetry, ever. The scanner itself has exactly two network features, both
@@ -289,6 +294,17 @@ Also honoured: a `.aegis-ignore` file in the repo root, one entry per line — e
 | `SEC-15` | **Insecure File Uploads** | Medium | Upload handlers accepting arbitrary MIME types, missing size limits, or storing files with user-supplied paths (path traversal) |
 | `SEC-16` | **Supply-Chain & Slopsquatting** | Medium | Unpinned dependencies, suspicious AI-hallucinated package names, or lockfile mismatches |
 | `SEC-17` | **Live Posture & Exposed Artifacts** | Low–Crit | Publicly reachable `.env`, `.git/config`, `.map` source maps, debug endpoints, or missing CSP / HSTS / `X-Frame-Options` headers |
+| `SEC-18` | **`SECURITY DEFINER` Without A Fixed `search_path`** | Medium | A function that runs with its owner's rights but resolves names through the caller's `search_path` — any role that can create objects can hijack it. Fix: `SET search_path = ''` |
+| `SEC-19` | **Public View Exposing `auth.users`** | Critical | A view in `public` reading `auth.users` with its owner's rights, so the anon key reads every user's email |
+| `SEC-20` | **Public View Bypassing RLS** | Medium | A view without `security_invoker = true` (or any materialized view) checks RLS against its owner, not the caller |
+| `SEC-21` | **RLS Policy Trusting `user_metadata`** | High | A policy reading a role from `user_metadata`, which every signed-in user can edit about themselves. Use `app_metadata` |
+
+`SEC-18` to `SEC-21` are each proven against a real PostgreSQL by
+`TestPostgresPrivilegeRulesAgainstARealDatabase`: the attack succeeds on the flagged
+migration (an ordinary role becomes superuser; anon reads every email; one user reads
+another's rows; an edited claim unlocks an admin table) and fails on the fix. A grant or
+revoke in the same migration sets the confidence — no grant to the API roles means it
+depends on the project's default privileges, so it is reported at `MEDIUM` confidence.
 
 ### B. UI/UX Design & Frontend QA Bug Finder
 
@@ -409,13 +425,15 @@ A profile is a default set of stages. It is never a ceiling: an explicit flag
 | `quick` | Source analysis only - currently **identical** to `code` | No |
 | `code` *(default)* | Source analysis: patterns, data-flow and secret detection | No |
 | `full` | `code` + dependencies + git history + build artifacts | No |
-| `release` | Everything in `full`, and forces `--fail-on-incomplete` | **Yes** - the only one |
+| `release` | Everything in `full`; forces `--fail-on-incomplete` and implies `--fail-on-high` | **Yes** - the only one |
 
-`--profile release` exits `1` when any stage was incomplete. It does **not** fail on
-findings by itself - severity is a separate axis. For a merge gate, combine them:
+`--profile release` exits `1` when any stage was incomplete, **and** on any `CRITICAL`
+or `HIGH` finding - it implies `--fail-on-high`. An explicit `--fail-on <level>` still
+wins, so a team can deliberately gate a release on `critical` only:
 
 ```bash
-python3 scripts/aegis_scan.py . --profile release --fail-on-high
+python3 scripts/aegis_scan.py . --profile release                       # incomplete or HIGH -> exit 1
+python3 scripts/aegis_scan.py . --profile release --fail-on critical    # incomplete or CRITICAL -> exit 1
 ```
 
 A release stage that had nothing to read is a gap, not a pass: no build output, a missing
@@ -462,8 +480,8 @@ esac
 
 | Code | Meaning |
 | :--- | :--- |
-| `0` | No gate flag tripped. **The verdict alone never sets the exit code** - `BLOCKED` exits `0` unless `--fail-on-high` or `--fail-on` is set |
-| `1` | `--fail-on-high` / `--fail-on` met a finding at or above `--min-confidence`; or `--fail-on-incomplete` (forced by `--profile release`) met a gap or a scan of zero files |
+| `0` | No gate tripped. **The verdict alone never sets the exit code** - outside `--profile release`, `BLOCKED` exits `0` unless `--fail-on-high` or `--fail-on` is set |
+| `1` | `--fail-on-high` / `--fail-on` (implied `high` by `--profile release`) met a finding at or above `--min-confidence`; or `--fail-on-incomplete` (forced by `--profile release`) met a gap or a scan of zero files |
 | `2` | The target path does not exist |
 
 #### Release Readiness Score
@@ -474,6 +492,23 @@ skipped checks do not cost ten points, they make the verdict `INCOMPLETE_SCAN`.
 
 Called directly, `compute_readiness_score([DEP-00])` also fails closed: any rule id ending
 `-00` is a gap however the `Finding` was built. `allow_skipped=True` is the explicit opt-out.
+
+## 🧩 Pair It With Platform Controls
+
+A static scan reads files. Some protections can only live on the platform that hosts
+your code or data, and they catch things no scan of a checkout can see. Turn these on as
+well - Vibe Aegis does not replace them:
+
+| Control | What it adds that a scan of your files cannot |
+| :--- | :--- |
+| **GitHub secret scanning + push protection** | Blocks a credential at `git push`, *before* it reaches the remote - after that it must be rotated. Free for public repositories; enable it in the repository's security settings |
+| **Dependabot** (`.github/dependabot.yml`) | Opens pull requests to update vulnerable or outdated dependencies and Actions as advisories appear, between scans. This repository ships one for its own Actions |
+| **Supabase Security Advisor** | Inspects the *live* database - the grants and policies actually in force - while `SEC-02` and `SEC-18`..`SEC-21` can only read your migration files. Supabase's default grants on `public` are also changing ([changelog](https://supabase.com/changelog/45329-breaking-change-tables-not-exposed-to-data-and-graphql-api-automatically)), which only the live database can show |
+| **Claude Code `/security-review`** | Built into Claude Code: an AI review of the pending changes on your branch. Complementary - it reasons about intent, this scanner gives deterministic, repeatable rules |
+
+Commercial dependency services (Snyk, Socket.dev) are not integrated: they need an account
+and send your dependency list to the vendor. `--engine osv-scanner` or `--engine trivy`
+covers the same ground locally.
 
 ## 🖥️ How to Use Across Every AI Coding Agent
 

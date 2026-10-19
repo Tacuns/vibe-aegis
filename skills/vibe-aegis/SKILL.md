@@ -35,6 +35,9 @@ Run the bundled zero-dependency scanner first so you never waste context guessin
 # Full sweep: source + data-flow + git history + dependencies + build artifacts
 python3 .aegis/scripts/aegis_scan.py . --all --output .aegis/scan-report.json
 
+# Release gate: every stage must run, and any CRITICAL/HIGH fails it
+python3 .aegis/scripts/aegis_scan.py . --profile release --output .aegis/scan-report.json
+
 # Fallback if running directly from the vibe-aegis repo:
 python3 scripts/aegis_scan.py . --all --output .aegis/scan-report.json
 
@@ -42,10 +45,17 @@ python3 scripts/aegis_scan.py . --all --output .aegis/scan-report.json
 python3 .aegis/scripts/aegis_scan.py . --diff origin/main --baseline .aegis/baseline.json
 ```
 
-The scanner now reports six domains: `SECURITY`, `UI_UX`, `DATAFLOW` (request input traced
-to a dangerous sink), `SUPPLY_CHAIN` (known dependency vulnerabilities), `ARTIFACT` (what the
-build actually ships) and `HISTORY` (credentials committed at any point). Credentials in the
-report are always redacted, so `.aegis/scan-report.json` is safe to attach to an issue.
+The scanner reports ten domains: `SECURITY`, `UI_UX`, `DATAFLOW` (request input traced to a
+dangerous sink), `PAYMENTS`, `RELIABILITY`, `SUPPLY_CHAIN` (known dependency vulnerabilities),
+`ARTIFACT` (what the build actually ships), `HISTORY` (credentials committed at any point),
+`EXTERNAL` (findings imported from an installed engine via `--engine`), and `COVERAGE`
+(something that was not examined - read `skipped_checks`, never treat it as clean).
+Credentials in the report are always redacted, so `.aegis/scan-report.json` is safe to
+attach to an issue.
+
+In Claude Code, also run the built-in `/security-review` on the branch's pending changes. It
+is an AI review of intent and complements the scanner's deterministic rules; report its
+findings through the same Skeptic and Referee stages.
 
 Read `.aegis/scan-report.json` to extract:
 1. Detected frameworks, database/BaaS, auth libraries, payment SDKs, UI libraries, and AI SDKs.
