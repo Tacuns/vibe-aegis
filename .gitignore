@@ -44,6 +44,29 @@ gha-creds-*.json
 secrets.*
 *.secret
 
+# ---------------------------------------------------------------------------
+# Private working notes and local assistant state.
+#
+# These were previously protected only by .git/info/exclude, which lives inside a
+# single clone and is never shared or pushed. That is not protection: a fresh clone,
+# a CI checkout or a cloud session has no exclude file, so a routine `git add -A`
+# would publish them. Listing them here makes the protection travel with the repo.
+#
+# Only the FILENAMES appear publicly; the contents never leave the machine.
+# ---------------------------------------------------------------------------
+PROJECT-MEMORY.md
+*.private.md
+PRIVATE-*.md
+NOTES.local.md
+
+# Local state written by AI coding assistants (prompts, memory, queues, machine info)
+.refact/
+.claude/settings.local.json
+.cursor/
+.windsurf/
+.aider*
+.continue/
+
 # Vibe Aegis local state
 .aegis-baseline.json
 *.sarif

@@ -18,12 +18,12 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields as dataclass_fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-SCANNER_VERSION = "2.6.0"
+SCANNER_VERSION = "2.7.0"
 
 IGNORE_DIRS: Set[str] = {
     ".git", "node_modules", ".next", "dist", "build", "out", ".vercel",
@@ -36,6 +36,9 @@ CODE_EXTENSIONS: Set[str] = {
     ".py", ".rb", ".go", ".rs", ".java", ".kt", ".swift", ".dart",
     ".php", ".sql", ".prisma", ".graphql", ".html", ".css", ".scss",
     ".json", ".yaml", ".yml", ".toml", ".env", ".sh",
+    # Firebase security rules (firestore.rules, storage.rules): SEC-02B exists for these
+    # files, which were never read.
+    ".rules",
 }
 
 FRONTEND_EXTENSIONS: Set[str] = {
@@ -62,6 +65,83 @@ class Finding:
     fingerprint: str = ""      # stable id for baseline suppression + SARIF dedupe
     kind: str = "finding"      # legacy 2-value alias of `status`
     status: str = "VULNERABILITY"  # VULNERABILITY | SKIPPED | SCAN_ERROR
+
+
+class CoverageLedger:
+    """Every byte the scanner chose not to read, recorded and reported.
+
+    A scanner skips things constantly - a file over the size cap, an unreadable
+    encoding, a minified bundle, a dependency list past the API batch limit. Each skip
+    was previously a bare `continue`, so the output said "nothing found" about regions
+    that were never opened. That is the same fail-open the readiness contract exists to
+    prevent, one level down: silence about what was not examined.
+
+    A skip is `material` when a real finding could plausibly have been inside it - an
+    oversized source file, a truncated dependency batch. Immaterial skips (a `.png`,
+    a `node_modules` directory) are counted for the report but raise no gap, or every
+    scan would be permanently INCOMPLETE and the signal would be worthless.
+    """
+
+    __slots__ = ("_skips",)
+
+    def __init__(self) -> None:
+        self._skips: Dict[str, Dict] = {}
+
+    def record(self, reason: str, path: str, *, material: bool = True,
+               detail: str = "") -> None:
+        # Materiality belongs to each occurrence, not to the reason. One reason covers
+        # both a lockfile (immaterial) and a `.min.js` bundle (material); keeping the
+        # FIRST occurrence's flag made the bundle's gap vanish whenever the walk
+        # happened to reach a lockfile first.
+        entry = self._skips.setdefault(
+            reason, {"count": 0, "examples": [], "material_count": 0,
+                     "material_examples": [], "detail": detail})
+        entry["count"] += 1
+        if len(entry["examples"]) < 5:
+            entry["examples"].append(path)
+        if material:
+            entry["material_count"] += 1
+            if len(entry["material_examples"]) < 5:
+                entry["material_examples"].append(path)
+
+    def as_dict(self) -> Dict:
+        return {
+            reason: {"count": e["count"], "examples": e["examples"],
+                     "material": e["material_count"] > 0}
+            for reason, e in sorted(self._skips.items())
+        }
+
+    def total(self) -> int:
+        return sum(e["count"] for e in self._skips.values())
+
+    def material_total(self) -> int:
+        return sum(e["material_count"] for e in self._skips.values())
+
+    def gaps(self) -> List["Finding"]:
+        """One coverage gap per material reason, so the gate can see them."""
+        out: List[Finding] = []
+        for reason, e in sorted(self._skips.items()):
+            if not e["material_count"]:
+                continue
+            n = e["material_count"]
+            examples = ", ".join(e["material_examples"][:3])
+            out.append(Finding(
+                rule_id="COV-00",
+                domain="COVERAGE",
+                severity="LOW",
+                title=f"Not Examined: {reason} ({n} item(s))",
+                file=e["material_examples"][0],
+                line=0,
+                snippet=evidence(f"{n} item(s) were not inspected. Examples: {examples}", 400),
+                cwe_or_standard="Coverage",
+                remediation=(e["detail"] or
+                             "These were not read, so no conclusion about them is possible. "
+                             "Re-run with the relevant limit raised, or review them by hand."),
+                confidence="HIGH",
+                kind="skipped_check",
+                status="SKIPPED",
+            ))
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +230,9 @@ SECURITY_PATTERNS: List[Tuple[str, str, str, re.Pattern, str, str, Optional[Set[
         "HIGH",
         "Dangerous Dynamic Code or Shell Execution",
         re.compile(
-            r"(?:\beval\s*\(|\bnew\s+Function\s*\(|subprocess\.(?:Popen|run|call)\([^)]*shell\s*=\s*True|child_process\.exec\s*\(\s*`[^`]*\$\{)",
+            r"(?:\beval\s*\(|\bnew\s+Function\s*\(|subprocess\.(?:Popen|run|call)\([^)]*shell\s*=\s*True|child_process\.exec\s*\(\s*`[^`]*\$\{"
+            # os.system / os.popen always run a shell; only a plain literal is fixed.
+            r"|\bos\.(?:system|popen)\s*\((?!\s*(?:'[^'\n]*'|\"[^\"\n]*\")\s*\)))",
         ),
         "CWE-78 / CWE-94",
         "Avoid eval() and shell=True. Pass command arguments as an array to execFile / subprocess.run(..., shell=False) with strict input allowlists.",
@@ -519,7 +601,7 @@ def check_form_control_labels(rel_path: str, text: str) -> List[Finding]:
                 title="Form Control Without An Accessible Name",
                 file=rel_path,
                 line=line_no,
-                snippet=lines[line_no - 1].strip()[:140] if line_no <= len(lines) else tag[:140],
+                snippet=evidence(lines[line_no - 1] if line_no <= len(lines) else tag),
                 cwe_or_standard="WCAG 2.2 AA - 3.3.2 Labels or Instructions, 4.1.2 Name, Role, Value",
                 remediation=(
                     "This control has no accessible name, so a screen reader announces only its "
@@ -602,6 +684,299 @@ def detect_tech_stack(root: Path) -> Dict[str, List[str]]:
     return {k: sorted(v) for k, v in stack.items()}
 
 
+# ---------------------------------------------------------------------------
+# Postgres / Supabase privilege rules (SEC-18 .. SEC-21)
+# ---------------------------------------------------------------------------
+# Written from PostgreSQL's documented privilege model and Supabase's documented
+# defaults - no rule text or code from any other tool. Each targets a way a migration
+# hands data to the public API role while every table still has RLS enabled.
+
+# The tag group must always participate: a backreference to an unmatched optional
+# group never matches, so `$$ ... $$` would slip through.
+_DOLLAR_QUOTED = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*|)\$.*?\$\1\$", re.DOTALL)
+_SQL_STATEMENT = re.compile(r"[^;]+")
+_CREATE_FUNCTION = re.compile(
+    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+([A-Za-z0-9_.\"]+)", re.IGNORECASE)
+_CREATE_VIEW = re.compile(
+    r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(MATERIALIZED\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+    r"([A-Za-z0-9_.\"]+)", re.IGNORECASE)
+_SECURITY_INVOKER_ON = re.compile(r"security_invoker\s*=\s*'?(?:true|on|1)\b", re.IGNORECASE)
+
+
+def _blank_dollar_quoted(text: str) -> str:
+    """Blank function bodies, keeping length so offsets still map to lines."""
+    return _DOLLAR_QUOTED.sub(lambda m: re.sub(r"[^\n]", " ", m.group(0)), text)
+
+
+def _split_name(qualified: str) -> Tuple[str, str]:
+    parts = qualified.replace('"', "").split(".")
+    return (parts[0].lower() if len(parts) > 1 else "public"), parts[-1].lower()
+
+
+def _api_role_access(sql: str, name: str) -> Optional[bool]:
+    """Does this migration give the Data API roles access to `name`?
+
+    True: an explicit GRANT to anon / authenticated / PUBLIC. False: access revoked from
+    both API roles, and never granted. None: the file does not say, so it depends on
+    the project's default privileges - which Supabase is changing (new projects no
+    longer grant the API roles access to new public objects), so it cannot be assumed.
+    """
+    target = r"(?:TABLE\s+)?(?:public\.)?\"?" + re.escape(name) + r"\"?\b"
+    granted = re.search(r"\bGRANT\b[^;]*\bON\s+" + target + r"[^;]*\bTO\b[^;]*\b(?:anon|authenticated|PUBLIC)\b",
+                        sql, re.IGNORECASE)
+    if granted:
+        return True
+    # Only the role list after FROM: `public.v` is a schema, not the PUBLIC role.
+    revokes = [m.group(1) for m in re.finditer(
+        r"\bREVOKE\b[^;]*\bON\s+" + target + r"[^;]*?\bFROM\b([^;]*)", sql, re.IGNORECASE)]
+    if any(re.search(r"\bPUBLIC\b", r, re.IGNORECASE) for r in revokes) or (
+            any(re.search(r"\banon\b", r, re.IGNORECASE) for r in revokes)
+            and any(re.search(r"\bauthenticated\b", r, re.IGNORECASE) for r in revokes)):
+        return False
+    return None
+
+
+def check_postgres_privilege_rules(rel_path: str, text: str) -> List[Finding]:
+    findings: List[Finding] = []
+    sql = _blank_dollar_quoted(text)
+    lines = text.splitlines()
+
+    def add(rule_id, severity, title, start, standard, remediation, confidence="HIGH"):
+        line_no = text[:start].count("\n") + 1
+        findings.append(Finding(
+            rule_id=rule_id, domain="SECURITY", severity=severity, title=title, file=rel_path,
+            line=line_no, snippet=evidence(lines[line_no - 1] if line_no <= len(lines) else ""),
+            cwe_or_standard=standard, remediation=remediation, confidence=confidence))
+
+    for st in _SQL_STATEMENT.finditer(sql):
+        stmt = st.group(0)
+        lead = len(stmt) - len(stmt.lstrip())
+        start = st.start() + lead
+
+        fn = _CREATE_FUNCTION.match(stmt)
+        if fn and re.search(r"\bSECURITY\s+DEFINER\b", stmt, re.IGNORECASE) \
+                and not re.search(r"\bSET\s+search_path\b", stmt, re.IGNORECASE):
+            _schema, name = _split_name(fn.group(1))
+            fixed_later = re.search(
+                r"ALTER\s+FUNCTION\s+(?:[A-Za-z0-9_\"]+\.)?\"?" + re.escape(name)
+                + r"\"?\b[^;]*\bSET\s+search_path\b", sql, re.IGNORECASE)
+            if not fixed_later:
+                add("SEC-18", "MEDIUM",
+                    f"SECURITY DEFINER Function `{name}` Without A Fixed search_path", start,
+                    "CWE-426 Untrusted Search Path / OWASP A01",
+                    "A SECURITY DEFINER function runs with its owner's privileges, and resolves "
+                    "every unqualified table and function name through the CALLER's search_path. "
+                    "Any role that can create an object earlier on that path - another database "
+                    "user, an extension, a compromised service account - runs its own code as "
+                    "the owner. Pin it: add `SET search_path = ''` to the function and "
+                    "schema-qualify every name inside (`public.orders`, `pg_catalog.now()`).")
+
+        view = _CREATE_VIEW.match(stmt)
+        if not view:
+            continue
+        materialized = bool(view.group(1))
+        schema, name = _split_name(view.group(2))
+        if schema != "public":
+            continue  # only the exposed schema is reachable through the Data API
+        access = _api_role_access(sql, name)
+        if access is False:
+            continue  # the API roles cannot read it at all
+        confidence = "HIGH" if access else "MEDIUM"
+        invoker = bool(_SECURITY_INVOKER_ON.search(stmt)) or bool(re.search(
+            r"ALTER\s+VIEW\s+(?:public\.)?\"?" + re.escape(name) + r"\"?\s+SET\s*\([^)]*"
+            r"security_invoker\s*=\s*'?(?:true|on|1)\b", sql, re.IGNORECASE))
+        if re.search(r"\bauth\s*\.\s*users\b", stmt, re.IGNORECASE) and (materialized or not invoker):
+            add("SEC-19", "CRITICAL",
+                f"Public View `{name}` Exposes auth.users", start,
+                "CWE-200 Exposure of Sensitive Information / OWASP A01",
+                "A view in the public schema is served by the Data API, and without "
+                "`security_invoker` it reads auth.users with its OWNER's rights - so anyone "
+                "holding the anon key can read every user's email, phone and metadata. Keep "
+                "auth.users out of public views: copy the fields you need into a "
+                "public.profiles table guarded by RLS, or move the view to a schema the API "
+                "does not expose." + ("" if access else " This migration does not grant the "
+                "view to anon or authenticated, so whether it is reachable depends on the "
+                "project's default privileges - verify with `\\dp public." + name + "`."),
+                confidence=confidence)
+            continue
+        if materialized or not invoker:
+            add("SEC-20", "MEDIUM",
+                f"Public {'Materialized ' if materialized else ''}View `{name}` Bypasses Row-Level Security",
+                start, "CWE-284 Improper Access Control / Supabase & Postgres RLS",
+                ("A materialized view stores a copy of the rows and has no RLS of its own, so "
+                 "every row it holds is readable through the Data API. Move it to a schema the "
+                 "API does not expose, or revoke SELECT from anon and authenticated."
+                 if materialized else
+                 "Postgres runs a view with its OWNER's privileges unless told otherwise, so "
+                 "RLS on the tables underneath is checked against the owner - usually a role "
+                 "that bypasses it - not against the caller. On Postgres 15+ create it with "
+                 "`WITH (security_invoker = true)`; otherwise revoke access from anon and "
+                 "authenticated or move it out of the public schema."),
+                confidence=confidence)
+
+    for st in _SQL_STATEMENT.finditer(sql):
+        stmt = st.group(0)
+        if re.match(r"^\s*CREATE\s+POLICY\b", stmt, re.IGNORECASE) and \
+                re.search(r"\buser_metadata\b|\braw_user_meta_data\b", stmt, re.IGNORECASE):
+            add("SEC-21", "HIGH", "RLS Policy Trusts User-Editable Metadata",
+                st.start() + len(stmt) - len(stmt.lstrip()),
+                "CWE-807 Reliance on Untrusted Inputs in a Security Decision / OWASP A01",
+                "`user_metadata` (raw_user_meta_data) can be changed by the signed-in user "
+                "themselves - `supabase.auth.updateUser({ data: { role: 'admin' } })` - so a "
+                "policy that reads a role or tenant from it lets any user grant themselves "
+                "access. Put authorization claims in `app_metadata`, which only the server can "
+                "write, or look them up from a table the user cannot modify.")
+    return findings
+
+
+# Calls that establish WHO the caller is. Client constructors (`createServerClient`,
+# `createClient`, `clerkClient`) are deliberately absent: building a client is setup,
+# and a route that builds one and never asks it for the user is unauthenticated.
+_AUTH_CALL = re.compile(
+    r"(?:getServerSession|\bauth\(\)|getUser\(|currentUser\(|verifyToken|jwt\.verify|"
+    r"jwtVerify|\.auth\.getUser|\.auth\.getClaims|requireAuth|getAuth\(|"
+    r"passport\.authenticate|auth\.protect|requireSession|withApiAuth|"
+    r"ensureAuthenticated|isAuthenticated|"
+    r"authGuard|AuthGuard|verifySession|getServerAuthSession|withAuth|"
+    r"require(?:User|Session|Auth|Admin|Login)|assert(?:User|Auth|Session)|"
+    r"get(?:Current)?User\(|getSession\(|checkAuth|ensureUser|authenticate\()"
+)
+
+_USE_SERVER_FILE = re.compile(
+    r"\A(?:\s|//[^\n]*\n|/\*.*?\*/)*['\"]use server['\"]\s*;?\s*(?:\n|$)", re.DOTALL)
+_HANDLER_START = re.compile(
+    r"(?m)^[ \t]*export\s+(?:async\s+function\s+(\w+)\b|function\s+(\w+)\b|"
+    r"const\s+(\w+)\s*=)")
+_MUTATING = {"POST", "PUT", "PATCH", "DELETE"}
+_LOCAL_FUNCTION = re.compile(
+    r"(?m)^[ \t]*(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(|"
+    r"^[ \t]*(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>")
+
+
+def _mutating_handlers(text: str, server_actions: bool) -> List[Tuple[str, int, str]]:
+    """(name, line, body) for each exported handler that can change state.
+
+    A route file's POST/PUT/PATCH/DELETE, or every exported function of a "use server"
+    file. A body runs to the next top-level export - a heuristic split, not a parse.
+    """
+    starts = list(_HANDLER_START.finditer(text))
+    out: List[Tuple[str, int, str]] = []
+    for i, m in enumerate(starts):
+        name = m.group(1) or m.group(2) or m.group(3)
+        if not (name in _MUTATING or server_actions):
+            continue
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(text)
+        out.append((name, text[:m.start()].count("\n") + 1, text[m.start():end]))
+    return out
+
+
+_METHOD_BRANCH = re.compile(
+    r"""\breq(?:uest)?\.method\s*===?\s*['"](POST|PUT|PATCH|DELETE)['"]""")
+_METHOD_SWITCH = re.compile(r"\bswitch\s*\(\s*req(?:uest)?\.method\s*\)")
+_METHOD_CASE = re.compile(r"""\bcase\s+['"](POST|PUT|PATCH|DELETE)['"]\s*:""")
+
+
+def _pages_api_method_branches(text: str) -> List[Tuple[str, int, str]]:
+    """A Pages Router handler is one default export that branches on `req.method`:
+    `if (req.method === "POST")` / `case "POST":`. There is no per-method export to
+    split on, so the whole file is the body - an auth check anywhere in it counts."""
+    hits = list(_METHOD_BRANCH.finditer(text))
+    if _METHOD_SWITCH.search(text):
+        hits += list(_METHOD_CASE.finditer(text))
+    hits.sort(key=lambda m: m.start())
+    seen: Set[str] = set()
+    out: List[Tuple[str, int, str]] = []
+    for m in hits:
+        if m.group(1) not in seen:
+            seen.add(m.group(1))
+            out.append((m.group(1), text[:m.start()].count("\n") + 1, text))
+    return out
+
+
+_USE_SERVER_LINE = re.compile(r"(?m)^[ \t]*['\"]use server['\"]\s*;?\s*$")
+
+
+def _inline_server_actions(text: str) -> List[Tuple[str, int, str]]:
+    """Functions whose body opens with the `'use server'` directive (inline actions)."""
+    defs = list(_LOCAL_FUNCTION.finditer(text))
+    out: List[Tuple[str, int, str]] = []
+    for i, m in enumerate(defs):
+        end = defs[i + 1].start() if i + 1 < len(defs) else len(text)
+        body = text[m.start():end]
+        first = re.search(r"\{\s*(?://[^\n]*\n\s*)*(['\"]use server['\"])", body)
+        if first and _USE_SERVER_LINE.search(body):
+            out.append((m.group(1) or m.group(2), text[:m.start()].count("\n") + 1, body))
+    return out
+
+
+def _calls_local_guard(body: str, text: str) -> bool:
+    """Does the handler call a helper, defined in this file, that checks the caller?"""
+    defs = list(_LOCAL_FUNCTION.finditer(text))
+    for i, m in enumerate(defs):
+        name = m.group(1) or m.group(2)
+        end = defs[i + 1].start() if i + 1 < len(defs) else len(text)
+        if (_AUTH_CALL.search(text[m.start():end])
+                and re.search(r"(?<![\w.])" + re.escape(name) + r"\s*\(", body)):
+            return True
+    return False
+
+
+_ID_KEY = re.compile(r"(?i)\s*(?:id|\w*Id|\w*_id|uuid)\b")
+_OWNER_KEY = (r"user[_-]?id|userId|owner[_-]?id|ownerId|tenant[_-]?id|tenantId|org[_-]?id|"
+              r"orgId|account[_-]?id|accountId|authorId|createdBy")
+_OWNER_PAIR = re.compile(r"(?i)\b(" + _OWNER_KEY + r")\b\s*(?::\s*([^,}]+))?")
+_REQUEST_VALUE = re.compile(
+    r"(?i)(req(?:uest)?\.(?:body|query|params|headers|json|formData)|\bparams\.|"
+    r"searchParams|\bbody\.|\binput\.|formData\.get|\bquery\.)")
+
+
+def _owner_values(where: str) -> List[str]:
+    """The value expression of each owner field: `userId: x` -> `x`, shorthand -> name."""
+    out = []
+    for m in _OWNER_PAIR.finditer(where):
+        out.append((m.group(2) or m.group(1)).strip())
+    return out
+
+
+def _request_derived_names(text: str) -> Set[str]:
+    """Identifiers assigned from the request anywhere in the file, to a fixed point."""
+    names: Set[str] = set()
+    assigns = []
+    for line in text.splitlines():
+        m = ASSIGNMENT.search(line)
+        if m:
+            targets = [m.group(2)] if m.group(2) else [
+                n.split(":")[-1].strip() for n in (m.group(1) or "").split(",")]
+            assigns.append(([t for t in targets if t and t.isidentifier()], m.group(3)))
+    changed = True
+    while changed:
+        changed = False
+        for targets, rhs in assigns:
+            # An auth call turns a request token INTO an identity: `getUser(body.token)`
+            # is the trusted side, not the attacker's.
+            if _AUTH_CALL.search(rhs):
+                continue
+            if (_REQUEST_VALUE.search(rhs) or TAINT_SOURCES.search(rhs)
+                    or any(_names_variable(n, rhs) for n in names)):
+                for t in targets:
+                    if t not in names:
+                        names.add(t)
+                        changed = True
+    return names
+
+
+def _names_variable(name: str, expr: str) -> bool:
+    """`name` used as a variable in `expr` - not as a property (`session.user.id`)."""
+    return re.search(r"(?:(?<=\.\.\.)|(?<![\w$.]))" + re.escape(name) + r"\b", expr) is not None
+
+
+def _from_request(value: str, request_names: Set[str]) -> bool:
+    if _REQUEST_VALUE.search(value) or TAINT_SOURCES.search(value):
+        return True
+    head = re.match(r"\s*([A-Za-z_$][\w$]*)", value)
+    return bool(head and head.group(1) in request_names)
+
+
 def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Finding]:
     findings: List[Finding] = []
     lines = text.splitlines()
@@ -625,11 +1000,14 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
                         title=f"SQL Table `{table_name}` Created Without Enabling Row-Level Security (RLS)",
                         file=rel_path,
                         line=line_no,
-                        snippet=lines[line_no - 1].strip()[:140] if line_no <= len(lines) else m.group(0),
+                        snippet=evidence(lines[line_no - 1] if line_no <= len(lines) else m.group(0)),
                         cwe_or_standard="CWE-284 / Supabase & Postgres RLS",
                         remediation=f"Add `ALTER TABLE {table_name} ENABLE ROW LEVEL SECURITY;` and define explicit SELECT/INSERT/UPDATE/DELETE policies.",
                     )
                 )
+
+    if ext == ".sql":
+        findings.extend(check_postgres_privilege_rules(rel_path, text))
 
     # Contextual Check 2: Next.js API Route or Server Action mutating data without an obvious auth check
     is_api_route = (
@@ -647,41 +1025,35 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
             )
         )
     )
-    has_use_server = '"use server"' in text or "'use server'" in text
-    if is_api_route or has_use_server:
-        has_mutation = bool(
-            re.search(r"export\s+async\s+function\s+(?:POST|PUT|PATCH|DELETE)\b", text)
-            or has_use_server
-        )
-        has_auth_call = bool(
-            re.search(
-                r"(?:getServerSession|auth\(\)|getUser\(|currentUser\(|verifyToken|jwt\.verify|"
-                r"jwtVerify|supabase\.auth\.getUser|requireAuth|getAuth\(|createServerClient|"
-                # Framework-idiomatic guards - absent before, causing false positives
-                r"passport\.authenticate|auth\.protect|requireSession|withApiAuth|"
-                r"ensureAuthenticated|isAuthenticated|Depends\(|Security\(|"
-                r"@login_required|@jwt_required|authGuard|AuthGuard|verifySession|"
-                r"getServerAuthSession|clerkClient|currentUser|withAuth|"
-                # Hand-rolled guards. Most projects wrap their auth check in a local
-                # helper, and an allowlist that only knows vendor SDK names reports
-                # every one of those routes as unauthenticated.
-                r"require(?:User|Session|Auth|Admin|Login)|assert(?:User|Auth|Session)|"
-                r"get(?:Current)?User\(|getSession\(|checkAuth|ensureUser|authenticate\()",
-                text,
-            )
-        )
-        if has_mutation and not has_auth_call:
+    # A directive only at the top of a file (React: before any import), and only in
+    # JavaScript - a Python test quoting the string once made its samples "actions".
+    has_use_server = (ext in {".ts", ".tsx", ".js", ".jsx", ".mjs"}
+                      and bool(_USE_SERVER_FILE.match(text)))
+    inline_actions = (_inline_server_actions(text)
+                      if ext in {".ts", ".tsx", ".js", ".jsx", ".mjs"} and not has_use_server else [])
+    if is_api_route or has_use_server or inline_actions:
+        # Each mutating handler must check its caller itself. This was one search of
+        # the whole file, so an auth call in GET protected an unauthenticated DELETE
+        # beside it, and `createServerClient` - which builds a database client and
+        # proves nothing about who is calling - counted as authentication.
+        handlers = (_mutating_handlers(text, has_use_server)
+                    if (is_api_route or has_use_server) else []) + inline_actions
+        if is_api_route and "pages/api/" in rel_path:
+            handlers += _pages_api_method_branches(text)
+        for name, line_no, body in handlers:
+            if _AUTH_CALL.search(body) or _calls_local_guard(body, text):
+                continue
             findings.append(
                 Finding(
                     rule_id="SEC-03",
                     domain="SECURITY",
                     severity="CRITICAL",
-                    title="Server Mutation Route / Server Action Appears to Lack Authentication Check",
+                    title=(f"Server Mutation `{name}` Appears to Lack Authentication Check"),
                     file=rel_path,
-                    line=1,
-                    snippet=lines[0].strip()[:140] if lines else rel_path,
+                    line=line_no,
+                    snippet=evidence(lines[line_no - 1] if 0 < line_no <= len(lines) else rel_path),
                     cwe_or_standard="CWE-306 / OWASP A01 Broken Access Control",
-                    remediation="Verify the caller's session on the server (e.g., `const { data: { user } } = await supabase.auth.getUser()` or `await auth()`) before executing mutations.",
+                    remediation="Verify the caller's session on the server inside this handler (e.g., `const { data: { user } } = await supabase.auth.getUser()` or `await auth()`) before executing the mutation. Creating a client is not a check.",
                     confidence="MEDIUM",
                 )
             )
@@ -697,7 +1069,7 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
                     title="Stripe Webhook Route Missing `stripe.webhooks.constructEvent` Signature Verification",
                     file=rel_path,
                     line=1,
-                    snippet=lines[0].strip()[:140] if lines else rel_path,
+                    snippet=evidence(lines[0] if lines else rel_path),
                     cwe_or_standard="CWE-345 / OWASP A08",
                     remediation="Read the raw request body (`await req.text()`) and validate `stripe-signature` via `stripe.webhooks.constructEvent()`.",
                 )
@@ -772,8 +1144,8 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
                     title=f"{provider.title()} Webhook Route Without Signature Verification",
                     file=rel_path,
                     line=1,
-                    snippet=(f"Handles {provider} webhooks but no signature verification "
-                             "(constructEvent / HMAC) was found in this file."),
+                    snippet=evidence(f"Handles {provider} webhooks but no signature verification "
+                                     "(constructEvent / HMAC) was found in this file.", 400),
                     cwe_or_standard="CWE-345 Insufficient Verification of Data Authenticity / OWASP A08",
                     remediation=(
                         "Read the RAW body (`await req.text()`, never `req.json()` - parsing breaks "
@@ -790,6 +1162,7 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
     # The single most common catastrophic flaw in vibe-coded apps, because the
     # happy path works perfectly - you only ever test with one account.
     if is_js and re.search(r"(?i)\b(findUnique|findFirst|findOne|update|delete|deleteOne)\s*\(", text):
+        request_names = _request_derived_names(text)
         for m in re.finditer(
             r"(?i)\.(?:findUnique|findFirst|findOne|update|delete|deleteOne)\s*\(\s*\{[^}]{0,200}?"
             r"\bwhere\s*:\s*\{([^}]{0,200})\}",
@@ -799,12 +1172,41 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
             # Addressed by an id that came from the request?
             from_request = re.search(
                 r"(?i)(req(?:uest)?\.(?:body|query|params)|params\.|searchParams|body\.|input\.)", where
-            )
-            # Scoped to the authenticated owner anywhere in the same clause?
-            owner_scoped = re.search(
-                r"(?i)(user[_-]?id|userId|owner[_-]?id|ownerId|tenant[_-]?id|tenantId|org[_-]?id|"
-                r"orgId|account[_-]?id|accountId|auth\.uid|session\.|authorId|createdBy)", where
-            )
+            ) or any(_from_request(v, request_names)
+                     for v in re.findall(r"[A-Za-z_$][\w$]*\s*(?::\s*[^,}]+)?", where)
+                     if _ID_KEY.match(v) and not _OWNER_PAIR.match(v))
+            # Scoped to the authenticated owner? An owner FIELD is not enough: this once
+            # accepted `userId: body.userId`, which the attacker simply sets to the
+            # victim's id. The owner value must not come from the request.
+            owner_values = _owner_values(where)
+            trusted = [v for v in owner_values if not _from_request(v, request_names)]
+            if from_request and owner_values and not trusted:
+                # `req.body.UserId` may be written by server middleware from the token
+                # (one file cannot see that), unlike a body parsed from `req.json()`.
+                mutable = all(re.match(r"\s*req(?:uest)?\.(?:body|params|query)\.", v)
+                              for v in owner_values)
+                findings.append(
+                    Finding(
+                        rule_id="SEC-04",
+                        domain="SECURITY",
+                        severity="CRITICAL",
+                        title="Owner Check Uses A Request-Supplied Value (IDOR)",
+                        file=rel_path,
+                        line=text[:m.start()].count("\n") + 1,
+                        snippet=evidence(f"where: {{{where.strip()}}}"),
+                        cwe_or_standard="CWE-639 Authorization Bypass Through User-Controlled Key / OWASP A01",
+                        remediation=(
+                            "Take the owner from the server-side session, never from the request - "
+                            "for example `where: { id, userId: session.user.id }`. If middleware "
+                            "overwrites this field from the verified token, confirm every route that "
+                            "reaches this query runs it. Verify by sending account B's id in the "
+                            "request while signed in as account A."
+                        ),
+                        confidence="LOW" if mutable else "MEDIUM",
+                    )
+                )
+                continue
+            owner_scoped = bool(trusted) or re.search(r"(?i)(auth\.uid|session\.)", where)
             if from_request and not owner_scoped:
                 findings.append(
                     Finding(
@@ -814,7 +1216,7 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
                         title="Record Addressed By Request-Supplied ID Without Owner Scoping (IDOR)",
                         file=rel_path,
                         line=text[:m.start()].count("\n") + 1,
-                        snippet=f"where: {{{where.strip()[:100]}}}",
+                        snippet=evidence(f"where: {{{where.strip()}}}"),
                         cwe_or_standard="CWE-639 Authorization Bypass Through User-Controlled Key / OWASP A01",
                         remediation=(
                             "Add the authenticated owner to the WHERE clause so another user's id "
@@ -845,7 +1247,7 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
                     title="Abuse-Prone Endpoint Without Rate Limiting",
                     file=rel_path,
                     line=1,
-                    snippet=f"`{abuse_prone.group(0)}` endpoint with no rate limiter found in this file.",
+                    snippet=evidence(f"`{abuse_prone.group(0)}` endpoint with no rate limiter found in this file.", 400),
                     cwe_or_standard="CWE-307 Improper Restriction of Excessive Authentication Attempts / OWASP A07",
                     remediation=(
                         "Add a per-IP and per-account rate limit. Without one this endpoint allows "
@@ -913,62 +1315,256 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
     return findings
 
 
+_ENV_FILE = re.compile(r"^\.env(?:\.[A-Za-z0-9_-]+)?$")
+_ENV_TEMPLATE = re.compile(r"\.(?:example|sample|template|dist)$")
+_ENV_ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_.]*\s*=\s*['\"]?[^\s'\"#]")
+
+
+def _gitignore_regex(pat: str) -> "re.Pattern":
+    """A gitignore glob as a regex: `*` and `?` never cross `/`; a leading `**/`, an
+    inner `/**/` and a trailing `/**` match zero or more directories."""
+    out, i = "", 0
+    while i < len(pat):
+        if pat.startswith("**/", i) and i == 0:
+            out, i = out + "(?:.*/)?", i + 3
+        elif pat.startswith("/**/", i):
+            out, i = out + "/(?:.*/)?", i + 4
+        elif pat.startswith("/**", i) and i + 3 == len(pat):
+            out, i = out + "/.*", i + 3
+        elif pat[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif pat[i] == "?":
+            out, i = out + "[^/]", i + 1
+        elif pat[i] == "[":
+            j = pat.find("]", i + 1)
+            if j < 0:
+                out, i = out + re.escape(pat[i]), i + 1
+            else:
+                body = pat[i + 1:j]
+                out, i = out + "[" + ("^" + body[1:] if body.startswith("!") else body) + "]", j + 1
+        else:
+            out, i = out + re.escape(pat[i]), i + 1
+    return re.compile(out + r"\Z")
+
+
+def _gitignore_says_ignored(root: Path, rel: str) -> Optional[bool]:
+    """Approximate the root .gitignore for one file path, following git's documented
+    rules (https://git-scm.com/docs/gitignore): blank lines and `#` comments are
+    skipped, `!` negates, a leading `/` anchors, a trailing `/` matches directories
+    only, a pattern without `/` matches any path component, the last match wins.
+    Only used when git itself is unavailable; None when there is no .gitignore.
+    """
+    gi = root / ".gitignore"
+    if not gi.is_file():
+        return None
+    rules = []
+    for raw in gi.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.rstrip()
+        if not line or line.startswith("#"):
+            continue
+        negate = line.startswith("!")
+        pat = line[1:] if negate else line
+        dir_only = pat.endswith("/")
+        pat = pat.rstrip("/")
+        anchored = pat.startswith("/") or "/" in pat
+        rules.append((negate, dir_only, anchored, _gitignore_regex(pat.lstrip("/"))))
+
+    def ignored(parts: List[str], is_dir: bool) -> bool:
+        result = False
+        for negate, dir_only, anchored, rx in rules:
+            if dir_only and not is_dir:
+                continue
+            hit = rx.match("/".join(parts)) if anchored else rx.match(parts[-1])
+            if hit:
+                result = not negate
+        return result
+
+    parts = rel.split("/")
+    # "It is not possible to re-include a file if a parent directory of that file is
+    # excluded" - so an excluded parent decides, whatever a later `!` says.
+    for i in range(1, len(parts)):
+        if ignored(parts[:i], True):
+            return True
+    return ignored(parts, False)
+
+
+def check_env_files(root: Path) -> List[Finding]:
+    """SEC-01C: an environment file that git would commit, or already has.
+
+    This used to search .gitignore for the substring ".env", so a comment ("never
+    commit .env") or a lone `.env.example` line silenced it, and a `.env` already
+    committed to the repository was never reported. Inside a git work tree, git itself
+    answers both questions; elsewhere the root .gitignore is evaluated by git's
+    documented rules, at MEDIUM confidence.
+    """
+    env_files: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        for name in filenames:
+            if _ENV_FILE.match(name) and not _ENV_TEMPLATE.search(name):
+                env_files.append((Path(dirpath) / name).relative_to(root).as_posix())
+    if not env_files:
+        return []
+
+    import subprocess
+
+    def git(*args: str) -> Optional[int]:
+        try:
+            return subprocess.run(["git", "-C", str(root), *args], capture_output=True,
+                                  timeout=30, shell=False).returncode
+        except Exception:
+            return None
+
+    in_git = git("rev-parse", "--is-inside-work-tree") == 0
+    findings: List[Finding] = []
+    for rel in sorted(env_files):
+        if in_git:
+            tracked = git("ls-files", "--error-unmatch", "--", rel) == 0
+            # check-ignore: 0 ignored, 1 not ignored, anything else an error.
+            status = None if tracked else git("check-ignore", "-q", "--", rel)
+            if not tracked and status not in (0, 1):
+                continue
+            exposed, confidence = tracked or status == 1, "HIGH"
+        else:
+            verdict = _gitignore_says_ignored(root, rel)
+            tracked, exposed, confidence = False, not verdict, "MEDIUM"
+        if not exposed:
+            continue
+        findings.append(Finding(
+            rule_id="SEC-01C", domain="SECURITY", severity="CRITICAL",
+            title=(f"Environment File `{rel}` Is Committed To Git" if tracked else
+                   f"Environment File `{rel}` Is Not Ignored By Git"),
+            file=rel, line=1,
+            snippet=evidence(f"{rel} is tracked in the repository - every value in it is in the "
+                             "history." if tracked else
+                             f"{rel} is not matched by any ignore rule, so the next `git add .` "
+                             "commits it.", 300),
+            cwe_or_standard="CWE-540 Inclusion of Sensitive Information in Source Code / OWASP A05",
+            remediation=(f"Run `git rm --cached {rel}`, add it to .gitignore, and rotate every "
+                         "secret it contains: removing the file does not remove it from history."
+                         if tracked else
+                         f"Add `{rel}` (or `.env*`, with `!.env.example` if you keep a template) "
+                         "to .gitignore."),
+            confidence=confidence,
+        ))
+    return findings
+
+
+_SELF_TEXT: List[str] = []
+
+
+def _is_this_scanner(text: str) -> bool:
+    if not _SELF_TEXT:
+        try:
+            _SELF_TEXT.append(Path(__file__).read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            _SELF_TEXT.append("\0")  # unreadable: never matches, so the file is scanned
+    return text == _SELF_TEXT[0]
+
+
+NON_SOURCE_FILES = {"package.json", "tsconfig.json", "jsconfig.json", ".gitignore"}
+
+
 def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
-                    include_tests: bool = False) -> Tuple[List[Finding], int]:
+                    include_tests: bool = False,
+                    ledger: Optional[CoverageLedger] = None,
+                    max_file_bytes: int = 1_500_000) -> Tuple[List[Finding], int]:
     findings: List[Finding] = []
     scanned_files = 0
+    ledger = ledger if ledger is not None else CoverageLedger()
 
-    # Check if .env is tracked or missing from .gitignore
-    gitignore_path = root / ".gitignore"
-    env_path = root / ".env"
-    if env_path.exists():
-        gitignore_txt = gitignore_path.read_text(encoding="utf-8", errors="ignore") if gitignore_path.exists() else ""
-        if ".env" not in gitignore_txt:
-            findings.append(
-                Finding(
-                    rule_id="SEC-01C",
-                    domain="SECURITY",
-                    severity="CRITICAL",
-                    title="`.env` File Present in Project Root Without `.env` Entry in `.gitignore`",
-                    file=".gitignore" if gitignore_path.exists() else ".env",
-                    line=1,
-                    snippet=".env is not ignored by Git and risks being committed to version control.",
-                    cwe_or_standard="CWE-540 / OWASP A05",
-                    remediation="Add `.env`, `.env.local`, and `.env.*` to `.gitignore` and run `git rm --cached .env` if already staged.",
-                )
-            )
+    findings.extend(check_env_files(root))
 
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        # os.walk() never descends into a symlinked directory. One whose target is inside
+        # the repository is scanned at its real path; one that points out of it was
+        # skipped with no record, so its code went unexamined while the scan looked whole.
+        for d in dirnames:
+            dpath = Path(dirpath) / d
+            if dpath.is_symlink() and _escapes(root, dpath):
+                try:
+                    drel = dpath.relative_to(root).as_posix()
+                except ValueError:
+                    drel = dpath.as_posix()
+                if only_files is None or any(f.startswith(drel + "/") for f in only_files):
+                    ledger.record("symlinked directory pointing outside the repository - not followed",
+                                  drel + "/",
+                                  detail="Its contents were not read. Replace the link with the "
+                                         "directory itself, or scan the target separately.")
         for fname in filenames:
             fpath = Path(dirpath) / fname
             ext = fpath.suffix.lower()
             if ext not in CODE_EXTENSIONS and not fname.startswith(".env"):
                 continue
+            try:
+                rel_for_log = fpath.relative_to(root).as_posix()
+            except ValueError:
+                rel_for_log = fpath.as_posix()
+            if fpath.is_symlink() and _escapes(root, fpath):
+                # A link out of the repository would have us read - and quote - a file
+                # that is not part of it (`src/k.ts -> ~/.ssh/id_rsa`). It is not
+                # followed, and it is said so: what it points at was not examined.
+                ledger.record("symlink pointing outside the repository - not followed",
+                              rel_for_log,
+                              detail="Replace the link with the file it points to, or review "
+                                     "the target by hand: it was not read.")
+                continue
+            if only_files is not None and rel_for_log not in only_files:
+                # Diff mode reviews only what this branch changed. Checked before any
+                # skip is recorded: an unchanged bundle is outside the review, not a
+                # gap in it, and counting it made every docs-only diff incomplete.
+                continue
+
             if fname.endswith((".min.js", ".min.css", ".lock", "package-lock.json", "pnpm-lock.yaml")):
+                # Minified bundles and lockfiles are excluded for noise, but a bundle is
+                # exactly where a build-inlined credential ends up. Say so rather than
+                # implying it was checked and found clean.
+                ledger.record("minified bundle or lockfile not scanned", rel_for_log,
+                              material=fname.endswith((".min.js", ".min.css")),
+                              detail="Use `--artifact <dir>` to inspect built bundles, which "
+                                     "cross-references credentials found in your source.")
                 continue
             try:
-                if fpath.stat().st_size > 1_500_000:
+                size = fpath.stat().st_size
+                if size > max_file_bytes:
+                    ledger.record(
+                        f"file larger than {max_file_bytes // 1000}kB", rel_for_log,
+                        detail="Raise the cap with `--max-file-size` to include it.")
                     continue
                 text = fpath.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
+            except Exception as exc:
+                ledger.record("file could not be read", rel_for_log,
+                              detail=f"Read error: {type(exc).__name__}. Check permissions "
+                                     f"and encoding.")
                 continue
 
             rel_path = fpath.relative_to(root).as_posix()  # POSIX separators so path rules match on Windows too
-            if only_files is not None and rel_path not in only_files:
-                continue  # diff mode: review only what this branch changed
+
+            if fname == "aegis_scan.py" and _is_this_scanner(text):
+                # Its rule table is made of the patterns it hunts. Skipped only when it is
+                # byte-for-byte the running scanner: a name alone would let any file
+                # called aegis_scan.py hide from the scan.
+                ledger.record("the scanner itself", rel_path, material=False,
+                              detail="Identical to the running aegis_scan.py.")
+                continue
 
             if is_test_path(rel_path) and not include_tests:
                 continue  # fixtures are deliberately insecure; --include-tests to audit them
 
-            scanned_files += 1
+            # Project configuration is still scanned, but it is not application code: a
+            # repository holding only package.json and tsconfig.json was "3 files scanned"
+            # and could pass. Coverage counts source files only.
+            if fname not in NON_SOURCE_FILES and not fname.startswith(".env"):
+                scanned_files += 1
             lines = text.splitlines()
-            # Match against code only. Commented-out code is not running code,
-            # and `lines` still holds the original text for evidence snippets.
+            # Phase 2: high-confidence credential detection (provider formats + entropy),
+            # on the ORIGINAL text. A key in a comment is committed exactly like a key in
+            # code; masking comments first hid `// old prod key: sk_live_...` entirely.
+            findings.extend(scan_secrets_in_text(rel_path, text, ledger=ledger))
+            # Everything else matches against code only. Commented-out code is not running
+            # code, and `lines` still holds the original text for evidence snippets.
             text = mask_comments(text, ext)
-
-            # Phase 2: high-confidence credential detection (provider formats + entropy)
-            findings.extend(scan_secrets_in_text(rel_path, text))
             # Phase 5: follow untrusted request data to dangerous sinks
             findings.extend(analyze_data_flow(rel_path, ext, text))
 
@@ -980,7 +1576,6 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
                     continue
                 for m in pattern.finditer(text):
                     line_no = text[:m.start()].count("\n") + 1
-                    snippet = lines[line_no - 1].strip()[:140] if line_no <= len(lines) else m.group(0)[:140]
                     findings.append(
                         Finding(
                             rule_id=rule_id,
@@ -989,7 +1584,8 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
                             title=title,
                             file=rel_path,
                             line=line_no,
-                            snippet=snippet,
+                            snippet=evidence(lines[line_no - 1] if line_no <= len(lines)
+                                             else m.group(0)),
                             cwe_or_standard=cwe,
                             remediation=rem,
                         )
@@ -1000,7 +1596,6 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
                     continue
                 for m in pattern.finditer(text):
                     line_no = text[:m.start()].count("\n") + 1
-                    snippet = lines[line_no - 1].strip()[:140] if line_no <= len(lines) else m.group(0)[:140]
                     findings.append(
                         Finding(
                             rule_id=rule_id,
@@ -1009,7 +1604,8 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
                             title=title,
                             file=rel_path,
                             line=line_no,
-                            snippet=snippet,
+                            snippet=evidence(lines[line_no - 1] if line_no <= len(lines)
+                                             else m.group(0)),
                             cwe_or_standard=std,
                             remediation=rem,
                             confidence="MEDIUM" if dom == "RELIABILITY" else "HIGH",
@@ -1021,7 +1617,6 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
                     continue
                 for m in pattern.finditer(text):
                     line_no = text[:m.start()].count("\n") + 1
-                    snippet = lines[line_no - 1].strip()[:140] if line_no <= len(lines) else m.group(0)[:140]
                     findings.append(
                         Finding(
                             rule_id=rule_id,
@@ -1030,7 +1625,8 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
                             title=title,
                             file=rel_path,
                             line=line_no,
-                            snippet=snippet,
+                            snippet=evidence(lines[line_no - 1] if line_no <= len(lines)
+                                             else m.group(0)),
                             cwe_or_standard=cwe,
                             remediation=rem,
                         )
@@ -1044,6 +1640,259 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
     return findings, scanned_files
 
 
+# ---------------------------------------------------------------------------
+# Live database posture (opt-in): what the database actually enforces
+# ---------------------------------------------------------------------------
+# Missing RLS and an IDOR leave no trace a pattern can find: every request is a normal
+# 200 with real rows - the wrong person's. Migrations in the repository show what was
+# INTENDED; a table changed in a dashboard, or never migrated, is invisible to them. This
+# stage asks the database itself, read-only, through `psql` (the scanner stays
+# dependency-free; without psql it is a coverage gap).
+#
+# The connection string is read from the environment, never from a flag, so it does not
+# land in shell history or the process list, and it is never printed.
+
+DB_URL_ENV = "AEGIS_DATABASE_URL"
+_SQL_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _db_gap(detail: str, remediation: str) -> "Finding":
+    return Finding(
+        rule_id="DB-00", domain="SECURITY", severity="LOW",
+        title="Live Database Check Could Not Run", file="(database)", line=0,
+        snippet=evidence(detail, 300), cwe_or_standard="Coverage",
+        remediation=remediation, confidence="HIGH", kind="skipped_check", status="SKIPPED")
+
+
+def _psql_env(url: str) -> Optional[Dict[str, str]]:
+    """libpq environment for `url`, so the password never appears in argv."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("postgres", "postgresql") or not parts.hostname:
+        return None
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
+    env.update({
+        "PGHOST": parts.hostname, "PGPORT": str(parts.port or 5432),
+        "PGUSER": urllib.parse.unquote(parts.username or ""),
+        "PGPASSWORD": urllib.parse.unquote(parts.password or ""),
+        "PGDATABASE": urllib.parse.unquote(parts.path.lstrip("/") or "postgres"),
+        "PGCONNECT_TIMEOUT": "10", "PGAPPNAME": "vibe-aegis-readonly",
+        # Every statement in a read-only transaction: this stage cannot write.
+        "PGOPTIONS": "-c default_transaction_read_only=on -c statement_timeout=30000",
+    })
+    query = dict(urllib.parse.parse_qsl(parts.query))
+    if query.get("sslmode"):
+        env["PGSSLMODE"] = query["sslmode"]
+    return env
+
+
+def _psql_rows(env: Dict[str, str], sql: str) -> List[List[str]]:
+    import subprocess
+    proc = subprocess.run(["psql", "-X", "-q", "-A", "-t", "-F", "\x1f", "-v", "ON_ERROR_STOP=1",
+                           "-c", sql], capture_output=True, text=True, env=env, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f"psql exited {proc.returncode}")
+    return [ln.split("\x1f") for ln in proc.stdout.splitlines() if ln.strip()]
+
+
+def check_live_database(schemas: List[str], roles: List[str]) -> List["Finding"]:
+    """DB-01..03 from the live catalog. Read-only; opt-in via --db-check."""
+    import shutil
+    url = os.environ.get(DB_URL_ENV, "")
+    if not url:
+        return [_db_gap(f"--db-check was given but {DB_URL_ENV} is not set.",
+                        f"Export {DB_URL_ENV} as the database's postgres:// connection string "
+                        "(a read-only role is enough) and re-run.")]
+    env = _psql_env(url)
+    if env is None:
+        return [_db_gap(f"{DB_URL_ENV} is not a postgres:// URL.",
+                        "Use the connection string from your database settings.")]
+    if not shutil.which("psql"):
+        return [_db_gap("psql is not on PATH, so the database was not queried.",
+                        "Install the PostgreSQL client (psql) and re-run. Vibe Aegis never "
+                        "installs tools for you.")]
+    bad = [x for x in schemas + roles if not _SQL_IDENT.match(x)]
+    if bad:
+        return [_db_gap("Invalid schema or role name: " + ", ".join(bad), "Use plain identifiers.")]
+    schema_arr = "array[" + ",".join("'%s'" % x for x in schemas) + "]::name[]"
+    try:
+        present = [r[0] for r in _psql_rows(env, "select rolname from pg_roles where rolname = any("
+                                            "array[" + ",".join("'%s'" % x for x in roles) + "]::name[])")]
+        if not present:
+            return [_db_gap("None of the API roles (" + ", ".join(roles) + ") exist in this "
+                            "database, so which tables the API exposes cannot be judged.",
+                            "Pass the roles your API connects as with --db-roles.")]
+        # A table grant is unusable without USAGE on its schema.
+        reach_sql = ("(has_schema_privilege('%s', n.oid, 'USAGE') and "
+                     "has_table_privilege('%s', c.oid, 'SELECT,INSERT,UPDATE,DELETE'))")
+        priv = " or ".join(reach_sql % (r, r) for r in present)
+        per_role = ", ".join(reach_sql % (r, r) for r in present)
+        relations = _psql_rows(env,
+            "select n.nspname, c.relname, c.relkind, c.relrowsecurity, "
+            "coalesce(array_to_string(c.reloptions, ','), ''), " + per_role + " "
+            "from pg_class c join pg_namespace n on n.oid = c.relnamespace "
+            "where c.relkind in ('r','p','v','m') and n.nspname = any(" + schema_arr + ") "
+            "and (" + priv + ") order by 1, 2")
+        policies = _psql_rows(env,
+            "select schemaname, tablename, policyname, array_to_string(roles, ','), cmd, "
+            "coalesce(qual, ''), coalesce(with_check, ''), permissive from pg_policies "
+            "where schemaname = any(" + schema_arr + ") order by 1, 2, 3")
+    except Exception as exc:
+        # The password is short and low-entropy more often than not, so pattern masking
+        # cannot be trusted to catch it: remove the exact value (and the URL) first.
+        message = str(exc)
+        for secret in (url, env.get("PGPASSWORD", ""), urllib.parse.quote(env.get("PGPASSWORD", ""))):
+            if secret:
+                message = message.replace(secret, "[REDACTED]")
+        return [_db_gap("The database could not be queried: " + message[:200],
+                        "Check the connection string, network access and that the role can read "
+                        "pg_catalog.")]
+
+    findings: List[Finding] = []
+    for row in relations:
+        schema, name, kind, rls, options = row[:5]
+        reach = [r for r, ok in zip(present, row[5:]) if ok == "t"]
+        where = f"db:{schema}.{name}"
+        who = " and ".join(reach)
+        anon_reach = any(r in ("anon", "public") for r in reach)
+        if kind in ("r", "p") and rls != "t":
+            findings.append(Finding(
+                rule_id="DB-01", domain="SECURITY", severity="CRITICAL" if anon_reach else "HIGH",
+                title=f"Table `{schema}.{name}` Is Reachable By {who} With Row-Level Security Off",
+                file=where, line=0,
+                snippet=evidence(f"relrowsecurity = false, and {who} hold privileges on it: every "
+                                 "row is returned to any caller with that role.", 300),
+                cwe_or_standard="CWE-284 Improper Access Control / Supabase RLS",
+                remediation=(f"ALTER TABLE {schema}.{name} ENABLE ROW LEVEL SECURITY; then add a "
+                             "policy that compares the row's owner with auth.uid(). With RLS on and "
+                             "no policy, nobody can read it - safe while you write the policy."),
+                confidence="HIGH"))
+        elif kind in ("v", "m") and "security_invoker=true" not in options.replace(" ", "").lower() \
+                and "security_invoker=on" not in options.replace(" ", "").lower():
+            findings.append(Finding(
+                rule_id="DB-03", domain="SECURITY", severity="HIGH",
+                title=(f"{'Materialized View' if kind == 'm' else 'View'} `{schema}.{name}` "
+                       f"Bypasses Row-Level Security For {who}"),
+                file=where, line=0,
+                snippet=evidence("The view runs with its owner's rights (no security_invoker), so "
+                                 f"RLS on the tables under it is not applied to {who}.", 300),
+                cwe_or_standard="CWE-284 Improper Access Control / Supabase RLS",
+                remediation=(f"ALTER VIEW {schema}.{name} SET (security_invoker = true) on Postgres "
+                             "15+, or revoke SELECT from the API roles and move it out of the "
+                             "exposed schema."),
+                confidence="HIGH"))
+    api_roles = set(present) | {"public"}
+    for schema, table, policy, roles_txt, cmd, qual, check, permissive in policies:
+        targets = sorted(set(roles_txt.split(",")) & api_roles)
+        # A RESTRICTIVE policy can only narrow access, so `true` there opens nothing.
+        if not targets or permissive != "PERMISSIVE" or "true" not in (qual.strip(), check.strip()):
+            continue
+        open_to_anon = any(r in ("anon", "public") for r in targets)
+        # A public-read table (`FOR SELECT USING (true)`) is a legitimate pattern, which is why
+        # SEC-02 skips it in migrations; report it, but as something to confirm, not an attack.
+        read_only = cmd == "SELECT"
+        severity = "MEDIUM" if read_only else "CRITICAL" if open_to_anon else "HIGH"
+        findings.append(Finding(
+            rule_id="DB-02", domain="SECURITY", severity=severity,
+            title=f"Policy `{policy}` On `{schema}.{table}` Allows Every Row ({cmd} for {', '.join(targets)})",
+            file=f"db:{schema}.{table}", line=0,
+            snippet=evidence(f"USING/WITH CHECK is `true`: any {', '.join(targets)} caller gets "
+                             f"{cmd} on every row, not just their own.", 300),
+            cwe_or_standard="CWE-639 Authorization Bypass Through User-Controlled Key / OWASP A01",
+            remediation=(("If every row of this table is meant to be public, suppress this "
+                          "finding. Otherwise scope the policy to the caller, e.g. "
+                          "USING (owner_id = auth.uid())." if read_only else
+                          "Scope the policy to the caller, e.g. USING (owner_id = auth.uid()) "
+                          "WITH CHECK (owner_id = auth.uid()). `true` lets any caller with this "
+                          "role write rows that are not theirs.")),
+            confidence="HIGH"))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Two-account test plan (--idor-plan): the check a scanner cannot do for you
+# ---------------------------------------------------------------------------
+
+def _route_for(rel_path: str) -> Optional[str]:
+    m = re.match(r"^(?:src/)?app/(.+)/route\.[jt]sx?$", rel_path)
+    if m:
+        path = "/" + m.group(1)
+    else:
+        m = re.match(r"^(?:src/)?pages/(api/.+)\.[jt]sx?$", rel_path)
+        if not m:
+            return None
+        path = "/" + re.sub(r"/index$", "", m.group(1))
+    path = re.sub(r"/\([^/]+\)", "", path)                       # route groups
+    return re.sub(r"\[\.{0,3}([^\]]+)\]", r"{\1}", path)
+
+
+def write_idor_plan(findings: List["Finding"], root: Path, out: Path) -> int:
+    """A manual two-account test for every place an IDOR or missing check was flagged.
+    Written as a file; nothing is sent anywhere."""
+    targets = [f for f in findings if f.rule_id in ("SEC-03", "SEC-04", "DB-01", "DB-02", "DB-03")]
+    lines = ["# Two-account access test", "",
+             "A static scan cannot prove ownership is enforced: an IDOR returns a normal `200` with "
+             "someone else's data. Run each check below with two real accounts on a staging "
+             "deployment you control.", "",
+             "1. Create account **A** and account **B**. Sign in as each and copy its session token "
+             "or cookie into `TOKEN_A` / `TOKEN_B`.",
+             "2. As **A**, create one record of each kind below and note its id as `A_ID`.",
+             "3. Run each request as **B**. Anything but `401`/`403`/`404` (or an empty result) "
+             "is a confirmed finding.", "",
+             "```bash", "export BASE_URL=https://staging.example.com  # your own deployment",
+             "export TOKEN_A=... TOKEN_B=... A_ID=...", "export A_USER_ID=...   # A's user id",
+             "export ANON_KEY=...    # Supabase/PostgREST only: the public anon key", "```", ""]
+    if not targets:
+        lines += ["No SEC-03, SEC-04 or DB-0x finding to test. Run the test above on your most "
+                  "sensitive record type anyway: no finding is not proof."]
+    for i, f in enumerate(targets, 1):
+        lines += [f"## {i}. {f.rule_id} - {f.title}", "", f"Source: `{f.file}`" +
+                  (f" line {f.line}" if f.line else ""), ""]
+        route = _route_for(f.file) if not f.file.startswith("db:") else None
+        if route:
+            method = "GET"
+            try:
+                text = (root / f.file).read_text(encoding="utf-8", errors="ignore").splitlines()
+                for ln in reversed(text[:max(f.line, 1)]):
+                    m = re.search(r"\b(GET|POST|PUT|PATCH|DELETE)\b", ln)
+                    # An App Router export, or a Pages Router `req.method` branch.
+                    if m and ("export" in ln or _METHOD_BRANCH.search(ln) or _METHOD_CASE.search(ln)):
+                        method = m.group(1)
+                        break
+            except OSError:
+                pass
+            url = "$BASE_URL" + re.sub(r"\{[^}]+\}", "$A_ID", route)
+            body = "" if method == "GET" else " -H 'Content-Type: application/json' -d \"{\\\"id\\\": \\\"$A_ID\\\"}\""
+            expect = ("# as B: must NOT return A's record" if method == "GET" else
+                      "# as B: must be refused - then check, as A, that the record is unchanged")
+            lines += ["```bash", expect,
+                      f"curl -s -o /dev/null -w '%{{http_code}}\\n' -X {method} \"{url}\" "
+                      f"-H \"Authorization: Bearer $TOKEN_B\"{body}", "```", ""]
+        elif f.file.startswith("db:"):
+            table = f.file[3:].split(".", 1)[-1]
+            api = f"\"$BASE_URL/rest/v1/{table}"
+            auth_h = " -H \"apikey: $ANON_KEY\" -H \"Authorization: Bearer $TOKEN_B\""
+            write = re.search(r"\((INSERT|UPDATE|DELETE|ALL) for", f.title)
+            if write and write.group(1) in ("INSERT", "ALL"):
+                lines += ["```bash", "# as B: try to create a row OWNED BY A (replace owner_id with the",
+                          "# table's owner column). Anything but 401/403 is a confirmed finding.",
+                          f"curl -s -o /dev/null -w '%{{http_code}}\\n' -X POST {api}\"{auth_h} "
+                          "-H 'Content-Type: application/json' -d \"{\\\"owner_id\\\": \\\"$A_USER_ID\\\"}\"",
+                          "```", ""]
+            if write and write.group(1) in ("UPDATE", "DELETE", "ALL"):
+                verb = "PATCH" if write.group(1) != "DELETE" else "DELETE"
+                lines += ["```bash", f"# as B: {verb} A's row must be refused; check as A it is unchanged",
+                          f"curl -s -X {verb} {api}?id=eq.$A_ID\"{auth_h}"
+                          + (" -H 'Content-Type: application/json' -d '{}'" if verb == "PATCH" else ""),
+                          "```", ""]
+            if not write or write.group(1) == "ALL":
+                lines += ["```bash", "# as B: must return only B's rows, never A's",
+                          f"curl -s {api}?select=*\"{auth_h}", "```", ""]
+        else:
+            lines += ["Find the endpoint that reaches this code and request A's record as B.", ""]
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return len(targets)
+
+
 def check_live_url_posture(target_url: str) -> List[Finding]:
     """
     Passive, read-only HTTP posture check for a live or local deployment URL.
@@ -1053,6 +1902,8 @@ def check_live_url_posture(target_url: str) -> List[Finding]:
     parsed = urllib.parse.urlparse(target_url)
     if not parsed.scheme or not parsed.netloc:
         return findings
+    # The URL may carry `user:password@`; that must never reach a title, path or report.
+    shown_url = display_url(target_url)
 
     ctx = ssl.create_default_context()
     req = urllib.request.Request(
@@ -1071,10 +1922,11 @@ def check_live_url_posture(target_url: str) -> List[Finding]:
                 rule_id="LIVE-00",
                 domain="SECURITY",
                 severity="LOW",
-                title=f"Could Not Reach Live URL ({target_url})",
-                file=target_url,
+                title=f"Could Not Reach Live URL ({shown_url})",
+                file=shown_url,
                 line=0,
-                snippet=str(exc)[:140],
+                # An exception message can quote the URL it failed on.
+                snippet=evidence(str(exc).replace(target_url, shown_url)),
                 cwe_or_standard="Live Deployment Check",
                 remediation="Verify the local or staging server is running before executing `--url` posture checks.",
                 kind="skipped_check",
@@ -1099,9 +1951,9 @@ def check_live_url_posture(target_url: str) -> List[Finding]:
                     domain="SECURITY",
                     severity=sev,
                     title=title,
-                    file=target_url,
+                    file=shown_url,
                     line=0,
-                    snippet=f"Response header `{h_name}` was not present",
+                    snippet=evidence(f"Response header `{h_name}` was not present", 400),
                     cwe_or_standard="OWASP A05 Security Misconfiguration",
                     remediation=rem,
                 )
@@ -1114,7 +1966,7 @@ def check_live_url_posture(target_url: str) -> List[Finding]:
                 domain="SECURITY",
                 severity="HIGH",
                 title="Live Deployment Returns Wildcard `Access-Control-Allow-Origin: *`",
-                file=target_url,
+                file=shown_url,
                 line=0,
                 snippet="Access-Control-Allow-Origin: *",
                 cwe_or_standard="CWE-942 / OWASP A05",
@@ -1124,6 +1976,7 @@ def check_live_url_posture(target_url: str) -> List[Finding]:
 
     # Passive check for exposed .env or .git/config
     base_url = f"{parsed.scheme}://{parsed.netloc}"
+    probe_failures: List[Tuple[str, str]] = []
     for probe_path, marker in (("/.env", "="), ("/.git/config", "[core]")):
         probe_url = base_url + probe_path
         try:
@@ -1141,16 +1994,35 @@ def check_live_url_posture(target_url: str) -> List[Finding]:
                             domain="SECURITY",
                             severity="CRITICAL",
                             title=f"Publicly Exposed `{probe_path}` on Live Server",
-                            file=probe_url,
+                            file=display_url(probe_url),
                             line=0,
-                            snippet=f"HTTP 200 returned with sensitive configuration markers at {probe_url}",
+                            snippet=evidence(f"HTTP 200 returned with sensitive configuration "
+                                             f"markers at {display_url(probe_url)}", 400),
                             cwe_or_standard="CWE-538 / OWASP A05",
                             remediation=f"Block public access to `{probe_path}` at your web server/CDN and rotate any exposed credentials.",
                         )
                     )
-        except Exception:
-            pass
+        except urllib.error.HTTPError as e:
+            # A 4xx is an answer: the server refused to serve the file. A 5xx is not -
+            # the server failed, and the file may still be served once it recovers.
+            if e.code >= 500:
+                probe_failures.append((probe_path, f"HTTP {e.code}"))
+        except Exception as exc:
+            # This used to be `pass`, so a timeout read exactly like "not exposed".
+            probe_failures.append((probe_path, type(exc).__name__))
 
+    for probe_path, reason in probe_failures:
+        findings.append(Finding(
+            rule_id="LIVE-00", domain="SECURITY", severity="LOW",
+            title=f"Exposure Probe Did Not Complete (`{probe_path}`)",
+            file=display_url(base_url + probe_path), line=0,
+            snippet=evidence(f"The request for {probe_path} failed ({reason}), so whether it "
+                             "is publicly readable is unknown.", 300),
+            cwe_or_standard="Live Deployment Check",
+            remediation=(f"Re-run when the deployment is reachable, or check `{probe_path}` "
+                         "by hand: it must not be served."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED",
+        ))
     return findings
 
 
@@ -1310,10 +2182,14 @@ PLACEHOLDER_VALUE = re.compile(
 SECRET_ASSIGNMENT = re.compile(
     r"""(?ix)
     (?P<name>[A-Za-z_][A-Za-z0-9_\-\.]*)
+    ['"]?                  # a quoted key: JSON `"api_secret": "..."`, a Python dict
     \s*[:=]\s*
     (?P<quote>['"])(?P<value>[^'"\n]{8,200})(?P=quote)
     """
 )
+
+
+LONG_LINE_LIMIT = 4000
 
 
 def shannon_entropy(value: str) -> float:
@@ -1342,65 +2218,103 @@ def looks_like_placeholder(value: str) -> bool:
     return False
 
 
+_TEST_CONTEXT_SEGMENTS = {
+    "test", "tests", "__tests__", "spec", "specs", "__mocks__", "mocks", "mock", "fixture",
+    "fixtures", "testdata", "e2e", "cypress", "playwright", "__snapshots__",
+    "example", "examples", "sample", "samples",
+}
+_EXAMPLE_FILE = re.compile(r"\.(?:example|sample|template|dist)$|^\.env\.(?:example|sample|template|dist)$")
+
+
 def is_test_context(rel_path: str) -> bool:
-    low = rel_path.lower()
-    return any(
-        marker in low
-        for marker in ("test", "spec", "fixture", "mock", "__snapshots__", "example", ".env.example", "sample")
-    )
+    """Is this a test, fixture or example file? Decided by whole path segments and
+    file-naming conventions, never by substring.
+
+    A substring match on "test", "spec" or "mock" made `src/latest/`, `inspector/`,
+    `contest/` and `hammock.js` "test code": their credentials were downgraded to MEDIUM
+    (passing --fail-on-high) and data-flow analysis was switched off for the file.
+    """
+    if is_test_path(rel_path):
+        return True
+    parts = rel_path.replace("\\", "/").lower().split("/")
+    return any(seg in _TEST_CONTEXT_SEGMENTS for seg in parts[:-1]) or bool(_EXAMPLE_FILE.search(parts[-1]))
 
 
-def scan_secrets_in_text(rel_path: str, text: str, origin: str = "source") -> List[Finding]:
+def _provider_finding(label: str, severity: str, rel_path: str, idx: int, value: str,
+                      origin: str) -> "Finding":
+    # A provider-format key keeps its severity wherever it lives. Real keys get committed
+    # in tests too, and documentation placeholders are rejected before this point by
+    # looks_like_placeholder() - so the path is no reason to call one MEDIUM.
+    return _vault_secret(label, value, Finding(
+        rule_id="SEC-01", domain="SECURITY", severity=severity,
+        title=f"{label} Found In {origin.title()} ({rel_path})",
+        file=rel_path, line=idx, snippet=redact(value),
+        cwe_or_standard="CWE-798 Hard-Coded Credentials / OWASP A07",
+        remediation=(f"Revoke and rotate this {label} immediately - it must be assumed "
+                     "compromised. Move it to a server-only environment variable and never "
+                     "expose it to a client bundle."),
+        confidence="HIGH",
+    ))
+
+
+def scan_secrets_in_text(rel_path: str, text: str, origin: str = "source",
+                         ledger: Optional["CoverageLedger"] = None) -> List[Finding]:
     """Phase 2 secret hunting. Used for source files, git history and build artifacts."""
     findings: List[Finding] = []
     lines = text.splitlines()
     testish = is_test_context(rel_path)
-    seen: Set[Tuple[str, int]] = set()
+    seen: Set[Tuple] = set()
 
     for idx, line in enumerate(lines, 1):
-        if len(line) > 4000:
+        if len(line) > LONG_LINE_LIMIT:
+            # A single 4000+ character line is almost always generated or bundled
+            # output - which is precisely where a build-inlined credential hides.
+            # The provider patterns are anchored and cheap, so scan the line for those
+            # and skip only the expensive entropy pass, recording that we did so.
+            for label, severity, pattern in PROVIDER_SECRETS:
+                for m in pattern.finditer(line):
+                    value = m.group(0)
+                    if looks_like_placeholder(value) or (label, idx, value) in seen:
+                        continue
+                    seen.add((label, idx, value))
+                    findings.append(_provider_finding(label, severity, rel_path, idx, value, origin))
+            if ledger is not None:
+                ledger.record(
+                    f"line longer than {LONG_LINE_LIMIT} chars - entropy analysis skipped",
+                    f"{rel_path}:{idx}",
+                    detail=("Known credential formats were still matched on these lines; "
+                            "only the high-entropy heuristic was skipped."))
             continue
 
-        # 2a. Known provider key formats - highest confidence available.
+        # 2a. Known provider key formats - highest confidence available. EVERY match on
+        # the line: `pattern.search` found only the first, so a second key of the same
+        # provider on one line was never reported.
         for label, severity, pattern in PROVIDER_SECRETS:
-            m = pattern.search(line)
-            if not m:
-                continue
-            value = m.group(0)
-            if looks_like_placeholder(value):
-                continue
-            key = (label, idx)
-            if key in seen:
-                continue
-            seen.add(key)
-            sev = "MEDIUM" if testish and severity != "MEDIUM" else severity
-            findings.append(
-                Finding(
-                    rule_id="SEC-01",
-                    domain="SECURITY",
-                    severity=sev,
-                    title=f"{label} Found In {origin.title()} ({rel_path})",
-                    file=rel_path,
-                    line=idx,
-                    snippet=redact(value),
-                    cwe_or_standard="CWE-798 Hard-Coded Credentials / OWASP A07",
-                    remediation=(
-                        f"Revoke and rotate this {label} immediately - it must be assumed compromised. "
-                        "Move it to a server-only environment variable and never expose it to a client bundle."
-                    ),
-                    confidence="HIGH",
-                )
-            )
+            for m in pattern.finditer(line):
+                value = m.group(0)
+                if looks_like_placeholder(value) or (label, idx, value) in seen:
+                    continue
+                seen.add((label, idx, value))
+                findings.append(_provider_finding(label, severity, rel_path, idx, value, origin))
 
         # 2b. Secret-sounding name assigned a high-entropy literal.
         for m in SECRET_ASSIGNMENT.finditer(line):
             name = m.group("name")
             value = m.group("value")
             # "_" is a word character, so \bsecret\b can never match inside
-            # NEXT_PUBLIC_API_SECRET. Normalise separators before testing.
-            if not SENSITIVE_NAME.search(re.sub(r"[_\-.]+", " ", name)):
+            # NEXT_PUBLIC_API_SECRET. Normalise separators before testing - camelCase
+            # boundaries too: `apiSecret` and `secretKey`, the usual JavaScript spelling,
+            # were never matched.
+            spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", name)
+            if not SENSITIVE_NAME.search(re.sub(r"[_\-.]+", " ", spaced)):
                 continue
             if looks_like_placeholder(value):
+                continue
+            # A credential is one token. UI text under a secret-sounding key - an i18n
+            # `"LABEL_PASSWORD": "Mot de passe"` or `"現在のパスワードを入力してください"` -
+            # has spaces or is mostly non-ASCII, and its variety of characters scored as
+            # entropy. A password with the odd `§` in it is still a password.
+            if re.search(r"\s", value) or sum(ord(ch) > 127 for ch in value) > len(value) * 0.2:
                 continue
             if shannon_entropy(value) < 3.6 or len(value) < 16:
                 continue
@@ -1409,7 +2323,7 @@ def scan_secrets_in_text(rel_path: str, text: str, origin: str = "source") -> Li
                 continue
             seen.add(key)
             client_exposed = bool(re.match(r"(?i)(NEXT_PUBLIC_|VITE_|EXPO_PUBLIC_|REACT_APP_|PUBLIC_)", name))
-            findings.append(
+            findings.append(_vault(
                 Finding(
                     rule_id="SEC-01B" if client_exposed else "SEC-01",
                     domain="SECURITY",
@@ -1421,7 +2335,8 @@ def scan_secrets_in_text(rel_path: str, text: str, origin: str = "source") -> Li
                     ),
                     file=rel_path,
                     line=idx,
-                    snippet=f"{name} = {redact(value)}  (entropy {shannon_entropy(value):.2f} bits/char)",
+                    snippet=evidence(f"{name} = {redact(value)}  "
+                                     f"(entropy {shannon_entropy(value):.2f} bits/char)", 200),
                     cwe_or_standard="CWE-798 Hard-Coded Credentials / OWASP A07",
                     remediation=(
                         "Any variable prefixed NEXT_PUBLIC_/VITE_/EXPO_PUBLIC_/REACT_APP_ is compiled into "
@@ -1431,18 +2346,212 @@ def scan_secrets_in_text(rel_path: str, text: str, origin: str = "source") -> Li
                         else "Load this from a server-side environment variable instead of hard-coding it, and rotate the current value."
                     ),
                     confidence="HIGH" if client_exposed else "MEDIUM",
-                )
-            )
+                ), value
+            ))
 
     return findings
 
 
+def _vault_secret(label: str, value: str, f: "Finding") -> "Finding":
+    # A PEM header is the same text in every key file; matching it proves nothing.
+    return f if label == "Private Key Block" else _vault(f, value)
+
+
+# The part of a credential that says WHICH kind it is. Providers publish these prefixes,
+# so printing one discloses nothing; everything after it is the secret.
+_PUBLIC_KEY_PREFIX = re.compile(
+    r"^(?:(?:sk|rk)_(?:live|test)_|AKIA|ASIA|gh[pousr]_|github_pat_|AIza|xox[baprs]-|"
+    r"sk-proj-|sk-ant-|sk-|SG\.|rzp_live_|key-|npm_|whsec_|"
+    r"https://hooks\.slack\.com/services/|[a-z][a-z0-9+.\-]*://)"
+)
+
+
 def redact(value: str) -> str:
-    """Never print a full credential into a report that gets committed or shared."""
+    """Never print any part of a credential into a report that gets committed or shared.
+
+    Only the provider's public prefix and the length survive. This used to keep the
+    first six and last four characters "for identification" - ten characters of a
+    sixteen-character secret, which leaves too little unknown to call it redacted.
+    Identification is the file, the line and the provider label; the value is not
+    needed for that, and later stages that must match the exact value read it from
+    the in-memory vault instead (see `_vault()`).
+    """
     value = value.strip()
-    if len(value) <= 12:
-        return value[:3] + "***"
-    return f"{value[:6]}...{value[-4:]} ({len(value)} chars)"
+    m = _PUBLIC_KEY_PREFIX.match(value)
+    prefix = m.group(0) if m and len(m.group(0)) < len(value) else ""
+    return f"{prefix}...[REDACTED {len(value)} chars]"
+
+
+# Raw credential values recognised during this run, held in process memory only, so a
+# later stage can prove an EXACT match - a key from your source inside a shipped bundle -
+# without a Finding ever holding the value. A Finding carries an opaque integer handle;
+# `asdict()` ignores it, so it never reaches a report.
+_SECRET_VAULT: Dict[int, str] = {}
+
+
+def _vault(f: "Finding", value: str) -> "Finding":
+    handle = len(_SECRET_VAULT) + 1
+    _SECRET_VAULT[handle] = value
+    f._secret_handle = handle  # type: ignore[attr-defined]
+    return f
+
+
+def _vault_copy(src: "Finding", dst: "Finding") -> "Finding":
+    """A finding derived from another one refers to the same secret."""
+    if hasattr(src, "_secret_handle"):
+        dst._secret_handle = src._secret_handle  # type: ignore[attr-defined]
+    return dst
+
+
+def _vaulted(f: "Finding") -> Optional[str]:
+    return _SECRET_VAULT.get(getattr(f, "_secret_handle", 0))
+
+
+# ---------------------------------------------------------------------------
+# Evidence: the ONLY way text from a scanned file or a tool reaches a Finding
+# ---------------------------------------------------------------------------
+# A report is committed, attached to issues and uploaded as a CI artifact, so every
+# snippet is public. `redact_findings()` alone could not make that true. It knows only
+# the provider formats, and it ran AFTER each rule had cut the line to 140 characters,
+# so a key split by the cut no longer matched its own pattern. Any secret that was not
+# in a provider format - a webhook secret, a `.env` password, a credentialed URL - was
+# printed verbatim by whichever rule happened to quote its line.
+#
+# `evidence()` masks first and truncates last. `TestEverySnippetIsBuiltThroughEvidence`
+# parses this file and fails if any Finding's snippet is built any other way.
+
+# Each pattern starts only where a run begins (the lookbehinds), so a long run of
+# identifier characters is scanned once, not once per position - which was quadratic.
+_URL_USERINFO = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z][a-z0-9+.\-]*://)[^\s/@\"'`<>]+@")
+_AUTH_SCHEME_VALUE = re.compile(r"(?i)\b(bearer|basic|token)\s+([A-Za-z0-9\-._~+/]{8,}=*)")
+
+# Broader than SENSITIVE_NAME on purpose. Detection must be precise; redaction must not
+# miss, so `dbPassword` and `csrfToken` count here although neither raises a finding.
+_SECRETISH_NAME = re.compile(
+    r"(?i)(?:secret|passw(?:or)?d|pwd|api[_\-]?key|access[_\-]?key|token|credential|"
+    r"private[_\-]?key|service[_\-]?role|signing[_\-]?key|encryption[_\-]?key|"
+    r"session[_\-]?key|dsn|conn(?:ection)?[_\-]?str(?:ing)?)"
+)
+_ASSIGNED_VALUE = re.compile(
+    r"""(?<![A-Za-z0-9_\-.$])(?P<name>[A-Za-z_][A-Za-z0-9_\-.]*)["']?\s*(?::|=(?![=>]))\s*"""
+    r"""(?:(?P<q>["'`])(?P<quoted>[^"'`\n]{1,400})(?P=q)|(?P<bare>[^\s"'`,;)}\]]{4,}))"""
+)
+# A bare (unquoted) value that is code rather than a literal: `password: hashed.value`,
+# `apiKey: process.env.KEY`, `token: string`. Anything else is masked - over-masking
+# costs a less readable snippet, under-masking costs a credential.
+_REFERENCE_PREFIX = re.compile(
+    r"^(?:process\.env|import\.meta\.env|os\.environ|os\.getenv|getenv\(|Deno\.env|"
+    r"env\(|ENV\[|\$\{|\{\{)"
+)
+_TYPE_WORDS = {
+    "string", "number", "boolean", "bigint", "str", "int", "bool", "bytes", "any",
+    "unknown", "null", "None", "undefined", "true", "false", "True", "False",
+    "required", "optional",
+}
+_RANDOM_TOKEN = re.compile(r"(?<![A-Za-z0-9_\-+/])[A-Za-z0-9_\-+/]{20,}={0,2}")
+_EVIDENCE_INPUT_CAP = 8192
+
+
+def _is_code_reference(name: str, value: str) -> bool:
+    if _REFERENCE_PREFIX.match(value) or value in _TYPE_WORDS:
+        return True
+    if re.fullmatch(r"[A-Z0-9_]+", name):
+        # `API_KEY=...` is .env style, where a bare value IS the literal.
+        return False
+    return bool(
+        value.lower() == name.lower()
+        or re.fullmatch(r"-?\d+(?:\.\d+)?", value)                       # a number
+        or re.fullmatch(r"[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+\(?", value)  # a.b.c
+        or re.fullmatch(r"[a-z_$][a-z$]*(?:[A-Z][a-z$]*)+\(?", value)    # camelCase
+        or re.fullmatch(r"[A-Za-z_$][\w$]*\(", value)                    # a call
+    )
+
+
+def _mask_assignment(m: "re.Match") -> str:
+    whole = m.group(0)
+    if not _SECRETISH_NAME.search(m.group("name")):
+        return whole
+    quoted = m.group("quoted") is not None
+    value = m.group("quoted") if quoted else m.group("bare")
+    if "[REDACTED" in value or (not quoted and _is_code_reference(m.group("name"), value)):
+        return whole
+    start = m.start("quoted" if quoted else "bare") - m.start()
+    return whole[:start] + redact(value) + whole[start + len(value):]
+
+
+def _looks_random(token: str) -> bool:
+    if not (re.search(r"\d", token) and re.search(r"[A-Za-z]", token)):
+        return False
+    # Paths and base64 both contain "/", but a path is far less random.
+    return shannon_entropy(token) >= (4.0 if ("/" in token or "+" in token) else 3.5)
+
+
+def evidence(text, limit: int = 140) -> str:
+    """Make text from a scanned file or an external tool safe to put in a report.
+
+    Masks credentialed URLs, every provider-format key, any secret-named assignment
+    (quoted, bare, `.env`, JSON or YAML), auth-header values and long random tokens -
+    THEN truncates. Never slice the input before calling this: a cut through a key is
+    exactly how a partial key used to escape its own pattern.
+
+    This only hides secrets that can be recognised. A short, low-entropy password in a
+    line with nothing to mark it as one cannot be told apart from code.
+    """
+    s = "" if text is None else str(text)
+    if len(s) > _EVIDENCE_INPUT_CAP:
+        # The cap protects the regexes from a multi-megabyte line. Drop the token the
+        # cut lands in, so no fragment of a value survives unmasked.
+        s = re.sub(r"[^\s\"'`,;:=()\[\]{}<>]*$", "", s[:_EVIDENCE_INPUT_CAP])
+    s = s.replace("\r", " ").replace("\n", " ").strip()
+    s = _URL_USERINFO.sub(r"\1[REDACTED]@", s)
+    for _label, _sev, pattern in PROVIDER_SECRETS:
+        s = pattern.sub(lambda m: redact(m.group(0)), s)
+    s = _AUTH_SCHEME_VALUE.sub(lambda m: f"{m.group(1)} {redact(m.group(2))}", s)
+    s = _ASSIGNED_VALUE.sub(_mask_assignment, s)
+    s = _RANDOM_TOKEN.sub(
+        lambda m: redact(m.group(0)) if _looks_random(m.group(0)) else m.group(0), s)
+    return s[:limit]
+
+
+def display_url(url: Optional[str]) -> str:
+    """A URL as it may be printed in a report, a title, a log line or the terminal.
+
+    Removing `user:password@` was not enough: `?token=...`, `&sig=...`, an OAuth
+    `#access_token=...` fragment and a capability token in the path all reached the
+    report verbatim through `live_url`. Using the RFC 3986 components: the user-info is
+    removed, every query VALUE is replaced (parameter names are kept, so the report
+    still says which parameters were sent), the fragment is replaced, and a path
+    segment that is a recognisable key or looks random is redacted. Scheme, host, port
+    and ordinary path segments are kept.
+    """
+    url = url or ""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return evidence(url, 2048)
+    if not parts.scheme or not parts.netloc:
+        return evidence(url, 2048)
+    netloc = parts.netloc.rpartition("@")[2]
+    if "@" in parts.netloc:
+        netloc = "[REDACTED]@" + netloc
+
+    def segment(seg: str) -> str:
+        for _label, _sev, pattern in PROVIDER_SECRETS:
+            if pattern.search(seg):
+                return "[REDACTED]"
+        if len(seg) >= 16 and _looks_random(urllib.parse.unquote(seg)):
+            return "[REDACTED]"
+        return seg
+
+    path = "/".join(segment(seg) for seg in parts.path.split("/"))
+    # A bare item (`?k3Jx9...`) has no name to keep, and may itself be the token.
+    query = "&".join(
+        (pair.partition("=")[0] + "=[REDACTED]") if "=" in pair else
+        ("[REDACTED]" if pair else pair)
+        for pair in parts.query.split("&")
+    ) if parts.query else ""
+    fragment = "[REDACTED]" if parts.fragment else ""
+    return urllib.parse.urlunsplit((parts.scheme, netloc, path, query, fragment))
 
 
 # ---------------------------------------------------------------------------
@@ -1484,7 +2593,7 @@ def scan_git_history(root: Path, max_commits: int = 300) -> List[Finding]:
         return [Finding(
             rule_id="GIT-00", domain="HISTORY", severity="LOW",
             title="Git History Check Could Not Run",
-            file="git", line=0, snippet=reason,
+            file="git", line=0, snippet=evidence(reason, 400),
             cwe_or_standard="Coverage Gap",
             remediation=("Credentials committed in the past stay readable even after the file is "
                          "deleted. Re-run inside a git working tree with git on PATH to check."),
@@ -1494,31 +2603,100 @@ def scan_git_history(root: Path, max_commits: int = 300) -> List[Finding]:
     if not (root / ".git").exists():
         return gap("No .git directory found - history was not inspected.")
 
-    log = run_git(root, ["log", f"--max-count={max_commits}", "--format=%H%x1f%an%x1f%ad%x1f%s", "--date=short"])
+    # Every ref, not just HEAD: `--all` is "as if all the refs in refs/, along with
+    # HEAD, are listed" (git-log docs) - branches, tags, remote-tracking refs and the
+    # stash. A key pushed only to a feature branch is as public as one on main.
+    log = run_git(root, ["log", "--all", f"--max-count={max_commits}",
+                         "--format=%H%x1f%an%x1f%ad%x1f%s", "--date=short"])
     if log is None:
         return gap("git could not be executed (missing binary, timeout, or not a repository).")
     if not log.strip():
         return findings
 
+    # What this run did NOT cover is stated, never implied: a commit limit, a shallow
+    # clone (CI checks out one commit by default), and every commit git failed to show.
+    total = run_git(root, ["rev-list", "--all", "--count"])
+    if total is None or not total.strip().isdigit():
+        findings.extend(gap("The number of commits could not be counted, so whether every "
+                            "commit was examined is unknown."))
+    elif int(total) > max_commits:
+        findings.append(Finding(
+            rule_id="GIT-00", domain="HISTORY", severity="LOW",
+            title=f"Git History Truncated At {max_commits} Commits",
+            file="git", line=0,
+            snippet=evidence(f"{total.strip()} commits are reachable from the repository's refs; "
+                             f"the {int(total) - max_commits} oldest were NOT examined.", 300),
+            cwe_or_standard="Coverage Gap",
+            remediation=f"Re-run with `--git-history {total.strip()}` to examine every commit.",
+            confidence="HIGH", kind="skipped_check", status="SKIPPED"))
+    if (run_git(root, ["rev-parse", "--is-shallow-repository"]) or "").strip() == "true":
+        findings.append(Finding(
+            rule_id="GIT-00", domain="HISTORY", severity="LOW",
+            title="Git History Is A Shallow Clone",
+            file="git", line=0,
+            snippet="Commits before the clone's depth were never fetched, so they were not examined.",
+            cwe_or_standard="Coverage Gap",
+            remediation=("Fetch the full history first (`git fetch --unshallow`, or "
+                         "`fetch-depth: 0` in actions/checkout)."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED"))
+
     reported: Set[str] = set()
+    env_reported: Set[str] = set()
+    # A file still tracked is SEC-01C's (CRITICAL); HIST-02 is for one that left the tree.
+    tracked_now = set((run_git(root, ["ls-files", "-z"]) or "").split("\0"))
+    failed: List[str] = []
     for entry in log.strip().splitlines():
         parts = entry.split("\x1f")
         if len(parts) != 4:
+            failed.append(entry[:10])
             continue
         sha, author, date, subject = parts
-        diff = run_git(root, ["show", sha, "--unified=0", "--no-color", "--diff-filter=AM"], timeout=30)
-        if not diff:
+        # No --diff-filter: AM hid a key added in a commit git saw as a rename. A merge
+        # is shown against its first parent, so lines written while resolving it are
+        # plain `+` lines. --no-ext-diff / --no-textconv: a repository's own config
+        # must not choose a program to run while we read it.
+        diff = run_git(root, ["show", sha, "--unified=0", "--no-color", "--no-ext-diff",
+                              "--no-textconv", "--diff-merges=first-parent", "--format="],
+                       timeout=30)
+        if diff is None:
+            failed.append(sha[:10])
             continue
+        short_sha = sha[:10]
+        # An environment file with a value in it, even one no credential pattern knows
+        # (`DB_PASSWORD=hunter2`), stays readable in history after it is deleted. Judged
+        # per file name, so a template beside it (`.env.example`) never stands in for it.
+        target = None
+        for ln in diff.splitlines():
+            if ln.startswith("+++ "):
+                path = ln[6:] if ln.startswith("+++ b/") else ""
+                name = path.rsplit("/", 1)[-1]
+                target = path if (_ENV_FILE.match(name) and not _ENV_TEMPLATE.search(name)
+                                  and path not in tracked_now and path not in env_reported) else None
+            elif target and ln.startswith("+") and _ENV_ASSIGNMENT.match(ln[1:]):
+                env_reported.add(target)
+                findings.append(Finding(
+                    rule_id="HIST-02", domain="HISTORY", severity="HIGH",
+                    title=f"Environment File `{target}` Was Committed To Git History",
+                    file=f"git:{short_sha}", line=0,
+                    snippet=evidence(f"{target} with values in it was added in commit {short_sha} "
+                                     f"by {author} on {date}: {subject}", 260),
+                    cwe_or_standard="CWE-540 Information Exposure Through Source Code / OWASP A07",
+                    remediation=(f"Every value it held is still readable with `git show {short_sha}`. "
+                                 "Rotate them, then purge the file from history with `git filter-repo` "
+                                 "and force-push after coordinating with every collaborator."),
+                    confidence="HIGH"))
+                target = None
         # Only added lines can introduce a secret.
         added = "\n".join(ln[1:] for ln in diff.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
         if not added:
             continue
-        for f in scan_secrets_in_text(f"commit {sha[:10]}", added, origin="git history"):
-            dedupe_key = f.snippet
+        for f in scan_secrets_in_text(f"commit {short_sha}", added, origin="git history"):
+            # Redacted evidence no longer tells two keys apart, so dedupe on the value.
+            dedupe_key = _vaulted(f) or f.snippet
             if dedupe_key in reported:
                 continue
             reported.add(dedupe_key)
-            findings.append(
+            findings.append(_vault_copy(f,
                 Finding(
                     rule_id="HIST-01",
                     domain="HISTORY",
@@ -1526,7 +2704,8 @@ def scan_git_history(root: Path, max_commits: int = 300) -> List[Finding]:
                     title=f"Credential Committed To Git History ({f.title.split(' Found In')[0]})",
                     file=f"git:{sha[:10]}",
                     line=0,
-                    snippet=f"{f.snippet} | commit {sha[:10]} by {author} on {date}: {subject[:60]}",
+                    snippet=evidence(f"{f.snippet} | commit {short_sha} by {author} on {date}: "
+                                     f"{subject}", 260),
                     cwe_or_standard="CWE-540 Information Exposure Through Source Code / OWASP A07",
                     remediation=(
                         "Removing the line in a later commit does NOT help - the value is still readable in history "
@@ -1535,7 +2714,18 @@ def scan_git_history(root: Path, max_commits: int = 300) -> List[Finding]:
                     ),
                     confidence="HIGH",
                 )
-            )
+            ))
+    if failed:
+        shown = ", ".join(failed[:5]) + (" ..." if len(failed) > 5 else "")
+        findings.append(Finding(
+            rule_id="GIT-00", domain="HISTORY", severity="LOW",
+            title=f"{len(failed)} Commit(s) Could Not Be Read",
+            file="git", line=0,
+            snippet=evidence(f"git failed or timed out showing {shown}, so those commits "
+                             "were not examined.", 300),
+            cwe_or_standard="Coverage Gap",
+            remediation="Inspect them with `git show <sha>`, or re-run with git available.",
+            confidence="HIGH", kind="skipped_check", status="SKIPPED"))
     return findings
 
 
@@ -1558,7 +2748,7 @@ def parse_dependencies(root: Path) -> List[Tuple[str, str, str]]:
             deps.append(key)
 
     lock = root / "package-lock.json"
-    if lock.exists():
+    if lock.exists() and not _escapes(root, lock):
         try:
             data = json.loads(lock.read_text(encoding="utf-8", errors="ignore"))
             for path, meta in (data.get("packages") or {}).items():
@@ -1573,7 +2763,7 @@ def parse_dependencies(root: Path) -> List[Tuple[str, str, str]]:
             pass
 
     pkg = root / "package.json"
-    if pkg.exists() and not deps:
+    if pkg.exists() and not _escapes(root, pkg) and not deps:
         try:
             data = json.loads(pkg.read_text(encoding="utf-8", errors="ignore"))
             for section in ("dependencies", "devDependencies"):
@@ -1583,7 +2773,7 @@ def parse_dependencies(root: Path) -> List[Tuple[str, str, str]]:
             pass
 
     req = root / "requirements.txt"
-    if req.exists():
+    if req.exists() and not _escapes(root, req):
         for line in req.read_text(encoding="utf-8", errors="ignore").splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
@@ -1593,7 +2783,7 @@ def parse_dependencies(root: Path) -> List[Tuple[str, str, str]]:
                 add("PyPI", m.group(1), m.group(2))
 
     cargo = root / "Cargo.lock"
-    if cargo.exists():
+    if cargo.exists() and not _escapes(root, cargo):
         text = cargo.read_text(encoding="utf-8", errors="ignore")
         for block in text.split("[[package]]"):
             n = re.search(r'name\s*=\s*"([^"]+)"', block)
@@ -1602,13 +2792,257 @@ def parse_dependencies(root: Path) -> List[Tuple[str, str, str]]:
                 add("crates.io", n.group(1), v.group(1))
 
     gomod = root / "go.mod"
-    if gomod.exists():
+    if gomod.exists() and not _escapes(root, gomod):
         for line in gomod.read_text(encoding="utf-8", errors="ignore").splitlines():
             m = re.match(r"^\s*([a-zA-Z0-9_.\-/]+)\s+v([0-9][0-9A-Za-z.\-+]*)", line.strip())
             if m and not line.strip().startswith(("module", "go ", "//")):
                 add("Go", m.group(1), "v" + m.group(2))
 
     return deps
+
+
+# Manifests and lockfiles that exist in the wild but that `parse_dependencies()` does not
+# read. Finding one means some dependencies were never checked.
+UNSUPPORTED_MANIFESTS = (
+    "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "bun.lock", "poetry.lock", "Pipfile.lock",
+    "Pipfile", "uv.lock", "pyproject.toml", "Gemfile.lock", "composer.lock", "pom.xml",
+    "build.gradle", "build.gradle.kts", "gradle.lockfile", "Package.resolved",
+    "Podfile.lock", "pubspec.lock", "mix.lock", "packages.lock.json",
+)
+SUPPORTED_MANIFESTS = ("package-lock.json", "package.json", "requirements.txt",
+                       "Cargo.lock", "go.mod")
+
+
+def dependency_coverage_gaps(root: Path) -> List[Finding]:
+    """What the dependency stage could NOT see. Each is a gap, never a pass.
+
+    `parse_dependencies()` reads five manifest formats, at the repository root only. An
+    empty result used to read as "no known vulnerabilities" - for a `poetry.lock`
+    pinning a vulnerable Django, for every lockfile in a monorepo's subdirectories, and
+    for each `requirements.txt` line not pinned with `==`.
+    """
+    def gap(title: str, file: str, detail: str, remediation: str) -> Finding:
+        return Finding(
+            rule_id="DEP-00", domain="SUPPLY_CHAIN", severity="LOW", title=title,
+            file=file, line=0, snippet=evidence(detail, 400), cwe_or_standard="Coverage",
+            remediation=remediation, confidence="HIGH", kind="skipped_check", status="SKIPPED")
+
+    engines = ("Use a dedicated scanner for these (`--engine osv-scanner` or "
+               "`--engine trivy`), which reads far more formats.")
+    gaps: List[Finding] = []
+
+    def present(name: str) -> bool:
+        # The same test parse_dependencies() applies: a manifest that links out of the
+        # repository is not read, so it must not count as present either.
+        p = root / name
+        return p.is_file() and not _escapes(root, p)
+
+    linked = [n for n in SUPPORTED_MANIFESTS + UNSUPPORTED_MANIFESTS
+              if (root / n).is_file() and _escapes(root, root / n)]
+    if linked:
+        gaps.append(gap("Dependency Manifest Links Outside The Repository", linked[0],
+                        "Not read, so none of their packages were checked: " + ", ".join(linked),
+                        "Commit the real manifest instead of a symlink to it."))
+    unsupported = [n for n in UNSUPPORTED_MANIFESTS if present(n)]
+    if unsupported:
+        gaps.append(gap("Dependency Manifest Format Not Supported", unsupported[0],
+                        "Not read, so none of their packages were checked: "
+                        + ", ".join(unsupported), engines))
+
+    nested: List[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        if Path(dirpath) == root:
+            continue
+        for name in filenames:
+            if name in SUPPORTED_MANIFESTS or name in UNSUPPORTED_MANIFESTS:
+                nested.append((Path(dirpath) / name).relative_to(root).as_posix())
+    if nested:
+        gaps.append(gap("Dependency Manifests Below The Repository Root Not Checked",
+                        nested[0], f"{len(nested)} manifest(s) in subdirectories were not "
+                        f"read: {', '.join(nested[:5])}",
+                        "Only root-level manifests are parsed. Scan each package directory "
+                        "separately, or " + engines[0].lower() + engines[1:]))
+
+    if present("package.json") and not present("package-lock.json"):
+        gaps.append(gap("npm Versions Taken From Ranges, Not Installed Versions",
+                        "package.json", "No package-lock.json, so each version was read "
+                        "from a semver range (^4.17.0 is queried as 4.17.0) rather than the "
+                        "version actually installed.",
+                        "Commit a package-lock.json, or " + engines[0].lower() + engines[1:]))
+
+    req = root / "requirements.txt"
+    if present("requirements.txt"):
+        unpinned = [ln.strip() for ln in req.read_text(encoding="utf-8", errors="ignore").splitlines()
+                    if ln.strip() and not ln.strip().startswith("#")
+                    and not re.match(r"^([A-Za-z0-9_.\-]+)\s*==\s*([0-9A-Za-z.\-]+)", ln.strip())]
+        if unpinned:
+            gaps.append(gap("Unpinned Python Requirements Not Checked", "requirements.txt",
+                            f"{len(unpinned)} line(s) not pinned with ==, so not checked: "
+                            + ", ".join(unpinned[:5]),
+                            "Pin exact versions (pip freeze, or pip-compile), or "
+                            + engines[0].lower() + engines[1:]))
+
+    if not unsupported and not nested and not linked and not any(present(n) for n in SUPPORTED_MANIFESTS):
+        gaps.append(gap("No Dependency Manifest Found", "(repository)",
+                        "No manifest or lockfile was found, so no dependency was checked.",
+                        "If the project has dependencies, commit their lockfile. "
+                        + engines))
+    return gaps
+
+
+# ---------------------------------------------------------------------------
+# Dependency severity: never understate a known vulnerability
+# ---------------------------------------------------------------------------
+# The OSV batch endpoint returns advisory ids only, so every DEP-01 used to be reported
+# as MEDIUM. A dependency with a 9.8 CRITICAL advisory therefore passed --fail-on-high
+# and the release gate. Severity now comes from each advisory's own record:
+#
+#   * every CVSS v3.x vector (top-level or per-package) is scored with the calculator
+#     below, written from the FIRST CVSS v3.1 specification;
+#   * CVSS v2 vectors are scored with the v2 equations;
+#   * the record's own label (GitHub's CRITICAL / HIGH / MODERATE / LOW, Ubuntu's
+#     priority) is read as given;
+#   * the HIGHEST of all of these wins - signals disagree, and the gate must not
+#     take the comforting one;
+#   * a MAL- advisory is a known malicious package: CRITICAL;
+#   * anything that cannot be read is reported HIGH at MEDIUM confidence, with the
+#     reason, rather than guessed low.
+#
+# CVSS v4 is not scored here: its equations need the specification's 270-entry lookup
+# table. A v4-only record falls back to its label - every GitHub-reviewed record
+# carries one.
+
+_CVSS3_WEIGHTS = {
+    "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2},
+    "AC": {"L": 0.77, "H": 0.44},
+    "UI": {"N": 0.85, "R": 0.62},
+    "C": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "I": {"H": 0.56, "L": 0.22, "N": 0.0},
+    "A": {"H": 0.56, "L": 0.22, "N": 0.0},
+}
+_CVSS3_PR = {"U": {"N": 0.85, "L": 0.62, "H": 0.27}, "C": {"N": 0.85, "L": 0.68, "H": 0.5}}
+
+
+def _cvss31_roundup(value: float) -> float:
+    """CVSS v3.1 Appendix A: round up to one decimal, immune to float error."""
+    whole = int(round(value * 100000))
+    if whole % 10000 == 0:
+        return whole / 100000.0
+    return (math.floor(whole / 10000) + 1) / 10.0
+
+
+def cvss3_base_score(vector: str) -> Optional[float]:
+    """Base score of a CVSS v3.0 / v3.1 vector, or None if it is not a valid one."""
+    parts = vector.strip().split("/")
+    if not parts or not re.fullmatch(r"CVSS:3\.[01]", parts[0]):
+        return None
+    metrics = dict(p.split(":", 1) for p in parts[1:] if ":" in p)
+    try:
+        scope = metrics["S"]
+        av, ac = _CVSS3_WEIGHTS["AV"][metrics["AV"]], _CVSS3_WEIGHTS["AC"][metrics["AC"]]
+        pr, ui = _CVSS3_PR[scope][metrics["PR"]], _CVSS3_WEIGHTS["UI"][metrics["UI"]]
+        c, i, a = (_CVSS3_WEIGHTS[k][metrics[k]] for k in ("C", "I", "A"))
+    except KeyError:
+        return None
+    iss = 1 - (1 - c) * (1 - i) * (1 - a)
+    impact = 6.42 * iss if scope == "U" else 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02) ** 15
+    exploitability = 8.22 * av * ac * pr * ui
+    if impact <= 0:
+        return 0.0
+    if scope == "U":
+        return _cvss31_roundup(min(impact + exploitability, 10))
+    return _cvss31_roundup(min(1.08 * (impact + exploitability), 10))
+
+
+def cvss2_base_score(vector: str) -> Optional[float]:
+    """Base score of a CVSS v2 vector (`AV:N/AC:L/Au:N/C:P/I:P/A:P`), or None."""
+    metrics = dict(p.split(":", 1) for p in vector.strip().split("/") if ":" in p)
+    try:
+        av = {"L": 0.395, "A": 0.646, "N": 1.0}[metrics["AV"]]
+        ac = {"H": 0.35, "M": 0.61, "L": 0.71}[metrics["AC"]]
+        au = {"M": 0.45, "S": 0.56, "N": 0.704}[metrics["Au"]]
+        c, i, a = ({"N": 0.0, "P": 0.275, "C": 0.660}[metrics[k]] for k in ("C", "I", "A"))
+    except KeyError:
+        return None
+    impact = 10.41 * (1 - (1 - c) * (1 - i) * (1 - a))
+    exploitability = 20 * av * ac * au
+    f_impact = 0 if impact == 0 else 1.176
+    return round((0.6 * impact + 0.4 * exploitability - 1.5) * f_impact + 1e-9, 1)
+
+
+def _band(score: float) -> str:
+    # CVSS v3 qualitative rating scale. A score of 0.0 is "None": still a known
+    # advisory against the installed version, so it is not dropped - it is LOW.
+    if score >= 9.0:
+        return "CRITICAL"
+    if score >= 7.0:
+        return "HIGH"
+    if score >= 4.0:
+        return "MEDIUM"
+    return "LOW"
+
+
+_LABELS = {"CRITICAL": "CRITICAL", "HIGH": "HIGH", "MODERATE": "MEDIUM", "MEDIUM": "MEDIUM",
+           "LOW": "LOW", "NEGLIGIBLE": "LOW"}
+_SEV_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+
+
+def osv_record_severity(record: Dict) -> Tuple[Optional[str], str]:
+    """(severity or None, how it was decided) for one OSV vulnerability record."""
+    vuln_id = str(record.get("id", ""))
+    if vuln_id.startswith("MAL-"):
+        return "CRITICAL", "known malicious package"
+    entries = list(record.get("severity") or [])
+    for aff in record.get("affected") or []:
+        entries.extend(aff.get("severity") or [])
+    found: List[Tuple[str, str]] = []
+    for e in entries:
+        kind, score = str(e.get("type", "")), str(e.get("score", ""))
+        if kind == "CVSS_V3":
+            value = cvss3_base_score(score)
+            if value is not None:
+                found.append((_band(value), f"CVSS {value}"))
+        elif kind == "CVSS_V2":
+            value = cvss2_base_score(score)
+            if value is not None:
+                found.append((_band(value), f"CVSS v2 {value}"))
+        elif kind == "Ubuntu" and score.upper() in _LABELS:
+            found.append((_LABELS[score.upper()], f"Ubuntu {score.lower()}"))
+    labels = [record.get("database_specific") or {}]
+    labels += [a.get("database_specific") or {} for a in record.get("affected") or []]
+    labels += [a.get("ecosystem_specific") or {} for a in record.get("affected") or []]
+    for spec in labels:
+        label = str(spec.get("severity", "")).upper() if isinstance(spec, dict) else ""
+        if label in _LABELS:
+            found.append((_LABELS[label], f"rated {label.lower()}"))
+    if not found:
+        return None, "no readable severity in the advisory"
+    return max(found, key=lambda x: _SEV_ORDER[x[0]])
+
+
+OSV_DETAIL_LIMIT = 200
+
+
+def fetch_osv_record(vuln_id: str) -> Optional[Dict]:
+    """GET one OSV record. None on any failure - the caller treats that as unknown."""
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,100}", vuln_id):
+        return None
+    try:
+        req = urllib.request.Request(
+            "https://api.osv.dev/v1/vulns/" + urllib.parse.quote(vuln_id, safe=""),
+            headers={"User-Agent": "VibeAegis-PreLaunch-Audit/2.0"}, method="GET")
+        with urllib.request.urlopen(req, timeout=10, context=ssl.create_default_context()) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _is_exact_version(version: str) -> bool:
+    v = (version or "").strip()
+    return bool(re.fullmatch(r"v?\d+(?:\.\d+)*(?:[-+._]?[0-9A-Za-z][0-9A-Za-z.+-]*)?", v)) \
+        and not re.search(r"(?:^|\.)[xX*](?:\.|$)", v)
 
 
 def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: bool = False) -> List[Finding]:
@@ -1622,7 +3056,7 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
                 rule_id="DEP-00", domain="SUPPLY_CHAIN", severity="LOW",
                 title="Dependency Vulnerability Check Skipped (offline mode)",
                 file="dependencies", line=0,
-                snippet=f"{len(deps)} dependencies parsed but not checked against OSV.",
+                snippet=evidence(f"{len(deps)} dependencies parsed but not checked against OSV.", 400),
                 cwe_or_standard="Informational",
                 remediation="Re-run without --offline to query the OSV vulnerability database.",
                 confidence="HIGH",
@@ -1633,7 +3067,44 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
         return findings
 
     SEVERITY_FROM_CVSS = [(9.0, "CRITICAL"), (7.0, "HIGH"), (4.0, "MEDIUM"), (0.0, "LOW")]
-    batch = [{"package": {"name": n, "ecosystem": e}, "version": v} for e, n, v in deps[:800]]
+    OSV_BATCH_LIMIT = 800
+    if len(deps) > OSV_BATCH_LIMIT:
+        # Silently querying the first 800 and reporting "no known vulnerabilities"
+        # certifies the rest without looking. Say which packages were left out.
+        findings.append(Finding(
+            rule_id="DEP-00", domain="SUPPLY_CHAIN", severity="LOW",
+            title=f"Dependency Scan Truncated At {OSV_BATCH_LIMIT} Packages",
+            file="dependencies", line=0,
+            snippet=evidence(f"{len(deps)} dependencies were parsed but only the first "
+                             f"{OSV_BATCH_LIMIT} were queried against OSV. The remaining "
+                             f"{len(deps) - OSV_BATCH_LIMIT} were NOT checked.", 400),
+            cwe_or_standard="Coverage",
+            remediation=("Split the scan per manifest, or use a dedicated scanner "
+                         "(`--engine osv-scanner` / `--engine trivy`) for large dependency sets."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED",
+        ))
+    # OSV matches exact versions only. `*`, `latest`, `>=2 <3`, `1.x`, a git URL or
+    # `workspace:*` matches nothing and came back as "no vulnerabilities" - unchecked,
+    # reported clean. Query what is exact and name the rest as a gap.
+    exact = [d for d in deps[:OSV_BATCH_LIMIT] if _is_exact_version(d[2])]
+    inexact = [d for d in deps[:OSV_BATCH_LIMIT] if not _is_exact_version(d[2])]
+    if inexact:
+        names = ", ".join(f"{n}@{v}" for _e, n, v in inexact[:8]) + (" ..." if len(inexact) > 8 else "")
+        findings.append(Finding(
+            rule_id="DEP-00", domain="SUPPLY_CHAIN", severity="LOW",
+            title=f"{len(inexact)} Dependencies Have No Exact Version And Were Not Checked",
+            file="dependencies", line=0,
+            snippet=evidence(f"Not an exact version, so OSV cannot match it: {names}", 400),
+            cwe_or_standard="Coverage",
+            remediation=("Commit a lockfile (package-lock.json, poetry.lock, ...) so the installed "
+                         "versions are known, or pin these to exact versions."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED",
+        ))
+    if not exact:
+        return findings
+    deps = exact
+    batch = [{"package": {"name": n, "ecosystem": e}, "version": v}
+             for e, n, v in deps]
 
     try:
         req = urllib.request.Request(
@@ -1643,14 +3114,14 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=25, context=ssl.create_default_context()) as resp:
-            results = json.loads(resp.read().decode("utf-8")).get("results", [])
+            payload = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
         findings.append(
             Finding(
                 rule_id="DEP-00", domain="SUPPLY_CHAIN", severity="LOW",
                 title="Could Not Reach The OSV Vulnerability Database",
                 file="dependencies", line=0,
-                snippet=str(exc)[:140],
+                snippet=evidence(str(exc)),
                 cwe_or_standard="Informational",
                 remediation="Check network access, or run with --offline to skip this stage deliberately.",
                 confidence="HIGH",
@@ -1660,15 +3131,60 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
         )
         return findings
 
+    # The batch API answers with one result per query, in order (an empty object means
+    # "no advisories"). `zip()` stops at the shorter list, so a missing or short
+    # `results` once left the unmatched packages unchecked - and reported nothing. Any
+    # answer that is not exactly that shape is a coverage gap, never a clean result.
+    results = payload.get("results") if isinstance(payload, dict) else None
+    problem = None
+    if not isinstance(results, list):
+        problem = "the response has no `results` list"
+    elif len(results) != len(batch):
+        problem = f"{len(results)} result(s) came back for {len(batch)} queried package(s)"
+    elif not all(isinstance(r, dict) and isinstance(r.get("vulns", []), list)
+                 and all(isinstance(v, dict) and v.get("id") for v in r.get("vulns", []))
+                 for r in results):
+        problem = "a result is not in the documented shape"
+    elif any(r.get("next_page_token") for r in results):
+        problem = "a package has more advisories than one response holds (next_page_token)"
+    if problem:
+        findings.append(Finding(
+            rule_id="DEP-00", domain="SUPPLY_CHAIN", severity="LOW",
+            title="OSV Response Did Not Match The Query",
+            file="dependencies", line=0,
+            snippet=evidence(f"{problem}, so the dependencies were not reliably checked.", 300),
+            cwe_or_standard="Coverage",
+            remediation="Re-run; if it persists, use `--engine osv-scanner` for this stage.",
+            confidence="HIGH", kind="skipped_check", status="SKIPPED"))
+        return findings
+
+    # Each advisory's severity comes from its own record (see osv_record_severity).
+    # One lookup per distinct id, capped; an id past the cap or a failed lookup is
+    # "unknown", which is reported HIGH - never silently MEDIUM.
+    severities: Dict[str, Tuple[Optional[str], str]] = {}
+    for result in results:
+        for v in (result or {}).get("vulns") or []:
+            vid = str(v.get("id", ""))
+            if vid and vid not in severities:
+                if len(severities) >= OSV_DETAIL_LIMIT:
+                    severities[vid] = (None, "not looked up: too many advisories in one scan")
+                    continue
+                record = fetch_osv_record(vid)
+                severities[vid] = (osv_record_severity(record) if record is not None
+                                   else (None, "advisory record could not be fetched"))
+
     for (eco, name, version), result in zip(deps, results):
         vulns = (result or {}).get("vulns") or []
         if not vulns:
             continue
         ids = [v.get("id", "?") for v in vulns][:6]
-        # The OSV batch endpoint returns advisory IDs only, with no CVSS score, so
-        # grading each one here would be inventing a number. Report MEDIUM and point
-        # at the advisories; the Skeptic/Referee stages confirm real impact.
-        worst = "MEDIUM"
+        rated = [(str(v.get("id", "?")),) + severities.get(str(v.get("id", "")), (None, "unknown"))
+                 for v in vulns]
+        known = [sev for _id, sev, _how in rated if sev]
+        unknown = [vid for vid, sev, _how in rated if not sev]
+        worst = max(known + (["HIGH"] if unknown else []), key=lambda x: _SEV_ORDER[x])
+        detail = "; ".join(f"{vid} {sev or 'UNKNOWN'} ({how})" for vid, sev, how in rated[:6])
+        unknown_shown = ", ".join(unknown[:3])
         findings.append(
             Finding(
                 rule_id="DEP-01",
@@ -1677,18 +3193,17 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
                 title=f"Known Vulnerability In Dependency `{name}@{version}` ({len(vulns)} advisor{'y' if len(vulns)==1 else 'ies'})",
                 file="package-lock.json" if eco == "npm" else "dependencies",
                 line=0,
-                snippet=(
-                    f"{eco}:{name}@{version} -> {', '.join(ids)}"
+                snippet=evidence(
+                    f"{eco}:{name}@{version} -> {detail}"
                     + (f" (+{len(vulns) - len(ids)} more)" if len(vulns) > len(ids) else "")
-                    + ". OSV batch lookup does not return CVSS scores, so severity here is "
-                      "reported as MEDIUM pending review of the linked advisories."
-                ),
+                    + (f". Severity of {unknown_shown} could not be determined, so it "
+                       "is treated as HIGH rather than guessed lower." if unknown else ""), 600),
                 cwe_or_standard="OWASP A06 Vulnerable and Outdated Components",
                 remediation=(
                     f"Upgrade `{name}` past the affected range. Details: "
                     f"https://osv.dev/vulnerability/{ids[0]}"
                 ),
-                confidence="HIGH",
+                confidence="MEDIUM" if unknown and not known else "HIGH",
             )
         )
     return findings
@@ -1728,10 +3243,48 @@ def build_sbom(root: Path, deps: List[Tuple[str, str, str]]) -> Dict:
 # read the source, it can cross-reference: it knows which secret leaked.
 
 ARTIFACT_DIRS = ("dist", "build", "out", ".next", ".output", ".svelte-kit", "www", "public", "release")
+# `public/` holds static files a framework copies into its build (Next.js, Vite, CRA).
+# They ship, so they are read - but they are not the build: a project with only
+# `public/` has no compiled bundle here, and reading one `robots.txt` once satisfied
+# this whole stage.
+STATIC_ASSET_DIRS = ("public",)
 ARTIFACT_TEXT_EXT = {".js", ".mjs", ".cjs", ".css", ".html", ".json", ".txt", ".map", ".wasm"}
 
 
+ARTIFACT_FILE_LIMIT = 4000
+ARTIFACT_MAX_BYTES = 12_000_000
+MOBILE_PACKAGE_EXT = {".apk", ".aab", ".ipa", ".zip"}
+MOBILE_ENTRY_LIMIT = 400
+MOBILE_ENTRY_MAX_BYTES = 40_000_000
+
+
+def _artifact_gap(title: str, file: str, detail: str, remediation: str) -> Finding:
+    return Finding(
+        rule_id="ART-00", domain="ARTIFACT", severity="LOW", title=title, file=file,
+        line=0, snippet=evidence(detail, 400), cwe_or_standard="Coverage",
+        remediation=remediation, confidence="HIGH", kind="skipped_check", status="SKIPPED",
+    )
+
+
+def _escapes(base: Path, path: Path) -> bool:
+    """Does `path`, with every symlink resolved, lie outside `base`?"""
+    try:
+        path.resolve().relative_to(base.resolve())
+        return False
+    except (ValueError, OSError, RuntimeError):
+        return True
+
+
 def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secrets: List[Finding]) -> List[Finding]:
+    """Read what actually ships. Anything this stage could not read is a coverage gap.
+
+    It used to return an empty list - indistinguishable from "examined and clean" - when
+    there was no build output at all, when `--artifact` named a path that did not exist,
+    when every file was a type it does not read, when a bundle was over the size cap, and
+    for every file past the first 4000. `--profile release` then reported "shipped
+    artifacts all audited" about artifacts that were never opened, including a 12 MB
+    bundle holding a live key.
+    """
     findings: List[Finding] = []
 
     targets: List[Path] = []
@@ -1742,6 +3295,11 @@ def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secret
         p = p.resolve()
         if p.exists():
             targets.append(p)
+        else:
+            return [_artifact_gap(
+                "Build Artifact Path Does Not Exist", artifact_path,
+                f"--artifact {artifact_path} was not found, so nothing that ships was examined.",
+                "Build the project first, or pass the path of the real build output.")]
     else:
         for name in ARTIFACT_DIRS:
             candidate = root / name
@@ -1749,31 +3307,71 @@ def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secret
                 targets.append(candidate)
 
     if not targets:
-        return findings
+        return [_artifact_gap(
+            "No Build Output Found", "(repository)",
+            "None of " + ", ".join(f"{d}/" for d in ARTIFACT_DIRS) + " exists, so what "
+            "ships to users was not examined.",
+            "Build the project and re-run, or point --artifact at the build output or the "
+            ".apk/.aab/.ipa you publish.")]
+    if not artifact_path and all(t.name in STATIC_ASSET_DIRS for t in targets):
+        findings.append(_artifact_gap(
+            "No Build Output Found", "(repository)",
+            "Only static assets (" + ", ".join(f"{t.name}/" for t in targets) + ") exist; "
+            "they are read below, but no compiled build output was found, so the bundle "
+            "that ships to users was not examined.",
+            "Build the project and re-run, or point --artifact at the build output or the "
+            ".apk/.aab/.ipa you publish."))
 
-    # What the source stage already identified as a secret, so we can prove a leak.
-    known_secret_fragments: Dict[str, Finding] = {}
+    # What the source stage already identified as a secret, so we can prove a leak. The
+    # exact value comes from the in-memory vault: snippets are fully redacted, and the
+    # 6-character prefix this once matched on (`sk_liv`) is shared by every Stripe key.
+    known_secrets: Dict[str, Finding] = {}
     for f in source_secrets:
-        frag = re.search(r"([A-Za-z0-9_\-]{6})\.\.\.", f.snippet)
-        if frag:
-            known_secret_fragments[frag.group(1)] = f
+        value = _vaulted(f)
+        if value and len(value) >= 8 and value not in known_secrets:
+            known_secrets[value] = f
 
+    examined = 0
+    oversized: List[str] = []
+    unreadable: List[str] = []
+    escaped: List[str] = []
     for target in targets:
-        if target.is_file() and target.suffix.lower() in {".apk", ".aab", ".ipa", ".zip"}:
+        if target.is_file() and target.suffix.lower() in MOBILE_PACKAGE_EXT:
             findings.extend(scan_mobile_package(root, target))
+            examined += 1
             continue
 
-        files = [target] if target.is_file() else [p for p in target.rglob("*") if p.is_file()]
-        for fpath in files[:4000]:
+        # Sorted, so which files fall past the limit is the same on every machine.
+        files = [target] if target.is_file() else sorted(p for p in target.rglob("*") if p.is_file())
+        if len(files) > ARTIFACT_FILE_LIMIT:
+            findings.append(_artifact_gap(
+                f"Build Output Truncated At {ARTIFACT_FILE_LIMIT} Files", target.name,
+                f"{len(files)} files under {target.name}/; the last "
+                f"{len(files) - ARTIFACT_FILE_LIMIT} in path order were NOT examined.",
+                "Point --artifact at the deployable output only (for example the client "
+                "bundle directory), so every shipped file is read."))
+        boundary = root if not _escapes(root, target) else target
+        for fpath in files[:ARTIFACT_FILE_LIMIT]:
+            if fpath.is_symlink() and _escapes(boundary, fpath):
+                escaped.append(fpath.name)
+                continue
             ext = fpath.suffix.lower()
+            if ext in MOBILE_PACKAGE_EXT and ext != ".zip":
+                # A package inside the build directory ships too.
+                findings.extend(scan_mobile_package(root, fpath))
+                examined += 1
+                continue
             if ext not in ARTIFACT_TEXT_EXT:
                 continue
             try:
-                if fpath.stat().st_size > 12_000_000:
+                if fpath.stat().st_size > ARTIFACT_MAX_BYTES:
+                    oversized.append(fpath.name)
                     continue
                 text = fpath.read_text(encoding="utf-8", errors="ignore")
             except Exception:
+                unreadable.append(fpath.name)
                 continue
+            examined += 1
 
             try:
                 rel = fpath.relative_to(root).as_posix()
@@ -1805,8 +3403,8 @@ def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secret
                 )
 
             # 4b. THE CROSS-REFERENCE: a secret from your source reached the shipped bundle.
-            for frag, origin in known_secret_fragments.items():
-                if frag in text:
+            for value, origin in known_secrets.items():
+                if value in text:
                     findings.append(
                         Finding(
                             rule_id="ART-01",
@@ -1814,10 +3412,9 @@ def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secret
                             severity="CRITICAL",
                             title="Confirmed Secret Leak: A Credential From Your Source Code Is Inside The Shipped Bundle",
                             file=rel, line=0,
-                            snippet=(
+                            snippet=evidence(
                                 f"Value first seen at {origin.file}:{origin.line} is present in this build output. "
-                                f"Anyone who loads your site can read it."
-                            ),
+                                f"Anyone who loads your site can read it.", 400),
                             cwe_or_standard="CWE-798 Hard-Coded Credentials / OWASP A07",
                             remediation=(
                                 "This is not a theoretical finding - the credential is already published to every "
@@ -1840,6 +3437,31 @@ def scan_build_artifacts(root: Path, artifact_path: Optional[str], source_secret
                     )
                     findings.append(f)
 
+    if oversized:
+        findings.append(_artifact_gap(
+            f"Build Files Over {ARTIFACT_MAX_BYTES // 1_000_000} MB Not Examined",
+            oversized[0],
+            f"{len(oversized)} file(s) skipped for size: {', '.join(oversized[:5])}",
+            "A large bundle is exactly where an inlined credential ends up. Split the "
+            "bundle or inspect these files directly."))
+    if unreadable:
+        findings.append(_artifact_gap(
+            "Build Files Could Not Be Read", unreadable[0],
+            f"{len(unreadable)} file(s) could not be read: {', '.join(unreadable[:5])}",
+            "Check file permissions on the build output and re-run."))
+    if escaped:
+        findings.append(_artifact_gap(
+            "Build Output Links Outside The Repository", escaped[0],
+            f"{len(escaped)} symlink(s) point outside the repository and were not followed: "
+            + ", ".join(escaped[:5]),
+            "Copy the real files into the build output, or review the link targets by hand."))
+    if not examined:
+        findings.append(_artifact_gap(
+            "No Readable Build Files", targets[0].name,
+            "Build output exists but contains no file type this stage reads "
+            "(" + ", ".join(sorted(ARTIFACT_TEXT_EXT | MOBILE_PACKAGE_EXT)) + ").",
+            "Point --artifact at the directory holding the shipped JavaScript, HTML or "
+            "mobile package."))
     return findings
 
 
@@ -1872,6 +3494,211 @@ def has_apk_signing_block(pkg_path: Path) -> Optional[bool]:
     return data[cd_offset - 16:cd_offset] == b"APK Sig Block 42"
 
 
+# ---- Android binary XML (AndroidManifest.xml inside an APK) ----------------
+# Layout from AOSP frameworks/base/libs/androidfw/include/androidfw/ResourceTypes.h:
+# a RES_XML_TYPE chunk holding a string pool, a resource-id map and element chunks
+# whose attributes carry a typed Res_value. Checked against `aapt dump xmltree` on
+# every attribute of 54 real APKs (UTF-16 and UTF-8 string pools) with no mismatch.
+_AXML_TYPE, _AXML_STRING_POOL, _AXML_RESOURCE_MAP, _AXML_START_ELEMENT = 0x0003, 0x0001, 0x0180, 0x0102
+_RES_TYPE_REFERENCE, _RES_TYPE_INT_DEC, _RES_TYPE_INT_HEX, _RES_TYPE_BOOLEAN = 0x01, 0x10, 0x11, 0x12
+# Platform attribute resource ids, as printed by `aapt dump xmltree` for android.jar.
+_ATTR_DEBUGGABLE, _ATTR_CLEARTEXT, _ATTR_TARGET_SDK, _ATTR_MIN_SDK = 0x0101000F, 0x010104EC, 0x01010270, 0x0101020C
+
+
+def _axml_strings(buf: bytes, off: int) -> List[str]:
+    import struct
+    _t, header_size, _size = struct.unpack_from("<HHI", buf, off)
+    count, _styles, flags, strings_start, _ = struct.unpack_from("<IIIII", buf, off + 8)
+    offsets = struct.unpack_from("<%dI" % count, buf, off + header_size)
+    base, utf8, out = off + strings_start, bool(flags & 0x100), []
+    for o in offsets:
+        q = base + o
+        if utf8:
+            q += 2 if buf[q] & 0x80 else 1                 # UTF-16 length, not needed
+            n = buf[q]
+            if n & 0x80:
+                n, q = ((n & 0x7F) << 8) | buf[q + 1], q + 2
+            else:
+                q += 1
+            out.append(buf[q:q + n].decode("utf-8", errors="replace"))
+        else:
+            n = struct.unpack_from("<H", buf, q)[0]
+            q += 2
+            if n & 0x8000:
+                n, q = ((n & 0x7FFF) << 16) | struct.unpack_from("<H", buf, q)[0], q + 2
+            out.append(buf[q:q + 2 * n].decode("utf-16-le", errors="replace"))
+    return out
+
+
+def decode_android_manifest(buf: bytes) -> Optional[List[Tuple[str, Dict[str, Tuple[int, int, int]]]]]:
+    """[(element, {attribute: (resource_id, value_type, value)})], or None if `buf` is
+    not binary XML this decoder can read. Never raises on malformed input."""
+    import struct
+    try:
+        kind, header_size, total = struct.unpack_from("<HHI", buf, 0)
+        if kind != _AXML_TYPE or total > len(buf):
+            return None
+        strings: List[str] = []
+        res_ids: List[int] = []
+        elements = []
+        off = header_size
+        while off + 8 <= total:
+            ctype, chs, csize = struct.unpack_from("<HHI", buf, off)
+            if csize < 8 or off + csize > total:
+                return None
+            if ctype == _AXML_STRING_POOL:
+                strings = _axml_strings(buf, off)
+            elif ctype == _AXML_RESOURCE_MAP:
+                res_ids = list(struct.unpack_from("<%dI" % ((csize - chs) // 4), buf, off + chs))
+            elif ctype == _AXML_START_ELEMENT:
+                ext = off + chs
+                _ns, name, attr_start, attr_size, attr_count = struct.unpack_from("<IIHHH", buf, ext)
+                attrs = {}
+                for i in range(attr_count):
+                    _ans, aname, _raw, _sz, _r0, dtype, data = struct.unpack_from(
+                        "<IIIHBBI", buf, ext + attr_start + i * attr_size)
+                    attrs[strings[aname] if aname < len(strings) else ""] = (
+                        res_ids[aname] if aname < len(res_ids) else 0, dtype, data)
+                elements.append((strings[name] if name < len(strings) else "", attrs))
+            off += csize
+        return elements
+    except (struct.error, IndexError, ValueError, MemoryError):
+        return None
+
+
+def _manifest_attr(attrs: Dict[str, Tuple[int, int, int]], res_id: int, name: str):
+    for key, value in attrs.items():
+        if value[0] == res_id or (value[0] == 0 and key == name):
+            return value
+    return None
+
+
+def _manifest_findings(rel: str, zf, names: List[str]) -> List["Finding"]:
+    def gap(title: str, detail: str) -> "Finding":
+        return Finding(
+            rule_id="ART-10", domain="ARTIFACT", severity="LOW", title=title, file=rel, line=0,
+            snippet=evidence(detail, 300), cwe_or_standard="Informational",
+            remediation=("Check the release build with `aapt dump xmltree <pkg> AndroidManifest.xml` "
+                         "(or `apkanalyzer manifest print`): `android:debuggable` must not be true, "
+                         "and cleartext traffic must be off unless it is deliberate."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED")
+
+    if "AndroidManifest.xml" not in names:
+        if "base/manifest/AndroidManifest.xml" in names:
+            # An App Bundle stores its manifest as a protocol buffer, not binary XML.
+            return [gap("App Bundle Manifest Not Decoded",
+                        "The .aab manifest is in protocol-buffer format, which this scanner does not "
+                        "decode, so debuggable and cleartext settings were not checked.")]
+        return []
+    try:
+        decoded = decode_android_manifest(zf.read("AndroidManifest.xml"))
+    except Exception:
+        decoded = None
+    if not decoded:
+        return [gap("Android Manifest Could Not Be Decoded",
+                    "AndroidManifest.xml is not binary XML this scanner can read, so debuggable "
+                    "and cleartext settings were not checked.")]
+
+    app = next((a for e, a in decoded if e == "application"), {})
+    sdk = next((a for e, a in decoded if e == "uses-sdk"), {})
+    where = f"{rel}!AndroidManifest.xml"
+    out: List[Finding] = []
+
+    debuggable = _manifest_attr(app, _ATTR_DEBUGGABLE, "debuggable")
+    if debuggable and debuggable[1] == _RES_TYPE_BOOLEAN and debuggable[2]:
+        out.append(Finding(
+            rule_id="ART-14", domain="ARTIFACT", severity="HIGH",
+            title="App Package Is Debuggable (`android:debuggable=\"true\"`)", file=where, line=0,
+            snippet="The decoded manifest sets android:debuggable to true.",
+            cwe_or_standard="CWE-489 Active Debug Code / OWASP MASVS-RESILIENCE",
+            remediation=("Build the release variant (debuggable is false there by default) and remove "
+                         "any explicit android:debuggable=\"true\": a debuggable app lets anyone "
+                         "attach a debugger, read its memory and run code as the app."),
+            confidence="HIGH"))
+    elif debuggable and debuggable[1] != _RES_TYPE_BOOLEAN:
+        out.append(Finding(
+            rule_id="ART-14", domain="ARTIFACT", severity="MEDIUM",
+            title="`android:debuggable` Is Set From A Resource - Verify It Is False", file=where, line=0,
+            snippet="android:debuggable is a resource reference, which the manifest alone cannot resolve.",
+            cwe_or_standard="CWE-489 Active Debug Code / OWASP MASVS-RESILIENCE",
+            remediation="Confirm with `aapt dump badging <pkg> | grep debuggable` that the release build is not debuggable.",
+            confidence="LOW"))
+
+    cleartext = _manifest_attr(app, _ATTR_CLEARTEXT, "usesCleartextTraffic")
+    target = _manifest_attr(sdk, _ATTR_TARGET_SDK, "targetSdkVersion") or _manifest_attr(
+        sdk, _ATTR_MIN_SDK, "minSdkVersion")
+    target_sdk = target[2] if target and target[1] in (_RES_TYPE_INT_DEC, _RES_TYPE_INT_HEX) else None
+    has_nsc = "networkSecurityConfig" in app
+    cleartext_remediation = ("Set `android:usesCleartextTraffic=\"false\"` (or a Network Security Config "
+                             "that denies cleartext) so every request must use HTTPS.")
+    if cleartext and cleartext[1] == _RES_TYPE_BOOLEAN and cleartext[2]:
+        out.append(Finding(
+            rule_id="ART-13", domain="ARTIFACT", severity="MEDIUM",
+            title="App Allows Cleartext Traffic (`android:usesCleartextTraffic=\"true\"`)", file=where, line=0,
+            snippet="The decoded manifest sets android:usesCleartextTraffic to true.",
+            cwe_or_standard="CWE-319 Cleartext Transmission / OWASP MASVS-NETWORK",
+            remediation=cleartext_remediation, confidence="MEDIUM" if has_nsc else "HIGH"))
+    elif cleartext and cleartext[1] != _RES_TYPE_BOOLEAN:
+        out.append(Finding(
+            rule_id="ART-13", domain="ARTIFACT", severity="MEDIUM",
+            title="`android:usesCleartextTraffic` Is Set From A Resource - Verify It Is False",
+            file=where, line=0, snippet="The value is a resource reference the manifest alone cannot resolve.",
+            cwe_or_standard="CWE-319 Cleartext Transmission / OWASP MASVS-NETWORK",
+            remediation=cleartext_remediation, confidence="LOW"))
+    elif cleartext is None and not has_nsc and target_sdk is not None and target_sdk <= 27:
+        # Android docs: the default is "true" for apps targeting API level 27 or lower.
+        out.append(Finding(
+            rule_id="ART-13", domain="ARTIFACT", severity="MEDIUM",
+            title=f"App Allows Cleartext Traffic By Default (targetSdkVersion {target_sdk})",
+            file=where, line=0,
+            snippet=evidence(f"No usesCleartextTraffic or networkSecurityConfig, and targetSdkVersion "
+                             f"{target_sdk} is 27 or lower, where cleartext defaults to allowed.", 300),
+            cwe_or_standard="CWE-319 Cleartext Transmission / OWASP MASVS-NETWORK",
+            remediation=cleartext_remediation, confidence="HIGH"))
+    return out
+
+
+def _verify_apk_signature(rel: str, pkg_path: Path) -> List["Finding"]:
+    """Verify with the platform's `apksigner`, or say plainly that nothing was verified."""
+    import shutil
+    import subprocess
+    tool = shutil.which("apksigner")
+    if not tool:
+        return [Finding(
+            rule_id="ART-10", domain="ARTIFACT", severity="LOW",
+            title="Package Signature Not Cryptographically Verified", file=rel, line=0,
+            snippet=("A signature block is present, but its certificate and content digests were not "
+                     "checked: `apksigner` is not on PATH."),
+            cwe_or_standard="Informational",
+            remediation=("Install Android build-tools (or your distribution's `apksigner` package) and "
+                         "re-run, or verify by hand with `apksigner verify --print-certs <file>`."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED")]
+    try:
+        proc = subprocess.run([tool, "verify", "--print-certs", str(pkg_path)],
+                              capture_output=True, text=True, timeout=120, shell=False)
+    except Exception as exc:
+        return [Finding(
+            rule_id="ART-10", domain="ARTIFACT", severity="LOW",
+            title="Package Signature Verification Did Not Complete", file=rel, line=0,
+            snippet=evidence(f"apksigner could not be run: {type(exc).__name__}", 200),
+            cwe_or_standard="Informational",
+            remediation="Run `apksigner verify --print-certs <file>` by hand.",
+            confidence="HIGH", kind="skipped_check", status="SKIPPED")]
+    if proc.returncode == 0:
+        return []
+    detail = " ".join(ln.strip() for ln in (proc.stdout + "\n" + proc.stderr).splitlines()
+                      if ln.strip() and not ln.startswith("Picked up "))
+    return [Finding(
+        rule_id="ART-11", domain="ARTIFACT", severity="HIGH",
+        title="Package Signature Does Not Verify", file=rel, line=0,
+        snippet=evidence(f"apksigner exited {proc.returncode}: {detail}", 300),
+        cwe_or_standard="CWE-347 Improper Verification of Cryptographic Signature",
+        remediation=("The package was modified after signing, or signed incorrectly. Rebuild and sign "
+                     "the release with your upload key; never ship a package that fails "
+                     "`apksigner verify`."),
+        confidence="HIGH")]
+
+
 def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
     """Inspect an APK/AAB/IPA as a zip archive - no external tooling required."""
     import zipfile
@@ -1889,7 +3716,7 @@ def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
             Finding(
                 rule_id="ART-10", domain="ARTIFACT", severity="LOW",
                 title="Could Not Open Mobile Package", file=rel, line=0,
-                snippet=str(exc)[:140], cwe_or_standard="Informational",
+                snippet=evidence(str(exc)), cwe_or_standard="Informational",
                 remediation="Confirm the file is a valid APK/AAB/IPA archive.",
                 confidence="HIGH",
                     kind="skipped_check",
@@ -1933,6 +3760,11 @@ def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
                     confidence="HIGH", kind="skipped_check", status="SKIPPED",
                 )
             )
+        elif pkg_path.suffix.lower() == ".apk":
+            # A signing block is present. That is structure, not proof: the certificate
+            # and the content digests are checked by the platform's own verifier or not
+            # at all - never by a guess of ours.
+            findings.extend(_verify_apk_signature(rel, pkg_path))
 
         # Configuration files that should never ship inside an app package.
         for n in names:
@@ -1950,75 +3782,43 @@ def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
                     )
                 )
 
-        # Manifest posture. AndroidManifest.xml inside an APK is binary XML, so we
-        # look for the encoded attribute strings rather than parsing it as text.
-        for manifest_name in ("AndroidManifest.xml", "base/manifest/AndroidManifest.xml"):
-            if manifest_name not in names:
-                continue
-            try:
-                raw = zf.read(manifest_name)
-            except Exception:
-                continue
-            decoded = raw.decode("utf-16-le", errors="ignore") + raw.decode("utf-8", errors="ignore")
-            if "usesCleartextTraffic" in decoded:
-                findings.append(
-                    Finding(
-                        rule_id="ART-13", domain="ARTIFACT", severity="MEDIUM",
-                        title="Manifest References Cleartext Traffic",
-                        file=f"{rel}!{manifest_name}", line=0,
-                        snippet="`usesCleartextTraffic` appears in the manifest.",
-                        cwe_or_standard="CWE-319 Cleartext Transmission / OWASP MASVS-NETWORK",
-                        remediation="Set `android:usesCleartextTraffic=\"false\"` and define a network security config that requires HTTPS.",
-                        confidence="MEDIUM",
-                    )
-                )
-            if "debuggable" in decoded:
-                # Binary AndroidManifest stores booleans as integers in a separate value
-                # array, so the string pool proves only that the ATTRIBUTE is present -
-                # `android:debuggable="false"`, which is the correct hardening, leaves the
-                # same string behind. Reporting this HIGH failed `--fail-on-high` on
-                # properly configured release builds. It is a prompt to verify, not a
-                # defect we can demonstrate, so it is graded accordingly.
-                findings.append(
-                    Finding(
-                        rule_id="ART-14", domain="ARTIFACT", severity="MEDIUM",
-                        title="Manifest References The `debuggable` Attribute - Verify It Is False",
-                        file=f"{rel}!{manifest_name}", line=0,
-                        snippet=(
-                            "`debuggable` appears in the manifest string pool. Its VALUE cannot be "
-                            "read from a binary manifest without full decoding, so this may be the "
-                            "correct `android:debuggable=\"false\"`."
-                        ),
-                        cwe_or_standard="CWE-489 Active Debug Code / OWASP MASVS-RESILIENCE",
-                        remediation=(
-                            "Confirm with `aapt dump badging <pkg> | grep debuggable` (or `apkanalyzer "
-                            "manifest debuggable`) that the release build is not debuggable - a "
-                            "debuggable app lets anyone inspect its memory and data."
-                        ),
-                        confidence="LOW",
-                    )
-                )
+        # Manifest posture, read from the decoded binary manifest. Searching its string
+        # pool for "debuggable" flagged the correct `android:debuggable="false"` exactly
+        # like `true`, because the attribute NAME is there either way.
+        findings.extend(_manifest_findings(rel, zf, names))
 
-        # Credential sweep across packaged assets and code sections.
-        budget = 0
+        # Credential sweep across packaged assets and code sections. Every eligible entry
+        # this does not read is a coverage gap: entries over the size cap, entries that
+        # fail to decompress, and everything past the entry budget used to be skipped
+        # with no record, so a key in the 401st asset produced a clean package.
+        eligible = []
         for n in names:
             low = n.lower()
             base = low.rsplit("/", 1)[-1]
             is_text_asset = low.endswith(
                 (".json", ".js", ".xml", ".properties", ".txt", ".yaml", ".yml", ".cfg", ".ini", ".plist")
             )
-            if not (is_text_asset or low.endswith(".dex") or base.startswith(".env")):
-                continue
+            if is_text_asset or low.endswith(".dex") or base.startswith(".env"):
+                eligible.append(n)
+        oversized: List[str] = []
+        unreadable: List[str] = []
+        if len(eligible) > MOBILE_ENTRY_LIMIT:
+            findings.append(_artifact_gap(
+                f"Mobile Package Sweep Stopped At {MOBILE_ENTRY_LIMIT} Entries", rel,
+                f"{len(eligible)} code and text entries in {rel}; the last "
+                f"{len(eligible) - MOBILE_ENTRY_LIMIT} in archive order were NOT examined for "
+                "credentials.",
+                "Unpack the package and point --artifact at the directory, or scan the "
+                "release build's own output before it is packaged."))
+        for n in eligible[:MOBILE_ENTRY_LIMIT]:
             try:
-                info = zf.getinfo(n)
-                if info.file_size > 40_000_000:
+                if zf.getinfo(n).file_size > MOBILE_ENTRY_MAX_BYTES:
+                    oversized.append(n)
                     continue
                 blob = zf.read(n)
             except Exception:
+                unreadable.append(n)
                 continue
-            budget += 1
-            if budget > 400:
-                break
             text = blob.decode("utf-8", errors="ignore")
             for f in scan_secrets_in_text(f"{rel}!{n}", text, origin="app package"):
                 f.rule_id = "ART-15"
@@ -2029,6 +3829,20 @@ def scan_mobile_package(root: Path, pkg_path: Path) -> List[Finding]:
                 )
                 findings.append(f)
 
+    if oversized:
+        findings.append(_artifact_gap(
+            f"{len(oversized)} Mobile Package Entries Over The Size Cap Were Not Read", rel,
+            ", ".join(oversized[:5]) + (" ..." if len(oversized) > 5 else "")
+            + f" - over {MOBILE_ENTRY_MAX_BYTES // 1_000_000} MB uncompressed, so not "
+            "examined for credentials.",
+            "Unpack the package and scan the large entries directly, or keep generated "
+            "data out of the app bundle."))
+    if unreadable:
+        findings.append(_artifact_gap(
+            f"{len(unreadable)} Mobile Package Entries Could Not Be Read", rel,
+            ", ".join(unreadable[:5]) + (" ..." if len(unreadable) > 5 else "")
+            + " - failed to decompress, so not examined for credentials.",
+            "Confirm the package is not corrupt (`unzip -t <file>`), then re-run."))
     return findings
 
 
@@ -2051,22 +3865,40 @@ TAINT_SOURCES = re.compile(
     | formData\.get\(
     | process\.argv\b
     | \bctx\.(?:query|params|request)\b
+    # Python: Flask (Request.args/form/values/json/get_json/files/cookies/data), Django
+    # (HttpRequest.GET/POST/COOKIES/FILES/body/headers), DRF (Request.data/query_params) -
+    # attribute names checked against Flask 3.1, Django 6.1 and DRF. `.py` files were
+    # analysed with only Express-style sources, so no Python view ever produced a finding.
+    | \brequest\.(?:args|form|values|json|files|cookies|data|GET|POST|COOKIES|FILES|query_params)\b
+    | \brequest\.get_json\(
     """
 )
 
-SANITIZERS = re.compile(
+# What makes a value safe depends on where it goes. One list for every sink meant
+# `encodeURIComponent()` cleared a value for SQL, `Number()` cleared it for a fetch
+# destination, and any `validateX()` cleared it for everything. Schema validation is
+# the only thing accepted for every sink; the rest is sink-specific, and a generic
+# `validate*` / `sanitize*` call - which may or may not do the right thing - no longer
+# clears anything: the finding stays, at LOW confidence.
+UNIVERSAL_SANITIZERS = re.compile(
     r"""(?x)
-    \.(?:parse|safeParse)\(          # zod / valibot schema validation
-    | \bparseInt\( | \bparseFloat\( | \bNumber\(
-    | \bencodeURIComponent\(
-    | \bescape(?:Html|Identifier)?\(
-    | \bsanitize\w*\(
-    | \bvalidate\w*\(
+    (?<!JSON)(?<!\burl)(?<!\bqs)(?<!Date)\.(?:parse|safeParse|parseAsync)\(   # zod / valibot
     | \bz\.[A-Za-z]+\(
-    | \ballowlist\b | \bwhitelist\b
-    | \bUUID\b | \bisUUID\(
+    | \bisUUID\( | \bisUuid\( | \buuidValidate\(
     """
 )
+_NUMERIC = r"\bparseInt\( | \bparseFloat\( | \bNumber\( | \bMath\.(?:floor|trunc|round)\( | \bint\("
+SINK_SANITIZERS: Dict[str, re.Pattern] = {
+    "FLOW-01": re.compile(r"(?x)" + _NUMERIC + r"| \bescape(?:Literal|Identifier)\( | \bformat\.literal\("),
+    "FLOW-02": re.compile(r"(?x)" + _NUMERIC + r"| \bshlex\.quote\( | \bshell[Ee]scape\( | \bquote\(\s*\["),
+    "FLOW-03": re.compile(r"(?x)" + _NUMERIC + r"| \bescapeHtml\( | \bhtmlEscape\( | \bDOMPurify\.sanitize\("
+                          r"| \bsanitizeHtml\( | \bhtml\.escape\( | \bmarkupsafe\.escape\("),
+    "FLOW-04": re.compile(r"(?x) \bencodeURIComponent\( | \bisAllowed\w*\( | \bassertAllowed\w*\("
+                          r"| \bquote_plus\( | \burllib\.parse\.quote\("),
+    "FLOW-05": re.compile(r"(?x)" + _NUMERIC + r"| \bpath\.basename\( | \bbasename\( | \bsecure_filename\("
+                          r"| \bsanitizeFilename\( | \bsanitize_filename\("),
+}
+GENERIC_SANITIZERS = re.compile(r"(?x) \bvalidate\w*\( | \bsanitize\w*\( | \bclean\w*\( | \bescape\(")
 
 TAINT_SINKS: List[Tuple[str, str, str, str, re.Pattern]] = [
     ("FLOW-01", "CRITICAL", "Untrusted Input Reaches A Raw SQL Query",
@@ -2093,17 +3925,269 @@ TAINT_SINKS: List[Tuple[str, str, str, str, re.Pattern]] = [
 # release gate. `exec`/`execSync` still take a command STRING and remain sinks.
 _SAFE_ARGV_EXEC = re.compile(r"\b(?:spawn|spawnSync|execFile|execFileSync)\s*\([^)]*,\s*\[")
 _SHELL_TRUE = re.compile(r"shell\s*:\s*true|shell\s*=\s*True")
+# Sinks where only the first argument is dangerous: the SQL text, the shell command, the
+# request URL. Filesystem and HTML sinks are judged on the whole call.
+_FIRST_ARG_SINKS = {"FLOW-01", "FLOW-02", "FLOW-04"}
 
 FUNCTION_SPLIT = re.compile(
-    r"(?m)^(?=\s*(?:export\s+)?(?:async\s+)?function\s|\s*(?:export\s+)?const\s+\w+\s*=\s*(?:async\s*)?\(|\s*(?:public|private|protected)?\s*async\s+\w+\s*\()"
+    r"(?m)^(?=\s*(?:async\s+)?def\s|\s*(?:export\s+)?(?:async\s+)?function\s|\s*(?:export\s+)?const\s+\w+\s*=\s*(?:async\s*)?\(|\s*(?:public|private|protected)?\s*async\s+\w+\s*\()"
 )
 
-ASSIGNMENT = re.compile(r"(?:const|let|var)\s+(?:\{\s*([^}]+)\s*\}|(\w+))\s*=\s*(.+)")
+# `let criteria: any = req.query.q` - a TypeScript annotation once hid the assignment.
+ASSIGNMENT = re.compile(
+    r"(?:const|let|var)\s+(?:\{\s*([^}]+)\s*\}|(\w+))\s*(?::\s*[^=]+?)?\s*=(?![=>])\s*(.+)")
+# Python has no declaration keyword: `name = value`, optionally annotated. Same three
+# groups as ASSIGNMENT (the first, destructuring, is always empty).
+PY_ASSIGNMENT = re.compile(r"^\s*()([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)\s*(.+)")
 
 
 def _mentions(name: str, line: str) -> bool:
     """True when `name` appears in `line` as a whole identifier."""
     return re.search(r"\b" + re.escape(name) + r"\b", line) is not None
+
+
+def _call_spans(line: str, pattern: re.Pattern) -> List[Tuple[int, int]]:
+    """Character spans of each `name(...)` call `pattern` opens, parentheses balanced."""
+    spans = []
+    for m in pattern.finditer(line):
+        if not m.group(0).rstrip().endswith("("):
+            continue
+        depth, j = 1, m.end()
+        while j < len(line) and depth:
+            depth += {"(": 1, ")": -1}.get(line[j], 0)
+            j += 1
+        spans.append((m.start(), j))
+    return spans
+
+
+def _outside(line: str, spans: List[Tuple[int, int]]) -> str:
+    """`line` with every span blanked, so what remains is what the calls do not wrap."""
+    chars = list(line)
+    for start, end in spans:
+        for k in range(start, min(end, len(chars))):
+            chars[k] = " "
+    return "".join(chars)
+
+
+def _code_only(expr: str) -> str:
+    """`expr` with string-literal TEXT blanked, keeping `${...}` / f-string `{...}`.
+
+    `query("SELECT * FROM t WHERE name = $1", [name])` mentions the tainted `name` only
+    as SQL text; counting that as a use reported the bound-parameter fix as injection.
+    """
+    out, i, n = [], 0, len(expr)
+    while i < n:
+        ch = expr[i]
+        if ch in "'\"`":
+            fstring = ch != "`" and i > 0 and expr[i - 1] in "fF"
+            j, buf = i + 1, [" "]
+            while j < n and expr[j] != ch:
+                if expr[j] == "\\":
+                    buf.append("  ")
+                    j += 2
+                    continue
+                opener = "${" if ch == "`" else ("{" if fstring else None)
+                if opener and expr.startswith(opener, j):
+                    depth, k = 1, j + len(opener)
+                    while k < n and depth:
+                        depth += {"{": 1, "}": -1}.get(expr[k], 0)
+                        k += 1
+                    buf.append(" " * len(opener) + expr[j + len(opener):k - 1] + " ")
+                    j = k
+                    continue
+                buf.append(" ")
+                j += 1
+            out.append("".join(buf) + " ")
+            i = j + 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _refs_taint(expr: str, tainted: Dict[str, Set[str]], sink: Optional[str] = None) -> List[str]:
+    """Tainted names `expr` uses (as variables, not properties) that are not already
+    cleared for `sink` - plus the pseudo-name "<request>" for a direct request source."""
+    expr = _code_only(expr)
+    hits = [t for t in tainted if (sink is None or sink not in tainted[t])
+            and re.search(r"(?:(?<=\.\.\.)|(?<![\w$.]))" + re.escape(t) + r"\b", expr)]
+    if TAINT_SOURCES.search(expr):
+        hits.append("<request>")
+    return hits
+
+
+_DEF_HEAD = re.compile(
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*(\w+)\s*\(([^)]*)\)"
+    r"|^\s*(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s*)?\(([^)]*)\)\s*=>"
+    r"|^\s*def\s+(\w+)\s*\(([^)]*)\)")
+
+
+def _split_args(args: str) -> List[str]:
+    out, depth, cur = [], 0, ""
+    for ch in args:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    out.append(cur)
+    return [a.strip() for a in out]
+
+
+def _param_names(params: str) -> List[str]:
+    names = []
+    for p in _split_args(params):
+        p = re.split(r"[:=]", p.strip().lstrip("*."), maxsplit=1)[0].strip()
+        names.append(p if p.isidentifier() else "")
+    return names
+
+
+def _flow_block(block_lines: List[str], tainted: Dict[str, Set[str]],
+                helpers: Dict[str, Dict],
+                assignment: re.Pattern = ASSIGNMENT) -> Tuple[List[Tuple], bool]:
+    """Track taint through one function block.
+
+    `tainted` maps a variable to the sinks it has been made safe for. Returns the
+    (line index, rule, carrier, line, confidence, via) hits, and whether the block
+    returns a tainted value.
+    """
+    hits: List[Tuple] = []
+    returns_taint = False
+    weak: Set[str] = set()
+    for i, line in enumerate(block_lines):
+        stripped = line.strip()
+        if stripped.startswith(("//", "*", "#")):
+            continue
+
+        m = assignment.search(line)
+        assigned_here = ""
+        if m:
+            destructured, single, rhs = m.group(1), m.group(2), m.group(3)
+            assigned_here = single or ""
+            # A call to a local helper that returns request data is a source too.
+            source_calls = [n for n, h in helpers.items() if h.get("returns_taint")]
+
+            def taint_in(expr: str) -> List[str]:
+                found = _refs_taint(expr, tainted)
+                if any(re.search(r"(?<![\w$.])" + re.escape(n) + r"\s*\(", expr) for n in source_calls):
+                    found.append("<request>")
+                return found
+            refs = taint_in(rhs)
+            if refs:
+                inherited = None
+                for r in refs:
+                    if r != "<request>":
+                        inherited = set(tainted[r]) if inherited is None else inherited & tainted[r]
+                cleared = set() if inherited is None or "<request>" in refs else inherited
+                universal = _outside(rhs, _call_spans(rhs, UNIVERSAL_SANITIZERS))
+                if not taint_in(universal):
+                    cleared = set(SINK_SANITIZERS)            # schema-validated: safe everywhere
+                else:
+                    for sink_id, pattern in SINK_SANITIZERS.items():
+                        rest = _outside(universal, _call_spans(universal, pattern))
+                        if not taint_in(rest):
+                            cleared.add(sink_id)
+                generic = _outside(universal, _call_spans(universal, GENERIC_SANITIZERS))
+                targets = [single] if single else [
+                    n.split(":")[-1].strip() for n in (destructured or "").split(",")]
+                for name in targets:
+                    if not name or not name.isidentifier():
+                        continue
+                    if cleared >= set(SINK_SANITIZERS):
+                        tainted.pop(name, None)
+                        continue
+                    tainted[name] = cleared
+                    if not taint_in(generic) or any(r in weak for r in refs):
+                        weak.add(name)
+                    else:
+                        weak.discard(name)
+            elif single in tainted:
+                tainted.pop(single, None)      # reassigned from something clean
+
+        if re.match(r"\s*return\b", line) and _refs_taint(line, tainted):
+            returns_taint = True
+
+        if not tainted and not TAINT_SOURCES.search(line):
+            continue
+
+        for rule_id, severity, title, standard, sink in TAINT_SINKS:
+            sink_m = sink.search(line)
+            if not sink_m:
+                continue
+            if (rule_id == "FLOW-02" and _SAFE_ARGV_EXEC.search(line)
+                    and not _SHELL_TRUE.search(line)):
+                continue  # array-form exec, no shell - this is the correct pattern
+            scope = line
+            if (rule_id in _FIRST_ARG_SINKS and sink_m.group(0).endswith("(")
+                    and not (rule_id == "FLOW-02" and _SHELL_TRUE.search(line))):
+                # Only the query, command or URL itself. A value passed as a bound
+                # parameter (`query("... $1", [id])`) or a request body is the fix.
+                depth, j = 1, sink_m.end()
+                while j < len(line) and depth:
+                    depth += {"(": 1, ")": -1}.get(line[j], 0)
+                    j += 1
+                args = _split_args(line[sink_m.end():max(j - 1, sink_m.end())])
+                scope = args[0] if args else ""
+            # #16: a sanitizer counts only if it wraps the tainted value itself, not
+            # because its name appears somewhere else on the line.
+            rest = _outside(scope, _call_spans(scope, UNIVERSAL_SANITIZERS))
+            rest = _outside(rest, _call_spans(rest, SINK_SANITIZERS[rule_id]))
+            candidates = [t for t in _refs_taint(rest, tainted, rule_id)
+                          if t not in ("<request>", assigned_here)]
+            direct = TAINT_SOURCES.search(rest)
+            if not candidates and not direct:
+                continue
+            # A request value used inline, with no variable in between, is the most
+            # direct flow there is - and was never reported.
+            hit = sorted(candidates)[0] if candidates else direct.group(0).strip()
+            unwrapped = _outside(rest, _call_spans(rest, GENERIC_SANITIZERS))
+            still = _refs_taint(unwrapped, tainted, rule_id)
+            confidence = ("LOW" if hit in weak or (hit not in still and not (direct and "<request>" in still))
+                          else "MEDIUM")
+            hits.append((i, rule_id, hit, stripped, confidence, None))
+
+        # #17: a tainted argument handed to a local helper whose parameter reaches a sink.
+        for name, helper in helpers.items():
+            for call in re.finditer(r"(?<![\w$.])" + re.escape(name) + r"\s*\(", line):
+                depth, j = 1, call.end()
+                while j < len(line) and depth:
+                    depth += {"(": 1, ")": -1}.get(line[j], 0)
+                    j += 1
+                args = _split_args(line[call.end():j - 1])
+                for idx, arg in enumerate(args):
+                    for rule_id in helper.get("param_sinks", {}).get(idx, ()):
+                        carriers = [t for t in _refs_taint(arg, tainted, rule_id) if t != "<request>"]
+                        if carriers or TAINT_SOURCES.search(arg):
+                            hits.append((i, rule_id, carriers[0] if carriers else arg.strip(),
+                                         stripped, "MEDIUM", name))
+    return hits, returns_taint
+
+
+def _local_helpers(blocks: List[str], assignment: re.Pattern = ASSIGNMENT) -> Dict[str, Dict]:
+    """One level of interprocedural analysis within a file: which local functions pass
+    a parameter into a sink, and which return request data."""
+    helpers: Dict[str, Dict] = {}
+    for block in blocks:
+        lines = block.splitlines()
+        head = _DEF_HEAD.match(lines[0]) if lines else None
+        if not head:
+            continue
+        name = head.group(1) or head.group(3) or head.group(5)
+        params = _param_names(head.group(2) or head.group(4) or head.group(6) or "")
+        param_sinks: Dict[int, Set[str]] = {}
+        for idx, param in enumerate(params):
+            if not param:
+                continue
+            hits, _ = _flow_block(lines[1:], {param: set()}, {}, assignment)
+            if hits:
+                param_sinks[idx] = {h[1] for h in hits}
+        _, returns_taint = _flow_block(lines[1:], {}, {}, assignment)
+        helpers[name] = {"param_sinks": param_sinks, "returns_taint": returns_taint}
+    return helpers
 
 
 def analyze_data_flow(rel_path: str, ext: str, text: str) -> List[Finding]:
@@ -2114,88 +4198,52 @@ def analyze_data_flow(rel_path: str, ext: str, text: str) -> List[Finding]:
 
     findings: List[Finding] = []
     blocks = FUNCTION_SPLIT.split(text)
+    assignment = PY_ASSIGNMENT if ext == ".py" else ASSIGNMENT
+    helpers = _local_helpers(blocks, assignment)
+    meta = {rule: (sev, title, std) for rule, sev, title, std, _ in TAINT_SINKS}
     offset_line = 1
 
     for block in blocks:
         block_lines = block.splitlines()
-        if not any(TAINT_SOURCES.search(ln) for ln in block_lines):
+        uses_helper_source = any(
+            h["returns_taint"] and re.search(r"(?<![\w$.])" + re.escape(n) + r"\s*\(", block)
+            for n, h in helpers.items())
+        if not (uses_helper_source or any(TAINT_SOURCES.search(ln) for ln in block_lines)):
             offset_line += len(block_lines)
             continue
 
-        tainted: Set[str] = set()
+        hits, _ = _flow_block(block_lines, {}, helpers, assignment)
         reported: Set[str] = set()
-
-        for i, line in enumerate(block_lines):
-            stripped = line.strip()
-            if stripped.startswith(("//", "*", "#")):
+        for i, rule_id, hit, stripped, confidence, via in hits:
+            key = f"{rule_id}:{hit}:{via or ''}"
+            if key in reported:
                 continue
-
-            # Propagate taint through simple assignments.
-            m = ASSIGNMENT.search(line)
-            if m:
-                destructured, single, rhs = m.group(1), m.group(2), m.group(3)
-                rhs_tainted = bool(TAINT_SOURCES.search(rhs)) or any(
-                    _mentions(t, rhs) for t in tainted
+            reported.add(key)
+            severity, title, standard = meta[rule_id]
+            where = f" inside `{via}()`" if via else ""
+            findings.append(
+                Finding(
+                    rule_id=rule_id,
+                    domain="DATAFLOW",
+                    severity=severity,
+                    title=title,
+                    file=rel_path,
+                    line=offset_line + i,
+                    snippet=evidence(f"`{hit}` originates from request input and reaches the sink"
+                                     f"{where} here: {stripped}", 180),
+                    cwe_or_standard=standard,
+                    remediation=(
+                        f"Validate `{hit}` with a schema (zod/pydantic) before use, and pass it as a bound "
+                        "parameter rather than interpolating it into the call. For fetch destinations, check "
+                        "the host against an allowlist and reject private IP ranges. A generic "
+                        "`validate*`/`sanitize*` helper is not accepted as proof: use one specific to "
+                        "this sink."
+                    ),
+                    confidence=confidence,
                 )
-                if rhs_tainted and not SANITIZERS.search(rhs):
-                    if single:
-                        tainted.add(single)
-                    if destructured:
-                        for name in destructured.split(","):
-                            name = name.split(":")[-1].strip()
-                            if name.isidentifier():
-                                tainted.add(name)
-                elif rhs_tainted and SANITIZERS.search(rhs):
-                    # Value was validated on the way in - it is clean from here.
-                    if single:
-                        tainted.discard(single)
-
-            if not tainted:
-                continue
-
-            # Does a tainted name reach a dangerous call on this line?
-            for rule_id, severity, title, standard, sink in TAINT_SINKS:
-                if not sink.search(line):
-                    continue
-                if (rule_id == "FLOW-02" and _SAFE_ARGV_EXEC.search(line)
-                        and not _SHELL_TRUE.search(line)):
-                    continue  # array-form exec, no shell - this is the correct pattern
-                if SANITIZERS.search(line):
-                    continue
-                # Name the variable that CARRIES the taint, not the one being assigned here.
-                assigned_here = (m.group(2) or "") if m else ""
-                candidates = [
-                    t for t in tainted
-                    if t != assigned_here and _mentions(t, line)
-                ]
-                hit = candidates[0] if candidates else None
-                if not hit:
-                    continue
-                key = f"{rule_id}:{hit}"
-                if key in reported:
-                    continue
-                reported.add(key)
-                findings.append(
-                    Finding(
-                        rule_id=rule_id,
-                        domain="DATAFLOW",
-                        severity=severity,
-                        title=title,
-                        file=rel_path,
-                        line=offset_line + i,
-                        snippet=f"`{hit}` originates from request input and is used here: {stripped[:120]}",
-                        cwe_or_standard=standard,
-                        remediation=(
-                            f"Validate `{hit}` with a schema (zod/pydantic) before use, and pass it as a bound "
-                            "parameter rather than interpolating it into the call. For fetch destinations, check "
-                            "the host against an allowlist and reject private IP ranges."
-                        ),
-                        confidence="MEDIUM",
-                    )
-                )
+            )
 
         offset_line += len(block_lines)
-
     return findings
 
 
@@ -2206,11 +4254,465 @@ def analyze_data_flow(rel_path: str, ext: str, text: str) -> List[Finding]:
 # day two. The baseline records what already existed so the team only sees what
 # they just introduced.
 
+# ---------------------------------------------------------------------------
+# Optional External Engine Adapters
+# ---------------------------------------------------------------------------
+# Vibe Aegis stays useful with nothing installed. These adapters let it ALSO use a
+# mature engine when the user already has one, without ever bundling, vendoring,
+# downloading or installing it.
+#
+# Three rules, and they are not negotiable:
+#
+#   1. Never auto-install. We probe PATH and nothing else. A missing engine is a
+#      COVERAGE GAP, never a silent pass - "semgrep was not run" and "semgrep found
+#      nothing" are different statements and the report makes that distinction.
+#   2. Never claim another tool's output as our own. Every imported finding is tagged
+#      with the engine that produced it and keeps that engine's own rule id.
+#   3. Anything that touches a network target requires explicit authorization.
+#
+# Licensing: we invoke installed binaries through their documented CLI and read their
+# documented output. No code from these projects is copied into this file, and running
+# a program you installed yourself imposes no licence obligation on this scanner. The
+# table records each project's licence so users can check their own obligations.
+
+ENGINE_SPECS: Dict[str, Dict[str, str]] = {
+    "semgrep": {
+        "bin": "semgrep", "licence": "LGPL-2.1-only (CLI)",
+        "role": "Multi-language AST pattern analysis",
+        "note": "Deeper than regex: real syntax trees per language.",
+    },
+    "gitleaks": {
+        "bin": "gitleaks", "licence": "MIT",
+        "role": "Secret detection across full git history",
+        "note": "Scans every commit, not just the working tree.",
+    },
+    "trufflehog": {
+        "bin": "trufflehog", "licence": "AGPL-3.0",
+        "role": "Secret detection in git history and files",
+        "note": "Always run with --no-verification: verifying a credential means sending "
+                "it to its provider, so a scan would hand every secret it finds to a third "
+                "party. --no-update stops its self-update check.",
+    },
+    "trivy": {
+        "bin": "trivy", "licence": "Apache-2.0",
+        "role": "Dependency, container, IaC and licence scanning",
+        "note": "Far broader dependency coverage than our OSV batch query.",
+    },
+    "osv-scanner": {
+        "bin": "osv-scanner", "licence": "Apache-2.0",
+        "role": "Lockfile-accurate vulnerability scanning",
+        "note": "Resolves transitive dependencies we cannot see from a manifest.",
+    },
+    "scorecard": {
+        "bin": "scorecard", "licence": "Apache-2.0",
+        "role": "Supply-chain posture of the repository itself",
+        "note": "Branch protection, signed releases, CI hardening, maintenance.",
+    },
+    "codeql": {
+        "bin": "codeql", "licence": "GitHub CodeQL Terms (restricted for some commercial use)",
+        "role": "Interprocedural data-flow analysis",
+        "note": "Requires a prebuilt database, which is a CI-scale job - no adapter here "
+                "yet. Run it in GitHub Actions and read its SARIF in code scanning.",
+    },
+    "zap": {
+        "bin": "zap.sh", "licence": "Apache-2.0",
+        "role": "Dynamic analysis against a RUNNING deployment",
+        "note": "Sends live traffic. Requires --authorize-network-scan and a --url you own.",
+    },
+}
+
+ENGINE_SEVERITY = {
+    "CRITICAL": "CRITICAL", "ERROR": "HIGH", "HIGH": "HIGH", "WARNING": "MEDIUM",
+    "MEDIUM": "MEDIUM", "MODERATE": "MEDIUM", "LOW": "LOW", "INFO": "LOW",
+    "INFORMATION": "LOW", "UNKNOWN": "LOW", "NOTE": "LOW",
+}
+
+
+def _engine_finding(engine: str, rule_id: str, severity: str, title: str, file: str,
+                    line: int, snippet: str, standard: str, remediation: str,
+                    confidence: str = "HIGH") -> Finding:
+    """Imported findings are clearly attributed and never silently rebranded."""
+    return Finding(
+        rule_id=f"EXT-{engine.upper()}:{rule_id}"[:120],
+        domain="EXTERNAL",
+        severity=ENGINE_SEVERITY.get(str(severity).upper(), "MEDIUM"),
+        title=evidence(f"[{engine}] {title}", 300),
+        file=file or "(repository)",
+        line=line or 0,
+        snippet=evidence(snippet, 400),
+        cwe_or_standard=standard or f"Reported by {engine}",
+        remediation=evidence(remediation, 900) or f"See the {engine} documentation for this rule.",
+        confidence=confidence,
+    )
+
+
+def probe_engine(name: str) -> Optional[str]:
+    """Is this engine already installed? We look at PATH and do nothing else."""
+    import shutil
+    spec = ENGINE_SPECS.get(name)
+    if not spec:
+        return None
+    return shutil.which(spec["bin"])
+
+
+def parse_semgrep(payload: Dict) -> List[Finding]:
+    out: List[Finding] = []
+    for r in payload.get("results", []) or []:
+        extra = r.get("extra", {}) or {}
+        meta = extra.get("metadata", {}) or {}
+        cwe = meta.get("cwe")
+        if isinstance(cwe, list):
+            cwe = ", ".join(str(c) for c in cwe)
+        out.append(_engine_finding(
+            "semgrep", r.get("check_id", "rule"), extra.get("severity", "WARNING"),
+            extra.get("message", "") or r.get("check_id", "finding"),
+            r.get("path", ""), (r.get("start", {}) or {}).get("line", 0),
+            extra.get("lines") or "",
+            str(cwe or meta.get("owasp") or "Semgrep rule"),
+            meta.get("fix") or extra.get("fix") or "",
+        ))
+    return out
+
+
+def parse_gitleaks(payload: List) -> List[Finding]:
+    out: List[Finding] = []
+    for r in payload or []:
+        # Never carry the raw Secret/Match field through - redact at the boundary.
+        out.append(_engine_finding(
+            "gitleaks", r.get("RuleID", "secret"), "CRITICAL",
+            f"Secret detected: {r.get('Description', r.get('RuleID', 'secret'))}",
+            r.get("File", ""), r.get("StartLine", 0),
+            f"{redact(str(r.get('Secret', '')))} (commit {str(r.get('Commit', ''))[:10]})",
+            "CWE-798 Hard-Coded Credentials",
+            "Rotate this credential - history rewriting does not uncompromise it.",
+        ))
+    return out
+
+
+def parse_trivy(payload: Dict) -> List[Finding]:
+    out: List[Finding] = []
+    for res in payload.get("Results", []) or []:
+        target = res.get("Target", "")
+        for v in res.get("Vulnerabilities", []) or []:
+            out.append(_engine_finding(
+                "trivy", v.get("VulnerabilityID", "VULN"), v.get("Severity", "MEDIUM"),
+                f"{v.get('PkgName', '?')} {v.get('InstalledVersion', '')}: "
+                f"{v.get('Title', v.get('VulnerabilityID', ''))}",
+                target, 0,
+                f"Fixed in: {v.get('FixedVersion') or 'no fix published'}",
+                v.get("VulnerabilityID", ""),
+                f"Upgrade {v.get('PkgName', '')} to {v.get('FixedVersion') or 'a patched release'}.",
+            ))
+        for sec in res.get("Secrets", []) or []:
+            # `Match` is masked by trivy itself. `Code` is NOT safe: it carries the
+            # surrounding lines verbatim, and a neighbouring line can hold another
+            # credential in full - so it is never read.
+            out.append(_engine_finding(
+                "trivy", sec.get("RuleID", "secret"), sec.get("Severity", "HIGH"),
+                f"Secret detected: {sec.get('Title', sec.get('RuleID', 'secret'))}",
+                target, sec.get("StartLine", 0), sec.get("Match", ""),
+                "CWE-798 Hard-Coded Credentials",
+                "Rotate this credential and move it to a server-side secret store.",
+            ))
+        for m in res.get("Misconfigurations", []) or []:
+            out.append(_engine_finding(
+                "trivy", m.get("ID", "MISCONF"), m.get("Severity", "MEDIUM"),
+                m.get("Title", "Misconfiguration"), target,
+                (m.get("CauseMetadata", {}) or {}).get("StartLine", 0),
+                m.get("Message", ""), m.get("ID", ""), m.get("Resolution", ""),
+            ))
+    return out
+
+
+def parse_trufflehog(rows: List[Dict]) -> List[Finding]:
+    """One JSON object per finding. Only `Raw` is read, and only through redact().
+
+    `RawV2`, `SecretParts`, `StructuredData` and `ExtraData` can all carry the secret
+    or parts of it, and the git metadata carries the committer's email address. None
+    of them is read.
+    """
+    out: List[Finding] = []
+    for r in rows:
+        data = (r.get("SourceMetadata") or {}).get("Data") or {}
+        loc = data.get("Git") or data.get("Filesystem") or {}
+        commit = str(loc.get("commit", ""))[:10]
+        verified = bool(r.get("Verified"))
+        out.append(_engine_finding(
+            "trufflehog", r.get("DetectorName", "secret"), "CRITICAL" if verified else "HIGH",
+            f"Secret detected: {r.get('DetectorName', 'secret')}"
+            + (" (verified live)" if verified else ""),
+            str(loc.get("file", "")), int(loc.get("line", 0) or 0),
+            f"{redact(str(r.get('Raw', '')))}" + (f" (commit {commit})" if commit else ""),
+            "CWE-798 Hard-Coded Credentials",
+            "Rotate this credential - removing it from the code does not uncompromise it.",
+            confidence="HIGH" if verified else "MEDIUM",
+        ))
+    return out
+
+
+def parse_osv_scanner(payload: Dict) -> List[Finding]:
+    """osv-scanner reports each vulnerability as a full OSV record, so its severity is
+    decided exactly as DEP-01's is - this adapter once called every one MEDIUM, and a
+    9.8 CRITICAL dependency passed --fail-on-high. The package's `groups[].max_severity`
+    (a CVSS base score osv-scanner computes) is one more signal; the highest wins, and
+    an advisory with no readable severity is HIGH at MEDIUM confidence, as DEP-01."""
+    out: List[Finding] = []
+    for res in payload.get("results", []) or []:
+        source = (res.get("source", {}) or {}).get("path", "")
+        for pkg in res.get("packages", []) or []:
+            info = pkg.get("package", {}) or {}
+            group_score: Dict[str, float] = {}
+            for grp in pkg.get("groups", []) or []:
+                try:
+                    score = float(grp.get("max_severity") or "")
+                except (TypeError, ValueError):
+                    continue
+                for vid in list(grp.get("ids") or []) + list(grp.get("aliases") or []):
+                    group_score[str(vid)] = max(score, group_score.get(str(vid), 0.0))
+            for v in pkg.get("vulnerabilities", []) or []:
+                vid = str(v.get("id", "OSV"))
+                severity, _how = osv_record_severity(v)
+                if vid in group_score and 0.0 < group_score[vid] <= 10.0:
+                    banded = _band(group_score[vid])
+                    if severity is None or _SEV_ORDER[banded] > _SEV_ORDER[severity]:
+                        severity = banded
+                out.append(_engine_finding(
+                    "osv-scanner", vid, severity or "HIGH",
+                    f"{info.get('name', '?')} {info.get('version', '')}: "
+                    f"{v.get('summary', vid)}",
+                    source, 0,
+                    ", ".join(v.get("aliases", [])[:4]) or vid,
+                    vid,
+                    "Upgrade to a version outside the affected range.",
+                    confidence="HIGH" if severity else "MEDIUM",
+                ))
+    return out
+
+
+def parse_scorecard(payload: Dict) -> List[Finding]:
+    """Scorecard grades posture 0-10. Only weak checks become findings."""
+    out: List[Finding] = []
+    for c in payload.get("checks", []) or []:
+        score = c.get("score", -1)
+        if score is None or score < 0 or score >= 7:
+            continue
+        out.append(_engine_finding(
+            "scorecard", c.get("name", "check"),
+            "HIGH" if score <= 3 else "MEDIUM",
+            f"Supply-chain posture: {c.get('name', '')} scored {score}/10",
+            "(repository)", 0, c.get("reason") or "",
+            "OpenSSF Scorecard",
+            "; ".join(c.get("details", [])[:2]) or
+            "See https://github.com/ossf/scorecard for how to raise this check.",
+            confidence="MEDIUM",
+        ))
+    return out
+
+
+ENGINE_PARSERS = {
+    "semgrep": parse_semgrep,
+    "gitleaks": parse_gitleaks,
+    "trivy": parse_trivy,
+    "trufflehog": parse_trufflehog,
+    "osv-scanner": parse_osv_scanner,
+    "scorecard": parse_scorecard,
+}
+
+ENGINE_COMMANDS = {
+    "semgrep": lambda root, _a: ["semgrep", "scan", "--config", "auto", "--json",
+                                 "--quiet", "--timeout", "300", str(root)],
+    # `detect` reads git history; outside a git repository it scanned "0 commits",
+    # printed `[]` and exited 0 - a clean result for a scan of nothing. --no-git reads
+    # the files instead.
+    "gitleaks": lambda root, _a: ["gitleaks", "detect", "--source", str(root),
+                                  "--report-format", "json", "--report-path", "-",
+                                  "--no-banner", "--exit-code", "0"]
+                                 + ([] if (Path(root) / ".git").exists() else ["--no-git"]),
+    "trufflehog": lambda root, _a: (
+        ["trufflehog", "git", Path(root).resolve().as_uri()] if (Path(root) / ".git").exists()
+        else ["trufflehog", "filesystem", str(root)]) + ["--no-verification", "--no-update", "--json"],
+    "trivy": lambda root, _a: ["trivy", "fs", "--format", "json", "--quiet",
+                               "--scanners", "vuln,misconfig,secret", str(root)],
+    "osv-scanner": lambda root, _a: ["osv-scanner", "--format", "json", "-r", str(root)],
+    "scorecard": lambda root, _a: ["scorecard", "--local", str(root), "--format", "json"],
+}
+
+
+NDJSON_ENGINES = {"trufflehog"}
+
+# The exit statuses that mean "the engine finished". Anything else is a failed or
+# partial run, whatever it printed: semgrep exits 2 on a bad rule or a missing path and
+# still prints valid JSON with zero results, which this once accepted as a clean scan.
+# Each value was observed with our exact command on the real binary (semgrep 1.99,
+# gitleaks 8, trivy, osv-scanner 2.2, trufflehog 3): 0 = finished; osv-scanner exits 1
+# when it FOUND vulnerabilities. scorecard could not be run here, so only 0 is trusted.
+ENGINE_OK_EXIT: Dict[str, Set[int]] = {
+    "semgrep": {0}, "gitleaks": {0}, "trufflehog": {0}, "trivy": {0},
+    "osv-scanner": {0, 1}, "scorecard": {0},
+}
+# Exit statuses that are a known, named outcome rather than a crash.
+ENGINE_EXIT_MEANING: Dict[str, Dict[int, str]] = {
+    "osv-scanner": {128: "found no packages to scan", 127: "general error (often: the OSV API "
+                    "was unreachable)"},
+    "semgrep": {2: "fatal error (bad rule, missing path, or rules could not be fetched)"},
+}
+
+# Engines that may run under --offline. Each was run with our exact command inside a
+# network namespace with no network at all and produced its normal results. The rest
+# need the network by design - semgrep --config auto fetches its rules, trivy its
+# vulnerability database, osv-scanner queries its API - or were not verified, which is
+# treated the same way.
+OFFLINE_SAFE_ENGINES = {"gitleaks", "trufflehog"}
+
+
+def _relative_to(root: Path, findings: List[Finding]) -> List[Finding]:
+    """Engines are given an absolute target and report absolute paths. A report should
+    not carry the scanning machine's directory layout, and SARIF wants repo paths."""
+    base = Path(root).resolve()
+    for f in findings:
+        try:
+            p = Path(f.file)
+            if p.is_absolute():
+                f.file = p.resolve().relative_to(base).as_posix()
+        except (ValueError, OSError):
+            pass
+    return findings
+
+
+def _engine_shape_problem(name: str, payload) -> Optional[str]:
+    """Why `payload` is not a result of `name`, or None. Each requirement is what the
+    real binary emits on a clean scan (observed: semgrep 1.99, gitleaks 8, trivy, osv-
+    scanner 2.2). trivy omits `Results` when it finds nothing, so only its header is
+    required. scorecard could not be run here, so its documented `checks` list is."""
+    def is_list(obj, key):
+        return isinstance(obj, dict) and isinstance(obj.get(key), list)
+    if name == "semgrep":
+        ok = is_list(payload, "results") and isinstance(payload.get("errors", []), list)
+        return None if ok else "no `results` list"
+    if name == "gitleaks":
+        return None if isinstance(payload, list) else "not a JSON array of findings"
+    if name == "trivy":
+        ok = (isinstance(payload, dict) and isinstance(payload.get("SchemaVersion"), int)
+              and "ArtifactName" in payload and isinstance(payload.get("Results", []), list))
+        return None if ok else "no trivy report header (SchemaVersion, ArtifactName)"
+    if name == "osv-scanner":
+        return None if is_list(payload, "results") else "no `results` list"
+    if name == "scorecard":
+        return None if is_list(payload, "checks") else "no `checks` list"
+    return None
+
+
+def run_engine(name: str, root: Path, timeout: int = 600) -> Tuple[List[Finding], Optional[Finding]]:
+    """Run one installed engine. Returns (findings, gap_or_None).
+
+    Any failure - missing binary, crash, timeout, unreadable output - produces a
+    coverage gap rather than an empty finding list, because "the engine did not run"
+    must never read as "the engine found nothing".
+    """
+    import subprocess
+
+    def gap(reason: str, detail: str = "") -> Finding:
+        return Finding(
+            rule_id="ENG-00", domain="COVERAGE", severity="LOW",
+            title=f"External Engine Not Run: {name}", file="(engines)", line=0,
+            snippet=evidence(f"{reason}{(' - ' + detail) if detail else ''}", 300),
+            cwe_or_standard="Coverage",
+            remediation=(f"{name} ({ENGINE_SPECS.get(name, {}).get('role', '')}) was "
+                         f"requested but produced no usable result, so its area is "
+                         f"UNVERIFIED. Install it yourself and re-run, or drop "
+                         f"--engine {name}. Vibe Aegis never installs tools for you."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED",
+        )
+
+    if name not in ENGINE_SPECS:
+        return [], gap("unknown engine")
+    if name not in ENGINE_COMMANDS:
+        return [], gap("no adapter implemented",
+                       ENGINE_SPECS[name].get("note", ""))
+    if not probe_engine(name):
+        return [], gap("not installed on PATH")
+
+    try:
+        proc = subprocess.run(ENGINE_COMMANDS[name](root, None), capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, shell=False)
+    except Exception as exc:
+        return [], gap("engine failed to execute", f"{type(exc).__name__}")
+
+    raw = (proc.stdout or "").strip()
+    if proc.returncode not in ENGINE_OK_EXIT.get(name, {0}):
+        meaning = ENGINE_EXIT_MEANING.get(name, {}).get(proc.returncode, "")
+        return [], gap(f"engine exited {proc.returncode}" + (f": {meaning}" if meaning else ""),
+                       proc.stderr or "")
+    if name in NDJSON_ENGINES:
+        # One object per line, and NOTHING at all when clean - so an empty stdout is a
+        # pass only together with a zero exit status (checked above).
+        try:
+            rows = [json.loads(ln) for ln in raw.splitlines() if ln.strip()]
+        except Exception:
+            return [], gap("engine output was not parseable JSON lines")
+        try:
+            return _relative_to(root, ENGINE_PARSERS[name](rows)), None
+        except Exception as exc:
+            return [], gap("engine output had an unexpected shape", type(exc).__name__)
+    if not raw:
+        return [], gap("engine produced no output", proc.stderr or "")
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        start = min((i for i in (raw.find("{"), raw.find("[")) if i >= 0), default=-1)
+        if start < 0:
+            return [], gap("engine output was not JSON", raw)
+        try:
+            payload = json.loads(raw[start:])
+        except Exception:
+            return [], gap("engine output was not parseable JSON")
+
+    # Valid JSON is not a scan result: `{}` parsed into zero findings and read as a
+    # clean run. Each engine's output must have the fields its real binary emits.
+    shape_problem = _engine_shape_problem(name, payload)
+    if shape_problem:
+        return [], gap("engine output was not a scan result", shape_problem)
+    try:
+        found = _relative_to(root, ENGINE_PARSERS[name](payload))
+    except Exception as exc:
+        return [], gap("engine output had an unexpected shape", type(exc).__name__)
+    # A run that finished but could not analyse everything is a partial run: semgrep
+    # lists files it failed to parse, and rules it could not run, under `errors`.
+    errors = payload.get("errors") if isinstance(payload, dict) and name == "semgrep" else None
+    if errors:
+        return found, gap(f"engine reported {len(errors)} error(s); its results are partial",
+                          "; ".join(str((e or {}).get("message", e))[:120] for e in errors[:3]))
+    return found, None
+
+
 def fingerprint(f: Finding) -> str:
     import hashlib
     normalized = re.sub(r"\s+", " ", f.snippet).strip()[:120]
     basis = f"{f.rule_id}|{f.file}|{normalized}"
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def assign_fingerprints(findings: List[Finding]) -> None:
+    """Fingerprint every finding, keeping two different secrets apart.
+
+    A fingerprint hashes the evidence, and fully redacted evidence for two different
+    keys of the same provider and length in the same file is identical text. Without
+    this, accepting one in a baseline would silently accept the other. The vaulted
+    value orders them; it is never part of the hash itself.
+    """
+    distinct: Dict[str, List[str]] = {}
+    for f in findings:
+        fp = fingerprint(f)
+        value = _vaulted(f)
+        if value is not None:
+            seen = distinct.setdefault(fp, [])
+            if value not in seen:
+                seen.append(value)
+            n = seen.index(value)
+            if n:
+                fp = hashlib.sha256(f"{fp}#{n}".encode("utf-8")).hexdigest()[:16]
+        f.fingerprint = fp
 
 
 def load_ignore_rules(root: Path) -> Tuple[Set[str], List[str]]:
@@ -2342,19 +4844,44 @@ def _is_incomplete(f: "Finding") -> bool:
     )
 
 
+# The five states a release gate is allowed to be in. Anything else is a guess.
+#
+#   BLOCKED               a defect we can point at. Do not ship.
+#   INCOMPLETE            something was not examined. No opinion is possible.
+#   REVIEW_REQUIRED       only medium/low defects. A human decides.
+#   STATIC_CHECKS_PASSED  the static checks that RAN found nothing. NOT release-ready:
+#                         no dependency, history, artifact or live-deployment evidence.
+#   RELEASE_AUDIT_PASSED  the release profile ran every stage and all of them passed.
+#
+# The old success string was "READY TO PUBLISH", emitted after a plain source scan.
+# That is a claim the evidence never supported: reading source tells you nothing about
+# your lockfile, your git history, your built bundle or your running deployment.
+VERDICT_BLOCKED = "BLOCKED"
+VERDICT_INCOMPLETE = "INCOMPLETE"
+VERDICT_REVIEW = "REVIEW_REQUIRED"
+VERDICT_STATIC_OK = "STATIC_CHECKS_PASSED"
+VERDICT_RELEASE_OK = "RELEASE_AUDIT_PASSED"
+
+# Stages a `--profile release` run must actually have completed before the scanner is
+# willing to say the release itself was audited.
+RELEASE_STAGES = ("dependencies", "git-history", "artifacts")
+
+
 def compute_readiness_score(
     findings: List[Finding],
     skipped_checks: Optional[List[Finding]] = None,
     scanned_files: Optional[int] = None,
     allow_skipped: bool = False,
+    release_audit: bool = False,
 ) -> Tuple[int, str]:
     """Score real defects only, and refuse to certify an audit that did not run.
 
     Fail-closed contract:
       * `scanned_files == 0`                -> INCOMPLETE_SCAN, score 0.
-      * any skipped / errored check         -> never READY (unless allow_skipped).
-      * READY TO PUBLISH requires ALL of    -> files were scanned, no CRITICAL/HIGH,
-                                               nothing skipped, score >= 90.
+      * any skipped / errored check         -> never a passing verdict (unless allow_skipped).
+      * a passing verdict requires ALL of   -> files were scanned, no CRITICAL/HIGH,
+                                               nothing skipped, no MEDIUM, score >= 90.
+        It is STATIC_CHECKS_PASSED, or RELEASE_AUDIT_PASSED only when `release_audit`.
 
     A check that could not run is an UNKNOWN, not a clean result. Counting one as
     a 1-point LOW meant an offline run with every deep stage skipped still scored
@@ -2367,26 +4894,36 @@ def compute_readiness_score(
 
     # Nothing was inspected: there is no evidence either way.
     if scanned_files is not None and scanned_files <= 0:
-        return 0, "INCOMPLETE_SCAN (0 source files scanned - cannot certify readiness)"
+        return 0, (f"{VERDICT_INCOMPLETE}_SCAN (0 source files scanned - "
+                   "cannot certify readiness)")
 
     weights = {"CRITICAL": 25, "HIGH": 10, "MEDIUM": 4, "LOW": 1}
     score = max(0, 100 - sum(weights.get(f.severity, 1) for f in real))
 
     # A live defect outranks a coverage gap.
     if any(f.severity in {"CRITICAL", "HIGH"} for f in real):
-        return score, "BLOCKED (Fix Critical/High findings before publishing)"
+        return score, f"{VERDICT_BLOCKED} (Fix Critical/High findings before publishing)"
 
     if incomplete and not allow_skipped:
         n = len(incomplete)
         names = ", ".join(sorted({f.title for f in incomplete})[:3])
         return score, (
-            f"VERIFIED_PARTIAL - INCOMPLETE_SCAN ({n} check{'s' if n != 1 else ''} "
-            f"skipped/offline: {names}; run a full online scan before publishing)"
+            f"{VERDICT_INCOMPLETE}_SCAN ({n} check{'s' if n != 1 else ''} "
+            f"skipped/offline: {names}; re-run with those stages available)"
         )
 
-    if score >= 90:
-        return score, "READY TO PUBLISH"
-    return score, "NEEDS REVIEW (Address Medium/Low polish items)"
+    # A MEDIUM is something a person should look at; a lone LOW (a missing focus ring)
+    # is polish and must not hold a release hostage, or the state stops meaning anything.
+    if any(f.severity == "MEDIUM" for f in real) or score < 90:
+        return score, (f"{VERDICT_REVIEW} ({len(real)} finding(s) need a human decision "
+                       "before release)")
+
+    # Clean - but say honestly WHICH evidence supports that.
+    if release_audit:
+        return score, (f"{VERDICT_RELEASE_OK} (source, dependencies, git history and "
+                       "shipped artifacts all audited with no findings)")
+    return score, (f"{VERDICT_STATIC_OK} (the static checks that ran found nothing - "
+                   "this is NOT a release-readiness verdict; run --profile release)")
 
 
 def redact_findings(findings: List[Finding]) -> None:
@@ -2399,33 +4936,51 @@ def redact_findings(findings: List[Finding]) -> None:
       * There is no "already looks redacted" bail-out. Skipping the whole snippet when
         it merely CONTAINED "..." meant a JS spread (`{...opts}`) or a Python ellipsis
         anywhere on the line switched redaction off for the real credential beside it.
-      * Title and remediation are swept too - a title interpolates `rel_path`, and a
-        credential in a filename is still a credential.
+      * EVERY text field is swept, not just snippet, title and remediation - a title
+        interpolates `rel_path`, a `file` can be a `--url` with `user:password@` in it,
+        and a credential in a filename is still a credential.
 
+    Snippets are already masked at construction by `evidence()`. This pass is the
+    backstop for every other field, and for any Finding built outside this module.
     Redacting an already-redacted value is harmless: `redact()` output does not match
     any provider pattern, so a second pass is a no-op.
     """
+    text_fields = [fd.name for fd in dataclass_fields(Finding) if fd.type in (str, "str")]
     for f in findings:
-        for _label, _sev, pattern in PROVIDER_SECRETS:
-            for field in ("snippet", "title", "remediation"):
-                text = getattr(f, field, "") or ""
+        for field in text_fields:
+            text = getattr(f, field, "") or ""
+            if not isinstance(text, str):
+                continue
+            text = _URL_USERINFO.sub(r"\1[REDACTED]@", text)
+            for _label, _sev, pattern in PROVIDER_SECRETS:
                 # Longest first, so a short match inside a longer one cannot corrupt it.
                 hits = sorted({m.group(0) for m in pattern.finditer(text)},
                               key=len, reverse=True)
                 for hit in hits:
                     text = text.replace(hit, redact(hit))
-                setattr(f, field, text)
+            setattr(f, field, text)
 
 
 def dedupe(findings: List[Finding]) -> List[Finding]:
-    """One finding per (rule, file, line). Keep the most confident evidence."""
+    """One finding per (rule, file, line) - and per SECRET, not per line, for credentials.
+
+    Several SEC-01* rules can describe one credential (a provider pattern, a secret-named
+    assignment, a client-exposed variable name); those collapse into one. But two
+    DIFFERENT credentials on one line are two findings: keying on file and line alone
+    discarded the second, and nothing later could bring it back. Identity is the exact
+    value from the in-memory vault; a finding that names no value (the variable-name
+    rule) only stands alone when no identified credential shares its line.
+    """
     best: Dict[Tuple[str, str, int, str], Finding] = {}
     rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    identified_lines = {(f.file, f.line) for f in findings
+                        if f.rule_id.startswith("SEC-01") and _vaulted(f) is not None}
     for f in findings:
-        # All SEC-01* rules describe the same thing: a credential at this spot.
-        # Report it once, keeping the most precise (and redacted) evidence.
         if f.rule_id.startswith("SEC-01"):
-            key = ("SECRET", f.file, f.line, "")
+            value = _vaulted(f)
+            if value is None and (f.file, f.line) in identified_lines:
+                continue  # the same line's credential is already reported with its identity
+            key = ("SECRET", f.file, f.line, value or "")
         else:
             # Dependency / artifact / history findings all sit at line 0 of the same
             # manifest, so the title is what actually distinguishes them.
@@ -2463,6 +5018,16 @@ def main() -> int:
     gate.add_argument("--fail-on-incomplete", action="store_true",
                       help="Exit 1 if any check could not run. Use this when a green pipeline "
                            "must mean 'fully audited', not merely 'nothing found'.")
+    gate.add_argument("--profile", choices=["quick", "code", "full", "release"], default="code",
+                      help="How much evidence to gather, and therefore which verdicts are "
+                           "reachable. quick and code (default): full source, data-flow and "
+                           "secret analysis, no deep stage unless you add one - the two are "
+                           "currently identical. full: adds dependencies, git history and build "
+                           "artifacts. release: everything, plus --fail-on-incomplete and, "
+                           "unless --fail-on is given, exit 1 on any MEDIUM or worse and on any "
+                           "verdict but RELEASE_AUDIT_PASSED; the only profile that can "
+                           "return RELEASE_AUDIT_PASSED. A source scan can never certify a "
+                           "release.")
     gate.add_argument("--min-confidence", choices=["high", "medium", "low"], default="low",
                       help="Only let findings at or above this confidence affect the exit code. "
                            "Severity says how bad a finding would be IF real; confidence says how "
@@ -2474,6 +5039,24 @@ def main() -> int:
     scope = parser.add_argument_group("scope")
     scope.add_argument("--diff", metavar="REF", nargs="?", const="origin/main",
                        help="Only scan files changed vs REF (default origin/main). Ideal for pull requests.")
+    engines = parser.add_argument_group("external engines (optional, never auto-installed)")
+    engines.add_argument("--engine", action="append", default=[], metavar="NAME",
+                         choices=sorted(ENGINE_SPECS.keys()),
+                         help="Also run an installed engine and import its findings: "
+                              + ", ".join(sorted(ENGINE_SPECS.keys())) +
+                              ". Repeatable. An engine that is not installed is reported "
+                              "as a coverage gap, never as a pass. Nothing is ever "
+                              "downloaded or installed for you.")
+    engines.add_argument("--list-engines", action="store_true",
+                         help="Show which external engines are installed, and exit.")
+    engines.add_argument("--authorize-network-scan", action="store_true",
+                         help="Required before any engine that sends traffic to a live "
+                              "target (ZAP). Confirms you own, or are authorised to test, "
+                              "the deployment named by --url.")
+
+    scope.add_argument("--max-file-size", type=int, default=1_500_000, metavar="BYTES",
+                       help="Skip files larger than this (default 1500000). Anything skipped "
+                            "is reported as a coverage gap, never as a clean result.")
     scope.add_argument("--include-tests", action="store_true",
                        help="Also audit test and fixture files. They deliberately contain "
                             "insecure code, so they are excluded by default.")
@@ -2483,7 +5066,7 @@ def main() -> int:
 
     deep = parser.add_argument_group("deep analysis")
     deep.add_argument("--url", help="Live/staging URL for passive, read-only header & exposure checks")
-    deep.add_argument("--artifact", metavar="PATH",
+    deep.add_argument("--artifact", metavar="PATH", nargs="?", const="",
                       help="Verify a build output directory or an .apk/.aab/.ipa package. "
                            "Auto-detects dist/, build/, .next/ when given no value.")
     deep.add_argument("--git-history", metavar="N", nargs="?", type=int, const=300,
@@ -2492,17 +5075,69 @@ def main() -> int:
     deep.add_argument("--all", action="store_true",
                       help="Enable every deep stage: artifacts, git history and dependencies")
     deep.add_argument("--offline", action="store_true", help="Never make a network request")
+    deep.add_argument("--db-check", action="store_true",
+                      help="Read-only check of the LIVE database: tables the API roles can reach with "
+                           "RLS off, `true` policies, views that bypass RLS. Needs psql and "
+                           "AEGIS_DATABASE_URL in the environment (never passed as a flag)")
+    deep.add_argument("--db-schemas", default="public", metavar="LIST",
+                      help="Comma-separated schemas the API exposes (default: public)")
+    deep.add_argument("--db-roles", default="anon,authenticated", metavar="LIST",
+                      help="Comma-separated roles the API connects as (default: anon,authenticated)")
+    out.add_argument("--idor-plan", metavar="PATH",
+                     help="Write a two-account manual test for every IDOR / access-control finding")
 
     args = parser.parse_args()
+
+    if args.list_engines:
+        print("External engines (Vibe Aegis never installs these for you):\n")
+        for name in sorted(ENGINE_SPECS):
+            spec = ENGINE_SPECS[name]
+            path = probe_engine(name)
+            adapter = "adapter" if name in ENGINE_COMMANDS else "no adapter yet"
+            print(f"  {name:13} {'INSTALLED' if path else 'not installed':14} {adapter}")
+            print(f"  {'':13} {spec['role']}")
+            print(f"  {'':13} licence: {spec['licence']}")
+            if spec.get("note"):
+                print(f"  {'':13} {spec['note']}")
+            if path:
+                print(f"  {'':13} path: {path}")
+            print()
+        print("Add one with --engine <name>. A requested engine that is missing is")
+        print("reported as a coverage gap, never as a passing check.")
+        return 0
 
     root = Path(args.target).resolve()
     if not root.exists():
         print(f"Error: Target path '{root}' does not exist.", file=sys.stderr)
         return 2
 
-    want_artifacts = args.all or args.artifact is not None
-    want_history = args.all or args.git_history is not None
-    want_deps = args.all or args.deps or args.sbom is not None
+    # A profile is a default set of stages, never a ceiling: an explicit flag can always
+    # add a stage a profile leaves out. `quick` and `code` deliberately cannot reach a
+    # release verdict, because they do not look at the evidence a release depends on.
+    deep_profile = args.profile in ("full", "release")
+    want_artifacts = args.all or deep_profile or args.artifact is not None
+    want_history = args.all or deep_profile or args.git_history is not None
+    want_deps = args.all or deep_profile or args.deps or args.sbom is not None
+    if args.profile == "quick":
+        # Enables no deep stage by default - but `--all` is an explicit flag too, and
+        # this once dropped it silently.
+        want_artifacts = args.all or args.artifact is not None
+        want_history = args.all or args.git_history is not None
+        want_deps = args.all or args.deps or args.sbom is not None
+    require_release_pass = False
+    if args.profile == "release":
+        # A release gate that tolerates an unexamined stage is not a gate.
+        args.fail_on_incomplete = True
+        # Nor is one that exits 0 on a BLOCKED verdict - or on REVIEW_REQUIRED, whose own
+        # text says findings "need a human decision before release": exiting 0 there
+        # made that decision for the human. With no explicit --fail-on, the release
+        # profile fails on MEDIUM and above (at or above --min-confidence, the third
+        # axis), and at the default --min-confidence low exits 0 only on
+        # RELEASE_AUDIT_PASSED. An explicit --fail-on <level> still wins, so a team can
+        # deliberately gate on severity alone (CRITICAL only).
+        if not args.fail_on:
+            args.fail_on = "medium"
+            require_release_pass = args.min_confidence == "low"
 
     stages: List[str] = ["static"]
     findings: List[Finding] = []
@@ -2518,8 +5153,10 @@ def main() -> int:
 
     # ---- Stage 1: static source analysis ---------------------------------
     stack = detect_tech_stack(root)
+    ledger = CoverageLedger()
     static_findings, scanned_files = scan_repository(
-        root, only_files=only_files, include_tests=args.include_tests)
+        root, only_files=only_files, include_tests=args.include_tests,
+        ledger=ledger, max_file_bytes=args.max_file_size)
     findings.extend(static_findings)
 
     # ---- Deep stages ------------------------------------------------------
@@ -2530,14 +5167,64 @@ def main() -> int:
     dependencies: List[Tuple[str, str, str]] = []
     if want_deps:
         dependencies = parse_dependencies(root)
-        if args.deps or args.all:
+        if args.deps or args.all or deep_profile:
             stages.append("dependencies")
             findings.extend(check_dependency_vulnerabilities(dependencies, offline=args.offline))
+            findings.extend(dependency_coverage_gaps(root))
 
     if want_artifacts:
         stages.append("artifacts")
         source_secrets = [f for f in static_findings if f.rule_id.startswith("SEC-01")]
         findings.extend(scan_build_artifacts(root, args.artifact, source_secrets))
+
+    # ---- Optional external engines ---------------------------------------
+    for engine_name in dict.fromkeys(args.engine):   # de-duplicate, keep order
+        if engine_name == "zap":
+            # Dynamic scanning sends real traffic at a real host. Two independent
+            # conditions, because an accidental scan of someone else's deployment is
+            # not an error you can take back.
+            if not args.authorize_network_scan or not args.url:
+                findings.append(Finding(
+                    rule_id="ENG-00", domain="COVERAGE", severity="LOW",
+                    title="External Engine Not Run: zap",
+                    file="(engines)", line=0,
+                    snippet=("Dynamic scanning requires BOTH --authorize-network-scan "
+                             "and a --url you own or are authorised to test."),
+                    cwe_or_standard="Coverage",
+                    remediation=("ZAP sends live traffic to the target. Re-run with "
+                                 "--url <your deployment> --authorize-network-scan only "
+                                 "against a deployment you control."),
+                    confidence="HIGH", kind="skipped_check", status="SKIPPED"))
+                continue
+        if args.offline and engine_name not in OFFLINE_SAFE_ENGINES:
+            # --offline is a promise about this whole run, not just our own requests.
+            findings.append(Finding(
+                rule_id="ENG-00", domain="COVERAGE", severity="LOW",
+                title=f"External Engine Not Run: {engine_name}",
+                file="(engines)", line=0,
+                snippet=evidence(f"--offline is set, and {engine_name} makes network "
+                                 "requests of its own, so it was not started.", 300),
+                cwe_or_standard="Coverage",
+                remediation=(f"Re-run without --offline to include {engine_name}. Only "
+                             + ", ".join(sorted(OFFLINE_SAFE_ENGINES)) + " run under "
+                             "--offline: each was verified to work with no network."),
+                confidence="HIGH", kind="skipped_check", status="SKIPPED"))
+            continue
+        stages.append(f"engine:{engine_name}")
+        eng_findings, eng_gap = run_engine(engine_name, root)
+        findings.extend(eng_findings)
+        if eng_gap is not None:
+            findings.append(eng_gap)
+
+    if args.db_check:
+        stages.append("database")
+        if args.offline:
+            findings.append(_db_gap("--offline is set, so the database was not contacted.",
+                                    "Re-run without --offline to include the live database check."))
+        else:
+            findings.extend(check_live_database(
+                [x.strip() for x in args.db_schemas.split(",") if x.strip()],
+                [x.strip() for x in args.db_roles.split(",") if x.strip()]))
 
     if args.url and not args.offline:
         stages.append("live-url")
@@ -2545,11 +5232,15 @@ def main() -> int:
     elif args.url and args.offline:
         print("Note: --offline set, skipping the live URL stage.", file=sys.stderr)
 
+    # Everything the scanner declined to read becomes a visible gap, on the same
+    # footing as a stage that could not run. Added before scoring and suppression so
+    # it reaches the verdict and cannot be baselined away.
+    findings.extend(ledger.gaps())
+
     # ---- Normalise, fingerprint, suppress --------------------------------
     redact_findings(findings)
     findings = dedupe(findings)
-    for f in findings:
-        f.fingerprint = fingerprint(f)
+    assign_fingerprints(findings)
 
     total_before = len(findings)
     ignore_rules, ignore_globs = load_ignore_rules(root)
@@ -2591,16 +5282,32 @@ def main() -> int:
     sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     findings.sort(key=lambda f: (sev_rank.get(f.severity, 9), f.domain, f.file, f.line))
 
-    score, verdict = compute_readiness_score(findings, scanned_files=scanned_files)
+    # RELEASE_AUDIT_PASSED is earned by evidence, not by passing a flag: every release
+    # stage must actually appear in `stages`. Asking for --profile release on a repo with
+    # no git history or no build output yields INCOMPLETE, which is the correct answer.
+    release_audit = (args.profile == "release"
+                     and all(s in stages for s in RELEASE_STAGES))
+    score, verdict = compute_readiness_score(
+        findings, scanned_files=scanned_files, release_audit=release_audit)
 
     # `--diff` that resolved successfully and matched no source files is an EMPTY
     # CHANGESET, not a failed audit - a docs-only or config-only pull request is the
     # normal case. Only a full scan finding nothing to read indicates a broken target
     # path or checkout. (A diff that could not be resolved falls back to a full scan
     # above and leaves `only_files` None, so it is still held to the strict rule.)
+    #
+    # Change scope is its own axis. This once replaced the verdict outright, so a
+    # docs-only diff run with --artifact or --deps reported "NO CODE CHANGES TO REVIEW"
+    # at 100/100 beside a CRITICAL finding from another stage. The empty changeset
+    # only waives the zero-files rule; every other stage's findings and gaps still
+    # decide the verdict, and only a run with nothing at all to report says so.
     diff_matched_no_source = only_files is not None and scanned_files == 0
     if diff_matched_no_source:
-        score, verdict = 100, "NO CODE CHANGES TO REVIEW (diff contained no scannable source files)"
+        if findings:
+            score, verdict = compute_readiness_score(
+                findings, scanned_files=None, release_audit=release_audit)
+        else:
+            score, verdict = 100, "NO CODE CHANGES TO REVIEW (diff contained no scannable source files)"
 
     # Coverage is a separate axis from severity: a check that did not run is not
     # a small defect, it is an unknown. Keep the two apart in the report.
@@ -2631,7 +5338,7 @@ def main() -> int:
         "version": SCANNER_VERSION,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "target_path": str(root),
-        "live_url": args.url,
+        "live_url": display_url(args.url) if args.url else None,
         "stages": stages,
         "scanned_files": scanned_files,
         "dependencies_parsed": len(dependencies),
@@ -2640,8 +5347,11 @@ def main() -> int:
         "release_verdict": verdict,
         "summary_counts": counts,
         "coverage": {
-            "complete": not skipped_checks and not scan_is_incomplete,
+            "complete": (not skipped_checks and not scan_is_incomplete
+                         and ledger.material_total() == 0),
             "checks_skipped": len(skipped_checks),
+            "items_not_examined": ledger.total(),
+            "not_examined": ledger.as_dict(),
             "note": (
                 "No source files were scanned, so nothing was verified. Check the target "
                 "path and the checkout."
@@ -2666,6 +5376,11 @@ def main() -> int:
         sarif_path = Path(args.sarif)
         sarif_path.parent.mkdir(parents=True, exist_ok=True)
         sarif_path.write_text(json.dumps(build_sarif(findings, root), indent=2), encoding="utf-8")
+
+    if args.idor_plan:
+        plan_path = Path(args.idor_plan)
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        write_idor_plan(findings, root, plan_path)
 
     if args.sbom:
         sbom_path = Path(args.sbom)
@@ -2729,7 +5444,7 @@ def main() -> int:
                 print(f"      {sc.snippet}")
                 print(f"      {sc.remediation}")
             print()
-        written = [p for p in (args.output, args.sarif, args.sbom) if p]
+        written = [p for p in (args.output, args.sarif, args.sbom, args.idor_plan) if p]
         if written:
             print("Reports written : " + ", ".join(written))
         print("=" * 76)
@@ -2757,6 +5472,8 @@ def main() -> int:
     # just never acted on it. Coverage and severity are separate axes all the way out
     # to the process exit status, not only inside the report.
     if args.fail_on_incomplete and (skipped_checks or scan_is_incomplete):
+        return 1
+    if require_release_pass and not verdict.startswith(VERDICT_RELEASE_OK):
         return 1
     return 0
 

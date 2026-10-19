@@ -1,0 +1,10 @@
+# Keeps this repository's own CI Actions current. The scanner itself has no dependencies
+# by design, and package.json declares none, so GitHub Actions is the only ecosystem here.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"

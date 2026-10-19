@@ -66,7 +66,7 @@ If a defence fully blocks the trigger, mark the finding DISMISSED and cite the e
 
 STAGE 5 - EVIDENCE REFEREE
 Write .aegis/AUDIT_REPORT.md containing:
-1. Release Readiness Score (0-100) and gate status: READY TO PUBLISH or BLOCKED. Score 100, minus 25 per CRITICAL, 10 per HIGH, 4 per MEDIUM, 1 per LOW. BLOCKED if any CRITICAL or HIGH remains open.
+1. Release Readiness Score (0-100) - 100, minus 25 per CRITICAL, 10 per HIGH, 4 per MEDIUM, 1 per LOW - and the gate status. Gate status is the scanner's `release_verdict`. Report its leading word exactly - `BLOCKED`, `INCOMPLETE_SCAN`, `REVIEW_REQUIRED`, `STATIC_CHECKS_PASSED` or `RELEASE_AUDIT_PASSED` - and never call the app release-ready unless it is `RELEASE_AUDIT_PASSED` from `--profile release` with zero open `CRITICAL`/`HIGH`. `STATIC_CHECKS_PASSED` means only that the source checks which ran found nothing.
 2. Confirmed security findings table ordered CRITICAL to LOW, each with file:line, CWE, CVSS 3.1 estimate, the trigger explanation, and the exact code fix.
 3. Confirmed UI/UX and accessibility findings table ordered HIGH to LOW, each with component location, the user-visible impact, the WCAG criterion where relevant, and the exact code fix.
 4. Dismissed false positives log explaining why each is already safe, with the defensive file:line.

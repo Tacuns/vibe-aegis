@@ -82,7 +82,7 @@ codex plugin marketplace add Tacuns/vibe-aegis   # OpenAI Codex, then $vibe-aegi
 
 **Supply chain and history:** `DEP-01` known dependency vulnerabilities via OSV (npm, PyPI, crates.io, Go); `HIST-01` credentials committed at any point in git history, even if deleted later - the value is still readable and still compromised.
 
-**Precision:** credential rules fire only on real provider key shapes or secret-named high-entropy values. Placeholders (`your-api-key-here`, `changeme`, `${process.env.X}`, AWS's documentation key `AKIAIOSFODNN7EXAMPLE`) are rejected. Every credential in every report is redacted to first 6 / last 4 characters, so reports are safe to commit and share.
+**Precision:** credential rules fire only on real provider key shapes or secret-named high-entropy values. Placeholders (`your-api-key-here`, `changeme`, `${process.env.X}`, AWS's documentation key `AKIAIOSFODNN7EXAMPLE`) are rejected. Every credential in every report is redacted to its public provider prefix and length, so reports are safe to commit and share.
 
 **Adoption:** `--diff` scans only changed files; `--baseline` suppresses pre-existing findings so a team sees only what they just introduced; `.aegis-ignore` accepts rule ids and path globs.
 

@@ -1,0 +1,1 @@
+export const NEXT_PUBLIC_API_SECRET = "k3Jx9mQw2PzR7vLnA4eT8yUiO1sD6fGh";

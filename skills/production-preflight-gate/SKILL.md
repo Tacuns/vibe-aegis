@@ -75,7 +75,7 @@ State one of three, with the evidence behind it:
 
 | Verdict | Condition |
 | :--- | :--- |
-| `READY` | Score ≥ 90/100, zero open `CRITICAL`/`HIGH`, all sections above verified |
+| `READY` | Scanner verdict `RELEASE_AUDIT_PASSED` from `--profile release`, zero open `CRITICAL`/`HIGH`, all sections above verified |
 | `READY WITH KNOWN LIMITATIONS` | No blockers, but specific items unverified or accepted — **list each one explicitly** |
 | `NOT READY` | Any open `CRITICAL`/`HIGH`, or any section that could not be verified at all |
 

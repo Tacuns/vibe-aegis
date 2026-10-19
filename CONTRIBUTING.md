@@ -73,11 +73,19 @@ Append to `PROVIDER_SECRETS` as `(label, severity, compiled_regex)`. Then add **
 
 ### Adding a taint sink
 
-Append to `TAINT_SINKS` as `(rule_id, severity, title, standard, compiled_regex)`. If the sink has a safe calling convention, add it to `SANITIZERS` too, and add a test proving the sanitised form produces **zero** findings. A taint rule without a negative test will be rejected.
+Append to `TAINT_SINKS` as `(rule_id, severity, title, standard, compiled_regex)`, and give it an entry in `SINK_SANITIZERS` listing only what makes a value safe for **that** sink (schema validation in `UNIVERSAL_SANITIZERS` already applies everywhere). Add a test proving the correctly sanitised form produces **zero** findings, and one proving a sanitizer for a different sink does not. A taint rule without a negative test will be rejected.
 
 ### Never print a raw credential
 
-`redact_findings()` runs over every finding before output. If you add a rule that surfaces credential material in `snippet`, make sure `redact()` covers it, and assert it in a test. Reports get committed and attached to issues.
+Reports get committed and attached to issues, so every `snippet` is public. Build it in one of three ways only:
+
+- a string constant: `snippet="Upload handling found with no size limit."`
+- `redact(value)`, for a credential you detected yourself
+- `evidence(text)`, for **anything** taken from a scanned file or an external tool: `snippet=evidence(lines[line_no - 1])`
+
+`evidence()` masks provider keys, secret-named values, credentialed URLs and random tokens, and **then** truncates. Never slice before calling it (`evidence(line[:140])`): a cut through a key is how a partial key once escaped its own pattern. Pass a limit instead: `evidence(line, 200)`.
+
+`TestEverySnippetIsBuiltThroughEvidence` parses the scanner and fails on any other spelling. Then add your rule to `REDACTION_CORPUS` in `tests/test_scanner.py`, with a canary on the line that triggers it. `test_every_rule_is_exercised_or_explicitly_exempt` fails until you do.
 
 ## Running the Tests
 
@@ -99,6 +107,7 @@ Verify the expected files land in `/tmp/test-app` for each agent, then delete th
 
 - [ ] `python3 -B -m unittest discover -s tests -v` passes
 - [ ] New rule has both a positive and a negative test case
+- [ ] New rule has a matched pair in `tests/corpus/<RULE>/vulnerable/` and `safe/` (realistic code, generic secrets only), or an entry in `CORPUS_EXEMPT` naming the test that covers it
 - [ ] Rule is documented in the README coverage matrix
 - [ ] `llms.txt` file map updated if you added or removed a file
 - [ ] `python3 scripts/build_llms_full.py .` re-run if you changed README, AGENTS.md, a SKILL.md, the CLI or the schema

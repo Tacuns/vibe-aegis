@@ -72,15 +72,17 @@
       "maximum": 100
     },
     "release_verdict": {
-      "description": "Fail-closed release gate. One of: 'INCOMPLETE_SCAN (...)' when no source files were scanned; 'BLOCKED (...)' when any CRITICAL/HIGH is open; 'VERIFIED_PARTIAL - INCOMPLETE_SCAN (...)' when any check was skipped or errored; 'NEEDS REVIEW (...)' below 90; 'READY TO PUBLISH' only when files were scanned, nothing was skipped, there are no CRITICAL/HIGH findings and the score is >= 90.",
+      "description": "Starts with one of BLOCKED, INCOMPLETE_SCAN, REVIEW_REQUIRED, STATIC_CHECKS_PASSED or RELEASE_AUDIT_PASSED, followed by an explanation in parentheses that varies between runs - match the leading word, never the whole string. STATIC_CHECKS_PASSED is NOT a release-readiness claim: only --profile release, with every release stage actually completed, can return RELEASE_AUDIT_PASSED. With --diff, a changeset with no scannable source returns 'NO CODE CHANGES TO REVIEW (...)'.",
       "type": "string",
       "minLength": 1,
       "examples": [
-        "READY TO PUBLISH",
-        "NEEDS REVIEW (Address Medium/Low polish items)",
         "BLOCKED (Fix Critical/High findings before publishing)",
-        "VERIFIED_PARTIAL - INCOMPLETE_SCAN (1 check skipped/offline: ...)",
-        "INCOMPLETE_SCAN (0 source files scanned - cannot certify readiness)"
+        "INCOMPLETE_SCAN (0 source files scanned - cannot certify readiness)",
+        "INCOMPLETE_SCAN (1 check skipped/offline: No Build Output Found; re-run with those stages available)",
+        "REVIEW_REQUIRED (2 finding(s) need a human decision before release)",
+        "STATIC_CHECKS_PASSED (the static checks that ran found nothing - this is NOT a release-readiness verdict; run --profile release)",
+        "RELEASE_AUDIT_PASSED (source, dependencies, git history and shipped artifacts all audited with no findings)",
+        "NO CODE CHANGES TO REVIEW (diff contained no scannable source files)"
       ]
     },
     "summary_counts": {
@@ -197,6 +199,14 @@
         },
         "note": {
           "type": "string"
+        },
+        "items_not_examined": {
+          "type": "integer",
+          "description": "How many files, lines or packages the scanner declined to read."
+        },
+        "not_examined": {
+          "type": "object",
+          "description": "Reason -> {count, examples, material}. A material skip is one that could plausibly have hidden a finding, and raises a COV-00 gap."
         }
       }
     },
@@ -229,12 +239,12 @@
       ],
       "properties": {
         "rule_id": {
-          "description": "Stable rule identifier. SEC/UX/LIVE are source and live-posture rules; PAY is payments and business logic; REL is backend reliability and scale; FLOW is data-flow (taint) analysis; DEP is dependency vulnerabilities; ART is build-artifact and mobile-package findings; HIST is git-history forensics. A rule id ending in -00 is always a coverage gap, never a defect.",
+          "description": "Stable rule identifier. SEC/UX/LIVE are source and live-posture rules; PAY is payments and business logic; REL is backend reliability and scale; FLOW is data-flow (taint) analysis; DEP is dependency vulnerabilities; ART is build-artifact and mobile-package findings; HIST is git-history forensics; COV is something the scanner declined to read; ENG is an external engine that did not run. EXT-<ENGINE>:<id> is a finding imported from an external engine, keeping that engine's own rule id. A rule id ending in -00 is always a coverage gap, never a defect.",
           "type": "string",
-          "pattern": "^(SEC|UX|LIVE|DEP|ART|HIST|GIT|FLOW|PAY|REL)-[0-9]{2}[A-Z]?$"
+          "pattern": "^(?:(?:SEC|UX|LIVE|DEP|ART|HIST|GIT|FLOW|PAY|REL|COV|ENG|DB)-[0-9]{2}[A-Z]?|EXT-[A-Z0-9-]+:.+)$"
         },
         "domain": {
-          "description": "Which analysis stage produced this finding.",
+          "description": "COVERAGE marks something that was not examined, not a defect. EXTERNAL marks a finding imported from an installed third-party engine, which keeps that engine's own rule id behind an EXT-<ENGINE>: prefix.",
           "enum": [
             "SECURITY",
             "UI_UX",
@@ -243,7 +253,9 @@
             "SUPPLY_CHAIN",
             "ARTIFACT",
             "HISTORY",
-            "DATAFLOW"
+            "DATAFLOW",
+            "COVERAGE",
+            "EXTERNAL"
           ]
         },
         "severity": {
@@ -271,7 +283,7 @@
           "minimum": 0
         },
         "snippet": {
-          "description": "Trimmed evidence excerpt. Credentials are always redacted (first 6 and last 4 characters only) so reports are safe to commit and share.",
+          "description": "Trimmed evidence excerpt. Credentials are always redacted (public provider prefix and length only) so reports are safe to commit and share.",
           "type": "string"
         },
         "cwe_or_standard": {
@@ -307,7 +319,7 @@
           "default": "finding"
         },
         "status": {
-          "description": "VULNERABILITY is a real defect that counts toward the score. SKIPPED and SCAN_ERROR are coverage gaps: they never affect the score and they force release_verdict away from READY TO PUBLISH.",
+          "description": "VULNERABILITY is a real defect that counts toward the score. SKIPPED and SCAN_ERROR are coverage gaps: they never affect the score and they make release_verdict INCOMPLETE_SCAN unless a CRITICAL or HIGH finding already makes it BLOCKED.",
           "enum": [
             "VULNERABILITY",
             "SKIPPED",

@@ -4,6 +4,469 @@ All notable changes to Vibe Aegis are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - 2026-10-19
+
+### Migration - `READY TO PUBLISH` no longer exists
+
+A plain source scan used to end in `READY TO PUBLISH`, which claimed far more than a source
+scan can know. The verdict is now one of five, and **any pipeline that compares
+`release_verdict` with `READY TO PUBLISH` will never match again** - it silently treats
+every run as not ready, or, if it tested for the absence of `BLOCKED`, as ready. `NEEDS
+REVIEW` and `VERIFIED_PARTIAL - INCOMPLETE_SCAN` are gone too.
+
+| Old | New |
+| :--- | :--- |
+| `READY TO PUBLISH` | `STATIC_CHECKS_PASSED` for a source scan - **not** a release claim. Only `--profile release` can return `RELEASE_AUDIT_PASSED` |
+| `NEEDS REVIEW (...)` | `REVIEW_REQUIRED (...)` |
+| `VERIFIED_PARTIAL - INCOMPLETE_SCAN (...)` | `INCOMPLETE_SCAN (...)` |
+| `BLOCKED (...)` | unchanged |
+
+Match the **leading word**, never the whole string - the text in parentheses carries counts
+and check names that change between runs. Better, gate on the exit code:
+
+```bash
+# Before
+grep -q '"release_verdict": "READY TO PUBLISH"' .aegis/scan-report.json
+# After: exits 0 only on RELEASE_AUDIT_PASSED
+python3 .aegis/scripts/aegis_scan.py . --profile release
+```
+
+`--profile release` exits `1` on an incomplete stage, on any `MEDIUM` or worse finding,
+and on any verdict other than `RELEASE_AUDIT_PASSED`. An explicit `--fail-on <level>`
+overrides the severity threshold.
+
+### Fixed - dependency vulnerabilities were always reported MEDIUM (CRITICAL)
+
+The OSV batch endpoint returns advisory ids only, and `DEP-01` reported every advisory as
+`MEDIUM`. A dependency with a 9.8 CRITICAL advisory therefore passed `--fail-on-high` and
+the release gate. Severity now comes from each advisory's own record: every CVSS v3.x and
+v2 vector is scored (the calculator agrees with an independent implementation on all
+5,184 v3.x and 729 v2 base vectors), the record's own rating is read, and **the highest
+signal wins** - in a sample of 5,239 GitHub-reviewed advisories, 115 had a CVSS vector
+alone that would understate GitHub's own rating. A `MAL-` advisory is CRITICAL; an
+advisory whose severity cannot be read is HIGH at MEDIUM confidence. `--deps` now also
+sends one `GET /v1/vulns/<id>` per matched advisory (at most 200).
+
+### Fixed - `--offline` did not stop external engines (HIGH)
+
+`--offline` disabled only the scanner's own requests; `--engine semgrep` still fetched its
+rules and `--engine trivy` its database. Under `--offline` only `gitleaks` and
+`trufflehog` now start - each verified to produce its normal results inside a network
+namespace with no network - and every other engine is an `ENG-00` gap. A test blocks every
+socket and runs the full release profile under `--offline` to prove no connection is
+attempted.
+
+### Fixed - the installer overwrote project files (HIGH)
+
+`install.sh` copied `.github/copilot-instructions.md`, `.claude/commands/aegis.md` and every
+skill file over whatever was there, with no backup - a team's own Copilot instructions were
+simply replaced. A project's own config files are now never modified (our version goes to
+`.aegis/suggested/`), files only Vibe Aegis writes are backed up to `.aegis/backup/` before
+an update, the summary lists what was kept, and a re-run with nothing changed touches
+nothing. The same applies to `--global`.
+
+### Fixed - secret detection and sensitive data (checklist A)
+
+Each issue was reproduced against this branch before it was changed, and each fix has a
+regression test that fails on the previous code.
+
+- **Production code was treated as test code (HIGH).** `is_test_context()` matched the
+  substrings `test`, `spec` and `mock`, so `src/latest/`, `inspector/`, `contest/` and
+  `hammock.js` were "tests": their provider keys were downgraded to `MEDIUM` - passing
+  `--fail-on-high` - and data-flow analysis was switched off for the file. It now
+  matches whole path segments and file-naming conventions, and a provider-format key is
+  never downgraded for its path at all.
+- **A second credential on a line was lost (HIGH).** Each provider pattern stopped at
+  its first match, and dedupe keyed `SEC-01*` on file and line, so the second key on a
+  line was never reported. Every match is found, and credentials are deduplicated by the
+  exact value (held in memory, never in the report), so rules describing one credential
+  still collapse into one finding.
+- **`SEC-01C` searched `.gitignore` for the text `.env` (HIGH).** A comment, or a lone
+  `.env.example` line, silenced it; a later `!.env` was ignored; and a `.env` already
+  committed was never reported. Inside a git work tree the scanner now asks git
+  (`git ls-files`, `git check-ignore`) and reports a committed file as committed. Without
+  git, the root `.gitignore` is evaluated by git's documented rules at `MEDIUM`
+  confidence; a differential test checks the two agree on every one- and two-rule
+  combination of the patterns it uses.
+- **Skipped mobile package entries left the package looking clean (MEDIUM).** The
+  credential sweep stopped after 400 entries and skipped entries over 40 MB, or that
+  failed to decompress, with no record. Each is now an `ART-00` coverage gap.
+- **Token-bearing URLs reached the report (MEDIUM).** `display_url()` removed only
+  `user:password@`, so `?token=`, `&sig=`, an OAuth `#access_token=` fragment and a
+  capability token in the path reached `live_url`, titles and file fields verbatim.
+  Every query value and the fragment are now replaced, and a path segment that is a
+  recognisable key or looks random is redacted; parameter names, host and ordinary path
+  segments are kept. The live-URL failure message is passed through the same filter.
+
+### Fixed - release gate and coverage correctness (checklist B)
+
+Reproduced on this branch before each change; each fix has a regression test.
+
+- **`--engine osv-scanner` called every advisory MEDIUM (HIGH).** osv-scanner reports full
+  OSV records, so severity is now decided exactly as `DEP-01`'s is, with the package's
+  `groups[].max_severity` as one more signal; the highest wins. Checked against real
+  osv-scanner 2.2.2 output: all seven advisories for `lodash@4.17.15` and
+  `minimist@1.2.5` match both osv-scanner's own score and GitHub's rating.
+- **`REVIEW_REQUIRED` exited `0` under `--profile release` (HIGH).** See *Changed*.
+- **Git history covered less than it said (HIGH).** Only `HEAD` was walked, so a key on
+  another branch was missed; `--diff-filter=AM` hid a key added in a commit git saw as a
+  rename; and the 300-commit limit, a shallow clone and every commit `git show` failed on
+  were silent. History is now read from every ref (`git log --all`), merges are shown
+  against their first parent, and the limit, a shallow clone and each unreadable commit
+  are `GIT-00` gaps. `git show` runs with `--no-ext-diff --no-textconv`, so a scanned
+  repository's own config cannot choose a program to run.
+- **`public/` satisfied the artifact stage on its own (HIGH).** A lone `robots.txt` there
+  counted as build output. `public/` is still read - it ships - but with no real build
+  directory beside it the stage is an `ART-00` gap.
+- **The coverage ledger depended on file order (HIGH).** One skip reason covers both
+  lockfiles (immaterial) and `.min.js` bundles (material), and the first one recorded
+  decided for all: a walk that reached a lockfile first lost the bundle's gap.
+  Materiality is now counted per occurrence.
+- **Failed `/.env` and `/.git/config` probes were swallowed (MEDIUM).** A timeout read
+  exactly like "not exposed". A failed probe, or a 5xx, is now a `LIVE-00` gap; a 4xx is
+  an answer.
+- **A docs-only `--diff` overwrote the verdict (MEDIUM).** It reported `NO CODE CHANGES TO
+  REVIEW` at 100/100 beside a CRITICAL from `--artifact`. The empty changeset now only
+  waives the zero-files rule; other stages' findings and gaps decide the verdict. Files
+  outside the diff are no longer recorded as skipped, so an unchanged bundle is not a gap
+  in a diff review.
+
+### Fixed - authentication, IDOR and data-flow accuracy (checklist C)
+
+Reproduced on this branch before each change; each has matched vulnerable and safe tests.
+
+- **`SEC-03` was one search of the whole file (HIGH).** An auth call in `GET` covered an
+  unauthenticated `DELETE` beside it, and `createServerClient` - which builds a database
+  client and says nothing about the caller - counted as authentication. Each mutating
+  handler and each server action is now checked on its own, a local helper that checks
+  the caller counts, and client constructors do not. `"use server"` is recognised only
+  as a directive (top of a file, or first statement of an inline action), so a file that
+  merely quotes the string - including a Python test - is no longer treated as actions.
+  The rule table no longer claims FastAPI or Express coverage it never had.
+- **`SEC-04` accepted any owner field (HIGH).** `where: { id, userId: body.userId }` passed,
+  although the attacker chooses `userId`. The owner value must now not come from the
+  request; a request-supplied owner is reported, at `LOW` confidence when it is an
+  Express `req.body.*` field that middleware may set from the token. Shorthand
+  `where: { id }` with a request-derived `id` is recognised.
+- **Sanitizers were interchangeable across sinks (HIGH).** `encodeURIComponent()` cleared
+  a value for SQL, `Number()` for a fetch destination, and any `validateX()` for
+  everything. Schema validation still clears every sink; otherwise only a sanitizer for
+  that sink counts, and a generic `validate*`/`sanitize*` helper leaves the finding at
+  `LOW` confidence. `JSON.parse` is no longer mistaken for schema validation.
+- **A sanitizer anywhere on the line suppressed the finding (MEDIUM).** It now counts only
+  when it wraps the tainted value. For SQL, shell and fetch sinks only the query, command
+  or URL is examined, so a bound parameter (`query("... $1", [id])`) is correctly treated
+  as the fix; string-literal text no longer counts as a use of a variable of the same name.
+- **Taint did not cross functions (MEDIUM).** One level within a file is now followed: a
+  tainted argument to a local helper whose parameter reaches a sink, and a helper that
+  returns request data. A request value used inline in the sink - the most direct flow -
+  was never reported and now is, and a TypeScript annotation (`let q: any = ...`) no longer
+  hides an assignment.
+- **Python files were analysed with JavaScript sources only.** Flask, Django and DRF
+  request attributes (names checked against Flask 3.1, Django 6.1 and DRF), `def`
+  boundaries and plain `name = value` assignments are now recognised.
+
+### Fixed - mobile package verification (checklist D)
+
+- **A signing block's presence was taken as a valid signature (HIGH).** It proves the
+  structure exists, not that the certificate and content digests are valid. When
+  `apksigner` is on PATH the package is now verified with it (`ART-11` if it fails);
+  otherwise the signature is an `ART-10` gap, "not cryptographically verified". No
+  cryptography is reimplemented here: the platform's own verifier decides, or nothing does.
+  Checked with the real `apksigner` 31.0.2 on signed, v1-only, v2-only, v3 and tampered
+  packages.
+- **Manifest checks grepped the string pool (MEDIUM).** The binary manifest is now decoded
+  (layout from AOSP `ResourceTypes.h`), so `android:debuggable="true"` is `ART-14` at HIGH
+  and the correct `false` is silent; `usesCleartextTraffic="true"`, or its absence below
+  targetSdk 28 with no network security config (the documented default), is `ART-13`.
+  A value taken from a resource is a LOW-confidence prompt to verify; an undecodable
+  manifest, or an `.aab`'s protobuf manifest, is an `ART-10` gap. The decoder matches
+  `aapt dump xmltree` on every attribute of 54 real APKs (UTF-16 and UTF-8 string pools),
+  and on 56 real APKs the scanner agrees with `aapt` on debuggable and with `apksigner` on
+  signature validity in every case. Test fixtures in `tests/fixtures/android/` are real
+  `aapt`/`apksigner` output built from manifests in the same directory.
+
+### Fixed - repository handling, engines and the Node wrapper (checklist E)
+
+- **Symlinks out of the repository were followed (HIGH).** A file link such as
+  `src/k.ts -> ~/.ssh/id_rsa` was read and quoted as if it were project code, in the
+  source walk, the build-output walk and the dependency manifests. A link whose target
+  lies outside the repository is now not followed and is recorded as not examined
+  (`COV-00` / `ART-00`); links that stay inside the repository are read as before.
+- **An engine that failed could be read as a clean scan (MEDIUM).** Output that parsed
+  as JSON was accepted whatever the exit status. Each engine's statuses were observed on
+  the real binary with our exact command: semgrep exits `2` on a bad rule or missing path
+  and still prints a valid, empty result; osv-scanner exits `1` when it finds
+  vulnerabilities and `128` when it finds no packages. Anything but a status meaning
+  "finished" is now an `ENG-00` gap, osv-scanner's `128` included, and a semgrep run that
+  lists `errors` is a partial run. `gitleaks detect` outside a git repository scanned "0
+  commits" and reported nothing; it now runs with `--no-git` there.
+- **The Node wrapper turned failures into success (MEDIUM).** An unknown command printed
+  usage and exited `0`, so a typo passed a CI step; a scanner killed by a signal (`status`
+  null) exited `0` through `?? 0`, and so did an installer whose `bash` could not start.
+  An unknown command now exits `2`, a signal `128 + n` as a shell reports it, and a child
+  that cannot start `127`; `help` still exits `0`.
+- **Installer (re-verified).** On the three paths the review named, an existing
+  `.github/copilot-instructions.md` is left untouched (our copy goes to
+  `.aegis/suggested/`), and `.claude/commands/aegis.md` and `.cursor/rules/vibe-aegis.mdc`
+  are backed up byte for byte before being replaced; a re-run with nothing changed
+  creates no new backup.
+
+### Added - a vulnerable/safe corpus for every rule, and a release-gate CI job (checklist F)
+
+- **`tests/corpus/<RULE>/{vulnerable,safe}/`** holds a realistic insecure and a realistic
+  correct implementation for 51 rules; `ART-12`/`ART-15` packages are built in the test.
+  `TestCorpus` requires each rule to fire on its vulnerable case and stay silent on its
+  safe one, and fails when a rule id has neither a corpus pair nor a `CORPUS_EXEMPT` entry
+  naming the test class that covers it. Credentials in the corpus are generic values, so it
+  can be published.
+- **Release Gate CI job.** Runs `--profile release` on a clean, a vulnerable, a
+  review-required and an incomplete project (`tests/release_gate/`) and asserts each exact
+  verdict and exit code, then runs the corpus and uploads its true/false
+  positive/negative summary as `corpus-report.json`. CI now has four jobs.
+
+### Fixed - found by the corpus
+
+- **camelCase secret names were never matched (HIGH).** `apiSecret = "..."` and
+  `secretKey = "..."` - the usual JavaScript spelling - produced nothing, while
+  `API_SECRET` did. camelCase boundaries are now split before the name is checked.
+- **Quoted keys were never matched (HIGH).** JSON (`"api_secret": "..."`) and Python dicts
+  (`{'password': '...'}`) put a quote between the name and the colon, so named secrets in
+  `config.json`, `appsettings.json` and settings modules were invisible. A value must now
+  be a single token that is not mostly non-ASCII, so translated UI text under a key like
+  `LABEL_PASSWORD` is not reported; checked on a real project with 40+ locale files (one
+  new genuine finding, nothing lost).
+- **Firebase rules files were never read.** `SEC-02B` exists for `firestore.rules` and
+  `storage.rules`, but `.rules` was not a scanned extension.
+
+### Fixed - second review: what the scanner examined versus what it assumed
+
+Five findings from a second review of this branch, each reproduced before it was changed.
+
+- **A credential inside a comment was invisible (HIGH).** Comments were masked before
+  secret detection, so `// old prod key: sk_live_...` produced nothing although it is
+  committed like any other line. Secret detection now reads the original text; the other
+  rules still ignore commented-out code.
+- **A directory symlink out of the repository was skipped silently (HIGH).** `os.walk()`
+  does not follow it, and nothing recorded that its contents were never read. It is now a
+  `COV-00` gap; a link that stays inside the repository is covered at its real path.
+- **An external dependency-manifest symlink counted as coverage (HIGH).** The parser
+  refused it, but the coverage check still counted it as present - and for
+  `requirements.txt` read it. Every manifest check now applies the same test, and such a
+  link is a `DEP-00` gap.
+- **A malformed OSV answer read as "no vulnerabilities" (HIGH).** A missing or short
+  `results` list was zipped against the query, dropping the unmatched packages; a
+  non-list `results` crashed the stage. The answer must now have exactly one well-formed
+  result per package (and no `next_page_token`), or it is a `DEP-00` gap.
+- **An engine printing `{}` read as a clean scan (HIGH).** Each engine's output must now
+  have the fields its real binary emits - checked against real clean and finding outputs
+  (a clean trivy scan omits `Results`, so only its header is required) - or it is an
+  `ENG-00` gap.
+
+### Added - checks for what leaves no trace: the live database, and a two-account test
+
+A leaked key is a string you can grep for. Missing row-level security and IDOR are not:
+every response is a normal `200` with another user's data in it. Two additions, and a
+README section, [What a scan cannot prove](README.md#-what-a-scan-cannot-prove), saying
+plainly where static analysis stops.
+
+- **`--db-check`: read the live database, not only the migrations.** A table created in
+  the dashboard, a hand-edited policy or a migration that never ran is invisible to a
+  source scan. With `AEGIS_DATABASE_URL` set, the scanner reads `pg_class`, `pg_roles` and
+  `pg_policies` through `psql` and reports `DB-01` (a table the API roles can reach - table
+  grant and schema `USAGE` - with RLS off), `DB-02` (a permissive policy whose `USING` or
+  `WITH CHECK` is `true`; a `SELECT` one is MEDIUM, because a public-read table is a
+  legitimate pattern, and a `RESTRICTIVE` one is not reported) and `DB-03` (a view without
+  `security_invoker`). `--db-schemas` and `--db-roles` name what the API exposes.
+  - The session is read-only (`default_transaction_read_only=on`, 30 s statement timeout)
+    and reads no row of application data.
+  - The password goes to `psql` in its environment, never argv, and is removed from any
+    error message before it is recorded.
+  - Every failure - no URL, no `psql`, a bad identifier, no API role, a query error, or
+    `--offline` - is a `DB-00` gap, never a pass.
+  - `tests/sql/db_posture.sql` builds one example of each rule and each silent case;
+    `TestLiveDatabaseCheck` was run against PostgreSQL 16 and gives exactly the expected
+    findings.
+- **`--idor-plan <PATH>`: the test a scanner cannot run.** Writes a Markdown plan for
+  every `SEC-03`, `SEC-04` and `DB-0x` finding: the route derived from the file path, the
+  handler's method, and a `curl` to run as account B against account A's record (for a
+  database write policy, an attempt to write a row owned by A). It is only written to
+  disk; nothing is sent. With no findings it still says that no finding is not proof.
+
+### Fixed - a third review: coverage, history, dependencies and the installer
+
+Ten proposed fixes were checked one by one against this branch before anything changed.
+Several were already in place (a `!.env.example` line never protected `.env` here, commit
+messages were never read, a scan of zero files was already `INCOMPLETE_SCAN`, an existing
+`copilot-instructions.md` was already kept); those now have regression tests. What was
+still wrong:
+
+- **A configuration-only project could pass (HIGH).** `package.json`, `tsconfig.json`,
+  `jsconfig.json`, `.gitignore` and `.env*` counted as scanned source files, so a project
+  with no application code read as covered. They are still scanned, but no longer counted.
+- **A deleted `.env` left no finding (HIGH).** History was searched for credential
+  patterns only, so `DB_PASSWORD=hunter2` in a `.env` committed and later removed was
+  invisible. New rule `HIST-02`, judged per file name so a template beside it never
+  stands in for it; files with only empty values and templates are not reported.
+- **Unpinned versions read as "no vulnerabilities" (HIGH).** `*`, `latest`, ranges, git
+  URLs and `workspace:*` went to OSV, matched nothing, and counted as checked. Only exact
+  versions are queried; the rest are a named `DEP-00` gap.
+- **Pages Router mutations were not checked (HIGH).** `SEC-03` looked for exported
+  `POST`/`DELETE` functions; a Pages Router handler branches on `req.method` inside one
+  default export. Those branches are now checked, and `--idor-plan` uses their method.
+- **`os.system()` was never matched (HIGH).** `SEC-08` named it in the README but matched
+  only `subprocess(..., shell=True)`. A non-literal `os.system` / `os.popen` argument is
+  now reported (no hit in Django, Flask or DRF).
+- **The scanner failed its own gate.** Its rule table matched itself, and the `DB-00`
+  help text carried a `postgres://user:password@...` placeholder that read as a
+  credential. The scanner now skips a file only when it is byte-for-byte the running
+  scanner - a name alone would let any `aegis_scan.py` hide - and CI runs the self-scan
+  with `--fail-on-high`.
+- **The installer's missing-value errors were unhelpful.** `--target` with no value died
+  on `$2: unbound variable`, and `--agent --target x` took `--target` as the agent. Both
+  now say which option needs a value and exit `2`.
+
+Not applied, with the reason: `severity="SKIPPED"` (not a valid severity in the report
+schema), a new `SCAN-00` id (the zero-file case is `INCOMPLETE_SCAN`, with `COV-00` for
+skipped files), `git log -n 50` (fewer commits than the current 300 across every ref),
+`res.status ?? 1` in the Node wrapper (it would lose the signal exit code), a `py`
+fallback outside Windows (on Linux `py` can be an unrelated program), deduplicating on rule and line
+(two different findings on one line would merge), and a `DEP-00` gap for a project with
+no dependencies (nothing to check is not a gap).
+
+### Changed - GitHub Actions are pinned to commit SHAs
+
+This repository's CI and the workflow shipped in `adapters/github-actions/` used movable
+tags (`@v4`). Each is now pinned to the commit its tag resolved to - cross-checked between
+our own CI logs and `git ls-remote` - with a `# vN` comment that Dependabot updates. A
+test fails on any unpinned `uses:`.
+
+### Added
+
+- **`SEC-18` .. `SEC-21`, Postgres/Supabase privilege rules** for `.sql` migrations, written
+  from PostgreSQL's privilege model with no rule text or code from any other tool: a
+  `SECURITY DEFINER` function without a fixed `search_path`; a public view exposing
+  `auth.users`; a public view bypassing RLS (no `security_invoker`, or materialized); an RLS
+  policy trusting user-editable `user_metadata`. Each attack is executed against a real
+  PostgreSQL in CI, succeeding on the flagged migration and failing on the fix. A grant or
+  revoke in the same file sets the confidence, because Supabase no longer grants the API
+  roles new public objects by default.
+- **`--engine trufflehog`**, always with `--no-verification` (verification would send each
+  credential found to its provider) and `--no-update`. Clean TruffleHog prints nothing and
+  exits `0`; that is read as clean, and a non-zero exit as a gap.
+- **Trivy `Secrets` are imported.** They were silently dropped. Only `Match`, which Trivy
+  masks, is read - never `Code`, whose context lines carry neighbouring source unmasked; a
+  real run showed a full database password there.
+- Engine findings report repository-relative paths instead of the scanning machine's.
+- `.github/dependabot.yml` keeps this repository's own Actions current.
+- `--profile quick|code|full|release`, five verdicts, external engine adapters
+  (`--engine`, `--list-engines`, `--authorize-network-scan`), `--max-file-size`, and the
+  coverage ledger (`COV-00`) - all documented in the README for the first time.
+
+### Changed
+
+- **`--profile release` fails on anything but `RELEASE_AUDIT_PASSED`.** It exited `0` on a
+  `BLOCKED` verdict unless `--fail-on-high` was also passed - a release gate that let a
+  release with an open HIGH through - and, once that was fixed, still exited `0` on
+  `REVIEW_REQUIRED`, whose own text says a human must decide before release. Without
+  `--fail-on`, it now fails on `MEDIUM` and above (at or above `--min-confidence`), and at
+  the default `--min-confidence low` on any verdict but `RELEASE_AUDIT_PASSED`. An explicit
+  `--fail-on <level>` still sets a severity-only threshold.
+- `SEC-18` is `MEDIUM`: exploiting it needs a role that can create database objects.
+
+### Fixed - documentation
+
+- README, `AGENTS.md`, the orchestrator and pre-flight skills, the full-audit prompt, the
+  schema and `llms-full.txt` described verdicts the scanner can no longer return.
+- The schema's `rule_id` pattern rejected `COV-00`, `ENG-00` and every `EXT-*` id the
+  scanner already emits, so a real JSON Schema validator rejected real reports. CI checked
+  only for required keys, which is why it passed.
+- `llms-full.txt` documented the old exit codes, called `LIVE-00` "informational only"
+  (it is a coverage gap), and omitted most gate flags.
+
+### Fixed - `--profile release` certified stages that examined nothing (CRITICAL)
+
+`RELEASE_AUDIT_PASSED` is only meaningful if every release stage actually read
+something. Two stages could "complete" without reading anything, and the release verdict
+then claimed "source, dependencies, git history and shipped artifacts all audited". Each
+case below was reproduced through the CLI and returned `RELEASE_AUDIT_PASSED`, exit `0`:
+
+- **Build artifacts**: no build output at all; an `--artifact` path that does not exist;
+  build output holding only file types the stage does not read; a bundle over the 12 MB
+  cap - including one holding a live Stripe key. Files past the first 4000 were dropped
+  silently, in filesystem order, so which files went unread varied by machine.
+- **Dependencies**: no manifest at all; a `poetry.lock` (or `yarn.lock`, `pnpm-lock.yaml`
+  and other formats the parser does not read) pinning a vulnerable version; lockfiles in a
+  monorepo's subdirectories; `requirements.txt` lines not pinned with `==`. Even
+  `--offline` passed, because zero parsed dependencies skipped the offline check entirely.
+
+Each is now a coverage gap - `ART-00` or `DEP-00` - so the verdict is `INCOMPLETE_SCAN`
+and `--profile release` exits `1`, naming what was not read. A `package.json` with no
+`package-lock.json` is also a gap: versions are then read from semver ranges (`^4.17.0`
+is queried as `4.17.0`), not the version actually installed. Build files are now read in
+sorted order, and an `.apk`/`.aab`/`.ipa` inside the build directory is inspected rather
+than skipped. A fully built, pinned, committed project still reaches
+`RELEASE_AUDIT_PASSED`; a test holds that.
+
+**Upgrade impact:** a `--profile release` (or `full`) pipeline that passed before may now
+fail as incomplete. That pipeline was never auditing what it claimed. Commit a supported
+lockfile, build before scanning or pass `--artifact`, or add `--engine osv-scanner` for
+dependency formats this scanner does not read.
+
+### Fixed - flags did not do what their help said
+
+- `--profile quick` silently discarded `--all`, contradicting the documented rule that an
+  explicit flag always adds a stage. It now honours it. The help text claimed quick ran
+  "fast source patterns only"; it never did - `quick` and `code` run identical source
+  analysis, and the help now says so.
+- `--artifact` with no value was rejected by argparse, although the help and README both
+  said it auto-detects `dist/`, `build/` and `.next/`. It now does.
+
+### Fixed - eight more routes put a credential in the report (CRITICAL)
+
+2.5.0 removed one rule that quoted a raw source line. `redact_findings()` was still the
+only defence for every other rule, and it knows only the provider formats - and it ran
+after each rule had already cut the line to 140 characters. Reproduced, each leaking the
+full value unless noted:
+
+- `SEC-01` on an unquoted `.env` value (`NEXT_PUBLIC_API_SECRET=...`).
+- `SEC-03` and `SEC-06` quoted **line 1 of the file**, typically `const API_KEY = "..."`,
+  even while `SEC-01` reported the same key redacted.
+- Every raw-line rule (`SEC-07`, `FLOW-*`, `UX-*` ...) carried any secret on its line.
+- A provider key split by the 140-character cut no longer matched its pattern, so the
+  fragment shipped (part of a Twilio SID, reproduced).
+- `--url https://user:password@host` put the password in the `LIVE-00` title, `file`,
+  SARIF URI and the report's `live_url`.
+- `ENG-00` copied an engine's raw stdout/stderr; imported semgrep findings copied the
+  matched source line and message.
+- `redact()` itself kept the first 6 and last 4 characters: 10 of a 16-character secret.
+
+Every snippet is now built by `evidence()`, which masks provider keys, secret-named
+values (quoted, bare, `.env`, JSON, YAML), credentialed URLs, auth-header values and long
+random tokens, and only then truncates. `redact_findings()` remains as a backstop over
+every text field. `redact()` prints only the public prefix and length:
+`sk_live_...[REDACTED 48 chars]`.
+
+### Changed
+
+- `ART-01` matches the exact source value, held in memory only, instead of a 6-character
+  fragment of the redacted snippet. The fragment (`sk_liv`) matched every Stripe key, so a
+  different key in a bundle was reported as a confirmed leak of yours.
+- Fingerprints of findings whose evidence contained a credential change once, because the
+  evidence is now redacted differently. Those findings reappear once after upgrading even
+  if baselined; re-run `--write-baseline` after reviewing them. Two different keys of the
+  same provider and length in one file keep distinct fingerprints, so accepting one never
+  accepts the other.
+
+### Added - redaction regression suite
+
+47 tests. An end-to-end run with git history, build artifacts, a credentialed `--url` and
+three fake external engines checks the JSON report, SARIF, SBOM, terminal output, JSON on
+stdout and stderr for any 8-character run of five canary secrets. A static guard parses
+the scanner and fails if any snippet is built from raw text or sliced before masking, and
+a completeness check fails if a new rule is neither exercised by the canary corpus nor
+explicitly exempted with the test that covers it.
+
 ## [2.6.0] - 2026-10-19
 
 The fail-closed contract was correct inside `compute_readiness_score()` and wrong

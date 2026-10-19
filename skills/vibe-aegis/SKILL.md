@@ -35,6 +35,9 @@ Run the bundled zero-dependency scanner first so you never waste context guessin
 # Full sweep: source + data-flow + git history + dependencies + build artifacts
 python3 .aegis/scripts/aegis_scan.py . --all --output .aegis/scan-report.json
 
+# Release gate: every stage must run, and any CRITICAL/HIGH fails it
+python3 .aegis/scripts/aegis_scan.py . --profile release --output .aegis/scan-report.json
+
 # Fallback if running directly from the vibe-aegis repo:
 python3 scripts/aegis_scan.py . --all --output .aegis/scan-report.json
 
@@ -42,10 +45,17 @@ python3 scripts/aegis_scan.py . --all --output .aegis/scan-report.json
 python3 .aegis/scripts/aegis_scan.py . --diff origin/main --baseline .aegis/baseline.json
 ```
 
-The scanner now reports six domains: `SECURITY`, `UI_UX`, `DATAFLOW` (request input traced
-to a dangerous sink), `SUPPLY_CHAIN` (known dependency vulnerabilities), `ARTIFACT` (what the
-build actually ships) and `HISTORY` (credentials committed at any point). Credentials in the
-report are always redacted, so `.aegis/scan-report.json` is safe to attach to an issue.
+The scanner reports ten domains: `SECURITY`, `UI_UX`, `DATAFLOW` (request input traced to a
+dangerous sink), `PAYMENTS`, `RELIABILITY`, `SUPPLY_CHAIN` (known dependency vulnerabilities),
+`ARTIFACT` (what the build actually ships), `HISTORY` (credentials committed at any point),
+`EXTERNAL` (findings imported from an installed engine via `--engine`), and `COVERAGE`
+(something that was not examined - read `skipped_checks`, never treat it as clean).
+Credentials in the report are always redacted, so `.aegis/scan-report.json` is safe to
+attach to an issue.
+
+In Claude Code, also run the built-in `/security-review` on the branch's pending changes. It
+is an AI review of intent and complements the scanner's deterministic rules; report its
+findings through the same Skeptic and Referee stages.
 
 Read `.aegis/scan-report.json` to extract:
 1. Detected frameworks, database/BaaS, auth libraries, payment SDKs, UI libraries, and AI SDKs.
@@ -107,9 +117,13 @@ it, and always give the rotation-first remediation order.
 Switch perspective to the **Skeptic**. For every candidate finding from Stages 1–3:
 - Attempt to **disprove** the claim by checking upstream middleware (`middleware.ts`), layout auth guards, ORM automatic parameterization, framework auto-escaping, or parent responsive containers.
 - If a defence completely blocks the trigger, mark the finding `DISMISSED` and cite the exact defensive `file:line`.
-- `DATAFLOW` findings are reported at `MEDIUM` confidence by design: the tracker works within a
-  single function scope, so confirm the value really is attacker-controlled and really is unvalidated
-  before promoting one to `CONFIRMED`.
+- `DATAFLOW` findings are reported at `MEDIUM` confidence by design: the tracker follows a function
+  and one call into helpers in the same file, not across files, so confirm the value really is
+  attacker-controlled and really is unvalidated before promoting one to `CONFIRMED`. A `LOW`
+  `DATAFLOW` finding passed through a generic `validate*`/`sanitize*` helper: read that helper and
+  decide whether it actually makes the value safe for this sink.
+- A `LOW` `SEC-04` takes its owner from a request field such as `req.body.UserId`: check whether
+  middleware overwrites that field from the verified token on every route that reaches the query.
 - `ART-01` is the exception - it is already confirmed evidence and must not be dismissed.
 - A publishable key (Supabase anon, Stripe publishable, Firebase web config) in a bundle is **not**
   a leak. Instead verify the protection it depends on: an anon key is only safe when Row-Level
@@ -118,7 +132,7 @@ Switch perspective to the **Skeptic**. For every candidate finding from Stages 1
 ### Stage 5: Evidence Referee & Release Readiness Report
 
 Switch perspective to the **Referee**. Evaluate all surviving claims and write `.aegis/AUDIT_REPORT.md` containing:
-1. **Release Readiness Score (0–100)** and Release Gate Status (`READY TO PUBLISH` vs `BLOCKED`).
+1. **Release Readiness Score (0–100)** and Release Gate Status. Gate status is the scanner's `release_verdict`. Report its leading word exactly - `BLOCKED`, `INCOMPLETE_SCAN`, `REVIEW_REQUIRED`, `STATIC_CHECKS_PASSED` or `RELEASE_AUDIT_PASSED` - and never call the app release-ready unless it is `RELEASE_AUDIT_PASSED` from `--profile release` with zero open `CRITICAL`/`HIGH`. `STATIC_CHECKS_PASSED` means only that the source checks which ran found nothing.
 2. **Confirmed Security Findings Table** (ordered `CRITICAL` -> `HIGH` -> `MEDIUM` -> `LOW` with `file:line`, CWE, trigger explanation, and exact code fix).
 3. **Confirmed UI/UX & Accessibility Findings Table** (ordered `HIGH` -> `MEDIUM` -> `LOW` with component location, visual/interaction impact, and exact code fix).
 4. **Dismissed False Positives Log** (showing why each dismissed item is already safe).

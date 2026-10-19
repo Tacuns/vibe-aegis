@@ -36,7 +36,7 @@ Audit every query that takes an identifier:
 - Is the filter applied on the **server**, not in client code or a hidden UI route?
 - For predictable IDs (sequential integers), assume enumeration. UUIDs raise the effort; they are not an authorisation control.
 
-Test it properly: create two accounts, take a resource ID from account A, request it while authenticated as account B. If it returns, that is a confirmed breach, not a theoretical one.
+Test it properly: create two accounts, take a resource ID from account A, request it while authenticated as account B. If it returns, that is a confirmed breach, not a theoretical one. `python3 scripts/aegis_scan.py . --idor-plan .aegis/idor-plan.md` writes this test, with a ready `curl` for every `SEC-03`/`SEC-04`/`DB-0x` finding — run it against a staging deployment you own. A clean scan is not a substitute: an IDOR returns a normal `200`.
 
 ## 3. Database Row-Level Security
 
@@ -49,6 +49,8 @@ For every table in the `public` schema:
 - Policies scoped to `auth.uid()` or verified tenant membership. Flag every `USING (true)` on anything non-public.
 - `WITH CHECK` on `INSERT`/`UPDATE`, otherwise a user can write rows that claim to belong to someone else.
 - Confirm the `service_role` key is **never** in client code. It bypasses RLS entirely.
+
+Migrations are not the database: a table made in the dashboard or a policy edited by hand never appears in them. With `AEGIS_DATABASE_URL` set (a read-only role is enough), `--db-check` reads the live catalog and reports tables the API roles reach with RLS off (`DB-01`), permissive `true` policies (`DB-02`) and views that bypass RLS (`DB-03`).
 
 Remember RLS is only enforced on the anon/authenticated roles. Server code using the service key must do its own scoping — enabling RLS does not protect queries that bypass it.
 

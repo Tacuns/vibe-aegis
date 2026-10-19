@@ -45,10 +45,10 @@ python3 .aegis/scripts/aegis_scan.py . --all --output .aegis/scan-report.json
 | `ART-01` | Critical | **Confirmed leak.** A credential found in your source is present in the shipped bundle |
 | `ART-02` | Medium / Low | A source map is in the build output. With `sourcesContent`, your original unminified source ships to every visitor |
 | `ART-03` | Critical–Medium | A provider-format credential found directly in shipped JavaScript, HTML or JSON |
-| `ART-11` | High | Mobile package has no signature block under `META-INF/` |
+| `ART-11` | High | Mobile package is unsigned, or `apksigner verify` rejects its signature |
 | `ART-12` | Critical | A config file (`.env`, `id_rsa`, `service-account.json`, `.npmrc`) is bundled inside the app package |
-| `ART-13` | Medium | Manifest references cleartext traffic |
-| `ART-14` | High | Manifest may mark the app debuggable |
+| `ART-13` | Medium | Decoded manifest allows cleartext traffic (explicitly, or by default below targetSdk 28) |
+| `ART-14` | High | Decoded manifest sets `android:debuggable="true"` |
 | `ART-15` | Critical–Medium | A credential is embedded in packaged assets, resources or code sections |
 
 ## Investigation Protocol
@@ -89,7 +89,7 @@ An `.apk` or `.aab` is a zip archive that anyone can download from the store and
 
 ### 5. Report honestly
 
-Every `ART-01` is **CONFIRMED** — the value is demonstrably in both places; do not downgrade it. `ART-13` and `ART-14` are derived from strings inside binary XML, so report them as **MANUAL_REVIEW** unless you can decode the manifest properly. Never state a leak is exploited; state it is exposed.
+Every `ART-01` is **CONFIRMED** — the value is demonstrably in both places; do not downgrade it. `ART-13` and `ART-14` are read from the decoded binary manifest; one at `LOW` confidence takes its value from a resource, so report it as **MANUAL_REVIEW**. An `ART-10` saying the signature was not cryptographically verified means `apksigner` was not available - run `apksigner verify --print-certs` yourself before calling the package signed. Never state a leak is exploited; state it is exposed.
 
 ## The Rotation Rule
 

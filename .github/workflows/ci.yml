@@ -24,10 +24,10 @@ jobs:
             os: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -42,15 +42,50 @@ jobs:
       - name: Run unit tests
         run: python3 -B -m unittest discover -s tests -v
 
+      - name: Self-scan (the scanner must pass its own gate)
+        run: python3 scripts/aegis_scan.py . --fail-on-high --quiet
+
+  release-gate:
+    # Unit tests show the code does what its tests say. This shows the strict release
+    # profile reaches the right verdict AND exit code on controlled projects - a clean one
+    # must pass, and vulnerable, review-required and incomplete ones must each fail - and
+    # that every rule fires on its vulnerable corpus case and stays silent on its safe one.
+    name: Release Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Release profile on controlled fixtures (exact verdict and exit code)
+        run: python3 -B tests/release_gate/run.py
+
+      - name: Matched vulnerable/safe corpus for every rule
+        env:
+          AEGIS_CORPUS_REPORT: corpus-report.json
+        run: python3 -B -m unittest tests.test_scanner.TestCorpus -v
+
+      - name: Upload corpus report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: corpus-report
+          path: corpus-report.json
+          if-no-files-found: error
+
   installer:
     name: Installer Smoke Test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
@@ -101,7 +136,13 @@ jobs:
           done
 
       - name: Run installed scanner against the installed project
-        run: python3 /tmp/test-app/.aegis/scripts/aegis_scan.py /tmp/test-app
+        run: |
+          set -e
+          # The installer adds no application code: give the scan a source file to read,
+          # and fail the step if the installed scanner blocks a clean project.
+          mkdir -p /tmp/test-app/src
+          printf 'export function add(a: number, b: number): number {\n  return a + b;\n}\n' > /tmp/test-app/src/index.ts
+          python3 /tmp/test-app/.aegis/scripts/aegis_scan.py /tmp/test-app --fail-on-high
 
       - name: Verify the new deep-analysis stages run end to end
         run: |
@@ -166,27 +207,41 @@ jobs:
           sys.path.insert(0, "scripts")
           import aegis_scan as a
 
+          # Assert against the module's own constants, never a literal verdict string.
+          # Checks 2 and 3 used to read `!= "READY TO PUBLISH"`. When that string was
+          # retired they became VACUOUSLY TRUE and stopped guarding anything - they
+          # would have passed even with the contract completely broken. A guard that
+          # cannot fail is not a guard.
+          PASS = a.VERDICT_STATIC_OK
+          GAP = a.VERDICT_INCOMPLETE
+
           # 1. An empty directory must never certify.
           with tempfile.TemporaryDirectory() as t:
               f, n = a.scan_repository(Path(t))
           score, verdict = a.compute_readiness_score(f, scanned_files=n)
-          assert n == 0 and score == 0 and verdict.startswith("INCOMPLETE_SCAN"), verdict
+          assert n == 0 and score == 0 and verdict.startswith(GAP), verdict
 
           # 2. The reported isolation call must never certify.
           f = a.check_dependency_vulnerabilities([("PyPI", "Django", "2.2.0")], offline=True)
-          assert a.compute_readiness_score(f)[1] != "READY TO PUBLISH"
+          verdict = a.compute_readiness_score(f)[1]
+          assert verdict.startswith(GAP), verdict
 
           # 3. A hand-built -00 with no markers must never certify.
           bare = a.Finding("DEP-00", "SUPPLY_CHAIN", "LOW", "Skipped", "deps", 0,
                            "x", "Informational", "re-run")
-          assert a.compute_readiness_score([bare])[1] != "READY TO PUBLISH"
+          verdict = a.compute_readiness_score([bare])[1]
+          assert verdict.startswith(GAP), verdict
 
           # 4. A genuinely clean repo must still pass, or the gate is useless.
           with tempfile.TemporaryDirectory() as t:
-              (Path(t) / "ok.js").write_text("export const add=(a,b)=>a+b;\n", encoding="utf-8")
+              (Path(t) / "ok.js").write_text("export const add=(a,b)=>a+b;", encoding="utf-8")
               f, n = a.scan_repository(Path(t))
-          assert a.compute_readiness_score(f, scanned_files=n) == (100, "READY TO PUBLISH")
-          print("Fail-closed contract holds on all four paths.")
+          score, verdict = a.compute_readiness_score(f, scanned_files=n)
+          assert score == 100 and verdict.startswith(PASS), verdict
+
+          # 5. A static scan must never claim RELEASE readiness.
+          assert a.VERDICT_RELEASE_OK not in verdict, verdict
+          print("Fail-closed contract holds on all five paths.")
           PY
 
       - name: Verify the installer is idempotent
@@ -209,7 +264,9 @@ jobs:
       - name: Validate JSON report against schema
         run: |
           set -e
-          python3 scripts/aegis_scan.py . --json --output /tmp/scan-report.json > /dev/null
+          # --include-tests: the repository's own code is clean, so the deliberately
+          # vulnerable corpus supplies the findings whose fields this step checks.
+          python3 scripts/aegis_scan.py . --include-tests --offline --json --output /tmp/scan-report.json > /dev/null
           python3 - <<'PY'
           import json, sys
           report = json.load(open("/tmp/scan-report.json"))
@@ -218,6 +275,9 @@ jobs:
           missing = [k for k in required if k not in report]
           if missing:
               print(f"::error::Report is missing required schema keys: {missing}")
+              sys.exit(1)
+          if not report["findings"]:
+              print("::error::No findings to validate - the schema check would be vacuous")
               sys.exit(1)
           for f in report["findings"]:
               fmissing = [k for k in schema["$defs"]["finding"]["required"] if k not in f]
