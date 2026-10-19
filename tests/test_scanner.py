@@ -2328,6 +2328,8 @@ class TestDocumentationMatchesTheScanner(unittest.TestCase):
                    "schemas/scan-report.schema.json", "scripts/build_llms_full.py"]
     USER_FACING_DIRS = ["skills", "docs", "adapters"]
     RETIRED_VERDICTS = ("READY TO PUBLISH", "NEEDS REVIEW", "VERIFIED_PARTIAL")
+    # redact() kept the first 6 and last 4 characters until 2.7.0; it now keeps none.
+    RETIRED_REDACTION = re.compile(r"(?i)first\s+(?:6|six)\b.{0,20}?last\s+(?:4|four)\b", re.S)
 
     def _read(self, rel):
         return (REPO_ROOT / rel).read_text(encoding="utf-8")
@@ -2344,6 +2346,11 @@ class TestDocumentationMatchesTheScanner(unittest.TestCase):
                  for v in self.RETIRED_VERDICTS
                  if v in p.read_text(encoding="utf-8", errors="ignore")]
         self.assertEqual(stale, [], "documents a verdict the scanner can no longer return")
+
+    def test_no_retired_redaction_claim_is_documented(self):
+        stale = [p.relative_to(REPO_ROOT).as_posix() for p in self._user_facing_files()
+                 if self.RETIRED_REDACTION.search(p.read_text(encoding="utf-8", errors="ignore"))]
+        self.assertEqual(stale, [], "still claims redaction keeps the first 6 and last 4 characters")
 
     def test_every_verdict_is_documented(self):
         readme, schema = self._read("README.md"), self._read("schemas/scan-report.schema.json")
