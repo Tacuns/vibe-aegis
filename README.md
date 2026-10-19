@@ -231,7 +231,8 @@ as *"semgrep found nothing"*. Valid JSON is not enough: semgrep exits `2` on a b
 missing path and still prints a well-formed, empty result. Each engine's accepted exit
 statuses were observed on the real binary (`osv-scanner` exits `1` when it finds
 vulnerabilities, and `128` - a gap - when it finds no packages); a semgrep run that lists
-`errors` is a partial run and a gap too.
+`errors` is a partial run and a gap too. So is output that parses but lacks the fields the
+engine's real output always has - `{}` is not a clean scan.
 
 | Argument | Description |
 | :--- | :--- |

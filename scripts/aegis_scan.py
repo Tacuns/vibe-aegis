@@ -1434,6 +1434,21 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
 
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        # os.walk() never descends into a symlinked directory. One whose target is inside
+        # the repository is scanned at its real path; one that points out of it was
+        # skipped with no record, so its code went unexamined while the scan looked whole.
+        for d in dirnames:
+            dpath = Path(dirpath) / d
+            if dpath.is_symlink() and _escapes(root, dpath):
+                try:
+                    drel = dpath.relative_to(root).as_posix()
+                except ValueError:
+                    drel = dpath.as_posix()
+                if only_files is None or any(f.startswith(drel + "/") for f in only_files):
+                    ledger.record("symlinked directory pointing outside the repository - not followed",
+                                  drel + "/",
+                                  detail="Its contents were not read. Replace the link with the "
+                                         "directory itself, or scan the target separately.")
         for fname in filenames:
             fpath = Path(dirpath) / fname
             ext = fpath.suffix.lower()
@@ -1488,12 +1503,13 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
 
             scanned_files += 1
             lines = text.splitlines()
-            # Match against code only. Commented-out code is not running code,
-            # and `lines` still holds the original text for evidence snippets.
-            text = mask_comments(text, ext)
-
-            # Phase 2: high-confidence credential detection (provider formats + entropy)
+            # Phase 2: high-confidence credential detection (provider formats + entropy),
+            # on the ORIGINAL text. A key in a comment is committed exactly like a key in
+            # code; masking comments first hid `// old prod key: sk_live_...` entirely.
             findings.extend(scan_secrets_in_text(rel_path, text, ledger=ledger))
+            # Everything else matches against code only. Commented-out code is not running
+            # code, and `lines` still holds the original text for evidence snippets.
+            text = mask_comments(text, ext)
             # Phase 5: follow untrusted request data to dangerous sinks
             findings.extend(analyze_data_flow(rel_path, ext, text))
 
@@ -2479,7 +2495,20 @@ def dependency_coverage_gaps(root: Path) -> List[Finding]:
     engines = ("Use a dedicated scanner for these (`--engine osv-scanner` or "
                "`--engine trivy`), which reads far more formats.")
     gaps: List[Finding] = []
-    unsupported = [n for n in UNSUPPORTED_MANIFESTS if (root / n).is_file()]
+
+    def present(name: str) -> bool:
+        # The same test parse_dependencies() applies: a manifest that links out of the
+        # repository is not read, so it must not count as present either.
+        p = root / name
+        return p.is_file() and not _escapes(root, p)
+
+    linked = [n for n in SUPPORTED_MANIFESTS + UNSUPPORTED_MANIFESTS
+              if (root / n).is_file() and _escapes(root, root / n)]
+    if linked:
+        gaps.append(gap("Dependency Manifest Links Outside The Repository", linked[0],
+                        "Not read, so none of their packages were checked: " + ", ".join(linked),
+                        "Commit the real manifest instead of a symlink to it."))
+    unsupported = [n for n in UNSUPPORTED_MANIFESTS if present(n)]
     if unsupported:
         gaps.append(gap("Dependency Manifest Format Not Supported", unsupported[0],
                         "Not read, so none of their packages were checked: "
@@ -2500,7 +2529,7 @@ def dependency_coverage_gaps(root: Path) -> List[Finding]:
                         "Only root-level manifests are parsed. Scan each package directory "
                         "separately, or " + engines[0].lower() + engines[1:]))
 
-    if (root / "package.json").is_file() and not (root / "package-lock.json").is_file():
+    if present("package.json") and not present("package-lock.json"):
         gaps.append(gap("npm Versions Taken From Ranges, Not Installed Versions",
                         "package.json", "No package-lock.json, so each version was read "
                         "from a semver range (^4.17.0 is queried as 4.17.0) rather than the "
@@ -2508,7 +2537,7 @@ def dependency_coverage_gaps(root: Path) -> List[Finding]:
                         "Commit a package-lock.json, or " + engines[0].lower() + engines[1:]))
 
     req = root / "requirements.txt"
-    if req.is_file():
+    if present("requirements.txt"):
         unpinned = [ln.strip() for ln in req.read_text(encoding="utf-8", errors="ignore").splitlines()
                     if ln.strip() and not ln.strip().startswith("#")
                     and not re.match(r"^([A-Za-z0-9_.\-]+)\s*==\s*([0-9A-Za-z.\-]+)", ln.strip())]
@@ -2519,7 +2548,7 @@ def dependency_coverage_gaps(root: Path) -> List[Finding]:
                             "Pin exact versions (pip freeze, or pip-compile), or "
                             + engines[0].lower() + engines[1:]))
 
-    if not unsupported and not nested and not any((root / n).is_file() for n in SUPPORTED_MANIFESTS):
+    if not unsupported and not nested and not linked and not any(present(n) for n in SUPPORTED_MANIFESTS):
         gaps.append(gap("No Dependency Manifest Found", "(repository)",
                         "No manifest or lockfile was found, so no dependency was checked.",
                         "If the project has dependencies, commit their lockfile. "
@@ -2724,7 +2753,7 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=25, context=ssl.create_default_context()) as resp:
-            results = json.loads(resp.read().decode("utf-8")).get("results", [])
+            payload = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
         findings.append(
             Finding(
@@ -2739,6 +2768,33 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
                     status="SKIPPED",
             )
         )
+        return findings
+
+    # The batch API answers with one result per query, in order (an empty object means
+    # "no advisories"). `zip()` stops at the shorter list, so a missing or short
+    # `results` once left the unmatched packages unchecked - and reported nothing. Any
+    # answer that is not exactly that shape is a coverage gap, never a clean result.
+    results = payload.get("results") if isinstance(payload, dict) else None
+    problem = None
+    if not isinstance(results, list):
+        problem = "the response has no `results` list"
+    elif len(results) != len(batch):
+        problem = f"{len(results)} result(s) came back for {len(batch)} queried package(s)"
+    elif not all(isinstance(r, dict) and isinstance(r.get("vulns", []), list)
+                 and all(isinstance(v, dict) and v.get("id") for v in r.get("vulns", []))
+                 for r in results):
+        problem = "a result is not in the documented shape"
+    elif any(r.get("next_page_token") for r in results):
+        problem = "a package has more advisories than one response holds (next_page_token)"
+    if problem:
+        findings.append(Finding(
+            rule_id="DEP-00", domain="SUPPLY_CHAIN", severity="LOW",
+            title="OSV Response Did Not Match The Query",
+            file="dependencies", line=0,
+            snippet=evidence(f"{problem}, so the dependencies were not reliably checked.", 300),
+            cwe_or_standard="Coverage",
+            remediation="Re-run; if it persists, use `--engine osv-scanner` for this stage.",
+            confidence="HIGH", kind="skipped_check", status="SKIPPED"))
         return findings
 
     # Each advisory's severity comes from its own record (see osv_record_severity).
@@ -4162,6 +4218,29 @@ def _relative_to(root: Path, findings: List[Finding]) -> List[Finding]:
     return findings
 
 
+def _engine_shape_problem(name: str, payload) -> Optional[str]:
+    """Why `payload` is not a result of `name`, or None. Each requirement is what the
+    real binary emits on a clean scan (observed: semgrep 1.99, gitleaks 8, trivy, osv-
+    scanner 2.2). trivy omits `Results` when it finds nothing, so only its header is
+    required. scorecard could not be run here, so its documented `checks` list is."""
+    def is_list(obj, key):
+        return isinstance(obj, dict) and isinstance(obj.get(key), list)
+    if name == "semgrep":
+        ok = is_list(payload, "results") and isinstance(payload.get("errors", []), list)
+        return None if ok else "no `results` list"
+    if name == "gitleaks":
+        return None if isinstance(payload, list) else "not a JSON array of findings"
+    if name == "trivy":
+        ok = (isinstance(payload, dict) and isinstance(payload.get("SchemaVersion"), int)
+              and "ArtifactName" in payload and isinstance(payload.get("Results", []), list))
+        return None if ok else "no trivy report header (SchemaVersion, ArtifactName)"
+    if name == "osv-scanner":
+        return None if is_list(payload, "results") else "no `results` list"
+    if name == "scorecard":
+        return None if is_list(payload, "checks") else "no `checks` list"
+    return None
+
+
 def run_engine(name: str, root: Path, timeout: int = 600) -> Tuple[List[Finding], Optional[Finding]]:
     """Run one installed engine. Returns (findings, gap_or_None).
 
@@ -4228,6 +4307,11 @@ def run_engine(name: str, root: Path, timeout: int = 600) -> Tuple[List[Finding]
         except Exception:
             return [], gap("engine output was not parseable JSON")
 
+    # Valid JSON is not a scan result: `{}` parsed into zero findings and read as a
+    # clean run. Each engine's output must have the fields its real binary emits.
+    shape_problem = _engine_shape_problem(name, payload)
+    if shape_problem:
+        return [], gap("engine output was not a scan result", shape_problem)
     try:
         found = _relative_to(root, ENGINE_PARSERS[name](payload))
     except Exception as exc:

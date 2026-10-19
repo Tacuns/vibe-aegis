@@ -239,6 +239,30 @@ Reproduced on this branch before each change; each has matched vulnerable and sa
 - **Firebase rules files were never read.** `SEC-02B` exists for `firestore.rules` and
   `storage.rules`, but `.rules` was not a scanned extension.
 
+### Fixed - second review: what the scanner examined versus what it assumed
+
+Five findings from a second review of this branch, each reproduced before it was changed.
+
+- **A credential inside a comment was invisible (HIGH).** Comments were masked before
+  secret detection, so `// old prod key: sk_live_...` produced nothing although it is
+  committed like any other line. Secret detection now reads the original text; the other
+  rules still ignore commented-out code.
+- **A directory symlink out of the repository was skipped silently (HIGH).** `os.walk()`
+  does not follow it, and nothing recorded that its contents were never read. It is now a
+  `COV-00` gap; a link that stays inside the repository is covered at its real path.
+- **An external dependency-manifest symlink counted as coverage (HIGH).** The parser
+  refused it, but the coverage check still counted it as present - and for
+  `requirements.txt` read it. Every manifest check now applies the same test, and such a
+  link is a `DEP-00` gap.
+- **A malformed OSV answer read as "no vulnerabilities" (HIGH).** A missing or short
+  `results` list was zipped against the query, dropping the unmatched packages; a
+  non-list `results` crashed the stage. The answer must now have exactly one well-formed
+  result per package (and no `next_page_token`), or it is a `DEP-00` gap.
+- **An engine printing `{}` read as a clean scan (HIGH).** Each engine's output must now
+  have the fields its real binary emits - checked against real clean and finding outputs
+  (a clean trivy scan omits `Results`, so only its header is required) - or it is an
+  `ENG-00` gap.
+
 ### Changed - GitHub Actions are pinned to commit SHAs
 
 This repository's CI and the workflow shipped in `adapters/github-actions/` used movable

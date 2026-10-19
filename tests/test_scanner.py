@@ -4519,3 +4519,139 @@ class TestSecretNamesInEveryCommonSpelling(unittest.TestCase):
             found, scanned = aegis_scan.scan_repository(Path(tmp))
         self.assertEqual(scanned, 1)
         self.assertIn("SEC-02B", {f.rule_id for f in found})
+
+
+# ---------------------------------------------------------------------------
+# Second review: what the scanner examined, and what it only assumed
+# ---------------------------------------------------------------------------
+
+class TestCommentedSecretsAreStillSecrets(unittest.TestCase):
+    """Comments were masked before secret detection, so a key in a comment vanished."""
+
+    def _ids(self, rel, code):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), rel, code)
+            found, _ = aegis_scan.scan_repository(Path(tmp))
+        return {f.rule_id for f in found}
+
+    def test_keys_in_line_block_and_hash_comments(self):
+        self.assertIn("SEC-01", self._ids("src/a.ts", "// old prod key: %s\nexport const on = true;\n" % STRIPE_KEY))
+        self.assertIn("SEC-01", self._ids("src/b.ts", '/* apiSecret = "%s" */\nexport const x = 1;\n' % ENTROPY_VALUE))
+        self.assertIn("SEC-01", self._ids("app/c.py", '# key = "%s"\nx = 1\n' % STRIPE_KEY))
+
+    def test_a_placeholder_in_a_comment_is_still_ignored(self):
+        self.assertNotIn("SEC-01", self._ids("src/a.ts", "// e.g. STRIPE_KEY=%s\nexport const on = true;\n" % ("sk_live_" + "x" * 24)))
+
+    def test_commented_out_code_still_does_not_fire_code_rules(self):
+        # Other rules keep ignoring comments: commented-out eval() is not running code.
+        self.assertNotIn("SEC-08", self._ids("src/a.ts", "// eval(userInput)\nexport const on = true;\n"))
+
+
+@unittest.skipIf(os.name == "nt", "creating symlinks needs extra privileges on Windows")
+class TestSymlinkedDirectoriesAreAccountedFor(unittest.TestCase):
+    """os.walk() skips symlinked directories; one pointing out of the repo left no trace."""
+
+    def test_an_external_directory_link_is_a_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, outside = Path(tmp) / "repo", Path(tmp) / "outside"
+            write(repo, "server.ts", "export const x = 1;\n")
+            write(outside, "api/h.ts", 'const k = "%s";\n' % STRIPE_KEY)
+            (repo / "src").mkdir()
+            os.symlink(outside / "api", repo / "src" / "api")
+            ledger = aegis_scan.CoverageLedger()
+            found, _ = aegis_scan.scan_repository(repo, ledger=ledger)
+        self.assertEqual([f for f in found if f.rule_id == "SEC-01"], [])
+        self.assertEqual([g.title for g in ledger.gaps()],
+                         ["Not Examined: symlinked directory pointing outside the repository - not followed (1 item(s))"])
+
+    def test_an_internal_directory_link_is_covered_at_its_real_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            write(repo, "lib/api/h.ts", 'const k = "%s";\n' % STRIPE_KEY)
+            (repo / "src").mkdir()
+            os.symlink(repo / "lib" / "api", repo / "src" / "api")
+            ledger = aegis_scan.CoverageLedger()
+            found, _ = aegis_scan.scan_repository(repo, ledger=ledger)
+        self.assertEqual({f.file for f in found if f.rule_id == "SEC-01"}, {"lib/api/h.ts"})
+        self.assertEqual(ledger.gaps(), [])
+
+
+@unittest.skipIf(os.name == "nt", "creating symlinks needs extra privileges on Windows")
+class TestDependencyManifestLinksAreGaps(unittest.TestCase):
+    """The parser refused an external manifest link; the coverage check counted it as present."""
+
+    def _gaps(self, names, content="django>=1.0\n"):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, outside = Path(tmp) / "repo", Path(tmp) / "outside"
+            repo.mkdir()
+            for name in names:
+                write(outside, name, content)
+                os.symlink(outside / name, repo / name)
+            return aegis_scan.parse_dependencies(repo), [g.title for g in aegis_scan.dependency_coverage_gaps(repo)]
+
+    def test_an_external_lockfile_is_a_gap_not_coverage(self):
+        deps, gaps = self._gaps(["package-lock.json"],
+                                '{"lockfileVersion":3,"packages":{"node_modules/x":{"version":"1.0.0"}}}')
+        self.assertEqual(deps, [])
+        self.assertEqual(gaps, ["Dependency Manifest Links Outside The Repository"])
+
+    def test_an_external_requirements_file_is_not_read(self):
+        _deps, gaps = self._gaps(["requirements.txt"])
+        self.assertEqual(gaps, ["Dependency Manifest Links Outside The Repository"])
+        self.assertNotIn("Unpinned Python Requirements Not Checked", gaps)
+
+    def test_a_real_manifest_is_unaffected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write(Path(tmp), "requirements.txt", "flask==3.0.3\n")
+            self.assertEqual(aegis_scan.dependency_coverage_gaps(Path(tmp)), [])
+
+
+class TestOsvResponseIsValidated(unittest.TestCase):
+    """zip() over a missing or short `results` list skipped packages silently."""
+
+    DEPS = [("npm", "a", "1.0.0"), ("npm", "b", "1.0.0"), ("npm", "c", "1.0.0")]
+
+    def _check(self, body):
+        real = aegis_scan.urllib.request.urlopen
+        aegis_scan.urllib.request.urlopen = lambda req, timeout=None, context=None: _FakeResponse({}, body)
+        try:
+            return aegis_scan.check_dependency_vulnerabilities(self.DEPS)
+        finally:
+            aegis_scan.urllib.request.urlopen = real
+
+    def test_malformed_answers_are_gaps(self):
+        for body in (b"{}", b'{"results": [{}]}', b'{"results": "x"}', b"[]",
+                     b'{"results": [{}, {}, {"vulns": "x"}]}',
+                     b'{"results": [{}, {}, {"vulns": [{}]}]}',
+                     b'{"results": [{}, {}, {"vulns": [{"id": "GHSA-1"}], "next_page_token": "t"}]}'):
+            found = self._check(body)
+            self.assertEqual([(f.rule_id, f.title) for f in found],
+                             [("DEP-00", "OSV Response Did Not Match The Query")], body)
+
+    def test_a_well_formed_clean_answer_is_clean(self):
+        self.assertEqual(self._check(b'{"results": [{}, {}, {}]}'), [])
+
+
+@unittest.skipIf(os.name == "nt", "stand-in engines are shell scripts")
+class TestEngineOutputMustBeAScanResult(unittest.TestCase):
+    """Valid JSON with the wrong shape (`{}`) parsed into zero findings and read as clean.
+    The accepted shapes were observed on the real binaries' clean and finding outputs."""
+
+    _run = TestEngineExitStatusIsChecked._run
+
+    def test_wrong_shapes_are_gaps(self):
+        for name, payload in (("semgrep", "{}"), ("semgrep", '{"results": "x"}'), ("trivy", "{}"),
+                              ("osv-scanner", "{}"), ("gitleaks", "{}"), ("scorecard", "{}")):
+            found, gap = self._run(name, "echo '%s'\n" % payload)
+            self.assertEqual(found, [], name)
+            self.assertIsNotNone(gap, (name, payload))
+            self.assertIn("not a scan result", gap.snippet)
+
+    def test_real_clean_shapes_are_accepted(self):
+        for name, payload in (("semgrep", '{"results": [], "errors": []}'),
+                              ("gitleaks", "[]"),
+                              ("trivy", '{"SchemaVersion": 2, "ArtifactName": "."}'),
+                              ("osv-scanner", '{"results": []}'),
+                              ("scorecard", '{"checks": []}')):
+            found, gap = self._run(name, "echo '%s'\n" % payload)
+            self.assertIsNone(gap, (name, gap and gap.snippet))
