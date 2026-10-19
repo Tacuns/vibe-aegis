@@ -350,11 +350,13 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(aegis_scan.compute_readiness_score([f("MEDIUM")])[0], 96)
         self.assertEqual(aegis_scan.compute_readiness_score([f("LOW")])[0], 99)
         self.assertTrue(aegis_scan.compute_readiness_score([f("HIGH")])[1].startswith("BLOCKED"))
-        self.assertTrue(aegis_scan.compute_readiness_score([f("LOW")])[1].startswith("READY"))
+        self.assertTrue(aegis_scan.compute_readiness_score([f("LOW")])[1]
+                        .startswith(aegis_scan.VERDICT_STATIC_OK))
         # Below 90 with no CRITICAL/HIGH is a polish problem, not a blocker.
         many_medium = [f("MEDIUM")] * 3
         self.assertEqual(aegis_scan.compute_readiness_score(many_medium)[0], 88)
-        self.assertTrue(aegis_scan.compute_readiness_score(many_medium)[1].startswith("NEEDS REVIEW"))
+        self.assertTrue(aegis_scan.compute_readiness_score(many_medium)[1]
+                        .startswith(aegis_scan.VERDICT_REVIEW))
 
 
 class TestPaymentsAndReliability(unittest.TestCase):
@@ -535,7 +537,8 @@ class TestCoverageVersusSeverity(unittest.TestCase):
         self.assertEqual(findings[0].kind, "skipped_check")
 
         score, verdict = aegis_scan.compute_readiness_score(findings)
-        self.assertFalse(verdict.startswith("READY"), f"still certifies an unrun audit: {verdict}")
+        self.assertFalse(verdict.startswith(aegis_scan.VERDICT_STATIC_OK),
+                         f"still certifies an unrun audit: {verdict}")
         self.assertIn("INCOMPLETE_SCAN", verdict)
 
     def test_skipped_checks_do_not_change_the_score(self):
@@ -570,18 +573,29 @@ class TestCoverageVersusSeverity(unittest.TestCase):
         _, verdict = aegis_scan.compute_readiness_score([self._real("CRITICAL"), self._skipped()])
         self.assertTrue(verdict.startswith("BLOCKED"), verdict)
 
-    def test_ready_requires_a_complete_audit(self):
-        """READY only when nothing was skipped."""
-        self.assertTrue(aegis_scan.compute_readiness_score([])[1].startswith("READY"))
-        self.assertIn("INCOMPLETE_SCAN",
+    def test_a_passing_state_requires_a_complete_audit(self):
+        """A pass only when nothing was skipped - and it is a STATIC pass, not a release one."""
+        self.assertTrue(aegis_scan.compute_readiness_score([])[1]
+                        .startswith(aegis_scan.VERDICT_STATIC_OK))
+        self.assertIn("INCOMPLETE",
                       aegis_scan.compute_readiness_score([self._skipped()])[1])
+
+    def test_a_source_scan_never_claims_release_readiness(self):
+        """Reading source says nothing about lockfiles, history, bundles or deployments."""
+        _, verdict = aegis_scan.compute_readiness_score([])
+        self.assertNotIn(aegis_scan.VERDICT_RELEASE_OK, verdict)
+        self.assertIn("NOT a release-readiness verdict", verdict)
+
+    def test_release_audit_state_requires_the_release_profile(self):
+        _, verdict = aegis_scan.compute_readiness_score([], release_audit=True)
+        self.assertTrue(verdict.startswith(aegis_scan.VERDICT_RELEASE_OK))
 
     def test_verdict_names_the_check_that_was_missed(self):
         """Telling someone the audit is incomplete is useless without saying which part."""
         _, verdict = aegis_scan.compute_readiness_score(
             [self._skipped(title="Dependency Vulnerability Check Skipped")])
         self.assertIn("Dependency Vulnerability Check Skipped", verdict)
-        self.assertNotIn("READY TO PUBLISH", verdict)
+        self.assertNotIn(aegis_scan.VERDICT_STATIC_OK, verdict)
 
     def test_report_separates_skipped_from_findings(self):
         """End-to-end: the JSON must not bury a coverage gap in the findings list."""
@@ -737,7 +751,7 @@ class TestFailClosedIsolation(unittest.TestCase):
         self.assertEqual(findings[0].status, "SKIPPED")
 
         _, verdict = aegis_scan.compute_readiness_score(findings)
-        self.assertNotEqual(verdict, "READY TO PUBLISH")
+        self.assertNotEqual(verdict, aegis_scan.VERDICT_STATIC_OK, verdict.split(" (")[0])
         self.assertIn("INCOMPLETE_SCAN", verdict)
 
     def test_bare_dep00_without_markers_still_fails_closed(self):
@@ -750,13 +764,13 @@ class TestFailClosedIsolation(unittest.TestCase):
                                   "dependencies", 0, "x", "Informational", "re-run")
         self.assertEqual(bare.status, "VULNERABILITY")   # no marker set
         _, verdict = aegis_scan.compute_readiness_score([bare])
-        self.assertNotEqual(verdict, "READY TO PUBLISH")
+        self.assertNotEqual(verdict, aegis_scan.VERDICT_STATIC_OK, verdict.split(" (")[0])
 
     def test_live00_also_fails_closed(self):
         bare = aegis_scan.Finding("LIVE-00", "SECURITY", "LOW", "Unreachable",
                                   "http://x", 0, "x", "Live Deployment Check", "start the server")
         _, verdict = aegis_scan.compute_readiness_score([bare])
-        self.assertNotEqual(verdict, "READY TO PUBLISH")
+        self.assertNotEqual(verdict, aegis_scan.VERDICT_STATIC_OK, verdict.split(" (")[0])
 
     def test_git00_emitted_when_history_cannot_be_checked(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -764,7 +778,7 @@ class TestFailClosedIsolation(unittest.TestCase):
         self.assertEqual([f.rule_id for f in findings], ["GIT-00"])
         self.assertEqual(findings[0].status, "SKIPPED")
         _, verdict = aegis_scan.compute_readiness_score(findings)
-        self.assertNotEqual(verdict, "READY TO PUBLISH")
+        self.assertNotEqual(verdict, aegis_scan.VERDICT_STATIC_OK, verdict.split(" (")[0])
 
     def test_zero_scanned_files_fails_closed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -783,13 +797,15 @@ class TestFailClosedIsolation(unittest.TestCase):
         self.assertGreater(scanned, 0)
         score, verdict = aegis_scan.compute_readiness_score(findings, scanned_files=scanned)
         self.assertEqual(score, 100)
-        self.assertEqual(verdict, "READY TO PUBLISH")
+        self.assertTrue(verdict.startswith(aegis_scan.VERDICT_STATIC_OK), verdict)
 
     def test_allow_skipped_is_an_explicit_opt_in(self):
         findings = aegis_scan.check_dependency_vulnerabilities([("PyPI", "x", "1.0")], offline=True)
-        self.assertNotEqual(aegis_scan.compute_readiness_score(findings)[1], "READY TO PUBLISH")
-        self.assertEqual(
-            aegis_scan.compute_readiness_score(findings, allow_skipped=True)[1], "READY TO PUBLISH")
+        self.assertFalse(aegis_scan.compute_readiness_score(findings)[1]
+                         .startswith(aegis_scan.VERDICT_STATIC_OK))
+        self.assertTrue(
+            aegis_scan.compute_readiness_score(findings, allow_skipped=True)[1]
+            .startswith(aegis_scan.VERDICT_STATIC_OK))
 
     def test_skipped_checks_argument_is_honoured(self):
         skipped = [aegis_scan.Finding("DEP-00", "SUPPLY_CHAIN", "LOW", "Skipped", "deps", 0,

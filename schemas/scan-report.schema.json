@@ -72,7 +72,7 @@
       "maximum": 100
     },
     "release_verdict": {
-      "description": "Fail-closed release gate. One of: 'INCOMPLETE_SCAN (...)' when no source files were scanned; 'BLOCKED (...)' when any CRITICAL/HIGH is open; 'VERIFIED_PARTIAL - INCOMPLETE_SCAN (...)' when any check was skipped or errored; 'NEEDS REVIEW (...)' below 90; 'READY TO PUBLISH' only when files were scanned, nothing was skipped, there are no CRITICAL/HIGH findings and the score is >= 90.",
+      "description": "One of BLOCKED, INCOMPLETE_SCAN, REVIEW_REQUIRED, STATIC_CHECKS_PASSED or RELEASE_AUDIT_PASSED, followed by an explanation in parentheses. STATIC_CHECKS_PASSED is NOT a release-readiness claim: only --profile release, with every release stage actually completed, can return RELEASE_AUDIT_PASSED.",
       "type": "string",
       "minLength": 1,
       "examples": [
@@ -197,6 +197,14 @@
         },
         "note": {
           "type": "string"
+        },
+        "items_not_examined": {
+          "type": "integer",
+          "description": "How many files, lines or packages the scanner declined to read."
+        },
+        "not_examined": {
+          "type": "object",
+          "description": "Reason -> {count, examples, material}. A material skip is one that could plausibly have hidden a finding, and raises a COV-00 gap."
         }
       }
     },
@@ -234,7 +242,7 @@
           "pattern": "^(SEC|UX|LIVE|DEP|ART|HIST|GIT|FLOW|PAY|REL)-[0-9]{2}[A-Z]?$"
         },
         "domain": {
-          "description": "Which analysis stage produced this finding.",
+          "description": "COVERAGE marks something that was not examined, not a defect. EXTERNAL marks a finding imported from an installed third-party engine, which keeps that engine's own rule id behind an EXT-<ENGINE>: prefix.",
           "enum": [
             "SECURITY",
             "UI_UX",
@@ -243,7 +251,9 @@
             "SUPPLY_CHAIN",
             "ARTIFACT",
             "HISTORY",
-            "DATAFLOW"
+            "DATAFLOW",
+            "COVERAGE",
+            "EXTERNAL"
           ]
         },
         "severity": {

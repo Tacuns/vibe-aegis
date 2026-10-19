@@ -64,6 +64,73 @@ class Finding:
     status: str = "VULNERABILITY"  # VULNERABILITY | SKIPPED | SCAN_ERROR
 
 
+class CoverageLedger:
+    """Every byte the scanner chose not to read, recorded and reported.
+
+    A scanner skips things constantly - a file over the size cap, an unreadable
+    encoding, a minified bundle, a dependency list past the API batch limit. Each skip
+    was previously a bare `continue`, so the output said "nothing found" about regions
+    that were never opened. That is the same fail-open the readiness contract exists to
+    prevent, one level down: silence about what was not examined.
+
+    A skip is `material` when a real finding could plausibly have been inside it - an
+    oversized source file, a truncated dependency batch. Immaterial skips (a `.png`,
+    a `node_modules` directory) are counted for the report but raise no gap, or every
+    scan would be permanently INCOMPLETE and the signal would be worthless.
+    """
+
+    __slots__ = ("_skips",)
+
+    def __init__(self) -> None:
+        self._skips: Dict[str, Dict] = {}
+
+    def record(self, reason: str, path: str, *, material: bool = True,
+               detail: str = "") -> None:
+        entry = self._skips.setdefault(
+            reason, {"count": 0, "examples": [], "material": material, "detail": detail})
+        entry["count"] += 1
+        if len(entry["examples"]) < 5:
+            entry["examples"].append(path)
+
+    def as_dict(self) -> Dict:
+        return {
+            reason: {"count": e["count"], "examples": e["examples"],
+                     "material": e["material"]}
+            for reason, e in sorted(self._skips.items())
+        }
+
+    def total(self) -> int:
+        return sum(e["count"] for e in self._skips.values())
+
+    def material_total(self) -> int:
+        return sum(e["count"] for e in self._skips.values() if e["material"])
+
+    def gaps(self) -> List["Finding"]:
+        """One coverage gap per material reason, so the gate can see them."""
+        out: List[Finding] = []
+        for reason, e in sorted(self._skips.items()):
+            if not e["material"]:
+                continue
+            examples = ", ".join(e["examples"][:3])
+            out.append(Finding(
+                rule_id="COV-00",
+                domain="COVERAGE",
+                severity="LOW",
+                title=f"Not Examined: {reason} ({e['count']} item(s))",
+                file=e["examples"][0] if e["examples"] else "(repository)",
+                line=0,
+                snippet=f"{e['count']} item(s) were not inspected. Examples: {examples}",
+                cwe_or_standard="Coverage",
+                remediation=(e["detail"] or
+                             "These were not read, so no conclusion about them is possible. "
+                             "Re-run with the relevant limit raised, or review them by hand."),
+                confidence="HIGH",
+                kind="skipped_check",
+                status="SKIPPED",
+            ))
+        return out
+
+
 # ---------------------------------------------------------------------------
 # Regex Pattern Definitions: Security (Low -> Critical)
 # ---------------------------------------------------------------------------
@@ -914,9 +981,12 @@ def check_contextual_file_rules(rel_path: str, ext: str, text: str) -> List[Find
 
 
 def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
-                    include_tests: bool = False) -> Tuple[List[Finding], int]:
+                    include_tests: bool = False,
+                    ledger: Optional[CoverageLedger] = None,
+                    max_file_bytes: int = 1_500_000) -> Tuple[List[Finding], int]:
     findings: List[Finding] = []
     scanned_files = 0
+    ledger = ledger if ledger is not None else CoverageLedger()
 
     # Check if .env is tracked or missing from .gitignore
     gitignore_path = root / ".gitignore"
@@ -945,13 +1015,32 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
             ext = fpath.suffix.lower()
             if ext not in CODE_EXTENSIONS and not fname.startswith(".env"):
                 continue
+            try:
+                rel_for_log = fpath.relative_to(root).as_posix()
+            except ValueError:
+                rel_for_log = fpath.as_posix()
+
             if fname.endswith((".min.js", ".min.css", ".lock", "package-lock.json", "pnpm-lock.yaml")):
+                # Minified bundles and lockfiles are excluded for noise, but a bundle is
+                # exactly where a build-inlined credential ends up. Say so rather than
+                # implying it was checked and found clean.
+                ledger.record("minified bundle or lockfile not scanned", rel_for_log,
+                              material=fname.endswith((".min.js", ".min.css")),
+                              detail="Use `--artifact <dir>` to inspect built bundles, which "
+                                     "cross-references credentials found in your source.")
                 continue
             try:
-                if fpath.stat().st_size > 1_500_000:
+                size = fpath.stat().st_size
+                if size > max_file_bytes:
+                    ledger.record(
+                        f"file larger than {max_file_bytes // 1000}kB", rel_for_log,
+                        detail="Raise the cap with `--max-file-size` to include it.")
                     continue
                 text = fpath.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
+            except Exception as exc:
+                ledger.record("file could not be read", rel_for_log,
+                              detail=f"Read error: {type(exc).__name__}. Check permissions "
+                                     f"and encoding.")
                 continue
 
             rel_path = fpath.relative_to(root).as_posix()  # POSIX separators so path rules match on Windows too
@@ -968,7 +1057,7 @@ def scan_repository(root: Path, only_files: Optional[Set[str]] = None,
             text = mask_comments(text, ext)
 
             # Phase 2: high-confidence credential detection (provider formats + entropy)
-            findings.extend(scan_secrets_in_text(rel_path, text))
+            findings.extend(scan_secrets_in_text(rel_path, text, ledger=ledger))
             # Phase 5: follow untrusted request data to dangerous sinks
             findings.extend(analyze_data_flow(rel_path, ext, text))
 
@@ -1316,6 +1405,9 @@ SECRET_ASSIGNMENT = re.compile(
 )
 
 
+LONG_LINE_LIMIT = 4000
+
+
 def shannon_entropy(value: str) -> float:
     """Bits of entropy per character. Random credentials sit well above prose."""
     if not value:
@@ -1350,7 +1442,8 @@ def is_test_context(rel_path: str) -> bool:
     )
 
 
-def scan_secrets_in_text(rel_path: str, text: str, origin: str = "source") -> List[Finding]:
+def scan_secrets_in_text(rel_path: str, text: str, origin: str = "source",
+                         ledger: Optional["CoverageLedger"] = None) -> List[Finding]:
     """Phase 2 secret hunting. Used for source files, git history and build artifacts."""
     findings: List[Finding] = []
     lines = text.splitlines()
@@ -1358,7 +1451,36 @@ def scan_secrets_in_text(rel_path: str, text: str, origin: str = "source") -> Li
     seen: Set[Tuple[str, int]] = set()
 
     for idx, line in enumerate(lines, 1):
-        if len(line) > 4000:
+        if len(line) > LONG_LINE_LIMIT:
+            # A single 4000+ character line is almost always generated or bundled
+            # output - which is precisely where a build-inlined credential hides.
+            # The provider patterns are anchored and cheap, so scan the line for those
+            # and skip only the expensive entropy pass, recording that we did so.
+            for label, severity, pattern in PROVIDER_SECRETS:
+                m = pattern.search(line)
+                if not m or looks_like_placeholder(m.group(0)):
+                    continue
+                key = (label, idx)
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(Finding(
+                    rule_id="SEC-01", domain="SECURITY",
+                    severity="MEDIUM" if testish and severity != "MEDIUM" else severity,
+                    title=f"{label} Found In {origin.title()} ({rel_path})",
+                    file=rel_path, line=idx, snippet=redact(m.group(0)),
+                    cwe_or_standard="CWE-798 Hard-Coded Credentials / OWASP A07",
+                    remediation=(f"Revoke and rotate this {label} immediately - it must be "
+                                 "assumed compromised. Move it to a server-only environment "
+                                 "variable and never expose it to a client bundle."),
+                    confidence="HIGH",
+                ))
+            if ledger is not None:
+                ledger.record(
+                    f"line longer than {LONG_LINE_LIMIT} chars - entropy analysis skipped",
+                    f"{rel_path}:{idx}",
+                    detail=("Known credential formats were still matched on these lines; "
+                            "only the high-entropy heuristic was skipped."))
             continue
 
         # 2a. Known provider key formats - highest confidence available.
@@ -1633,7 +1755,24 @@ def check_dependency_vulnerabilities(deps: List[Tuple[str, str, str]], offline: 
         return findings
 
     SEVERITY_FROM_CVSS = [(9.0, "CRITICAL"), (7.0, "HIGH"), (4.0, "MEDIUM"), (0.0, "LOW")]
-    batch = [{"package": {"name": n, "ecosystem": e}, "version": v} for e, n, v in deps[:800]]
+    OSV_BATCH_LIMIT = 800
+    if len(deps) > OSV_BATCH_LIMIT:
+        # Silently querying the first 800 and reporting "no known vulnerabilities"
+        # certifies the rest without looking. Say which packages were left out.
+        findings.append(Finding(
+            rule_id="DEP-00", domain="SUPPLY_CHAIN", severity="LOW",
+            title=f"Dependency Scan Truncated At {OSV_BATCH_LIMIT} Packages",
+            file="dependencies", line=0,
+            snippet=(f"{len(deps)} dependencies were parsed but only the first "
+                     f"{OSV_BATCH_LIMIT} were queried against OSV. The remaining "
+                     f"{len(deps) - OSV_BATCH_LIMIT} were NOT checked."),
+            cwe_or_standard="Coverage",
+            remediation=("Split the scan per manifest, or use a dedicated scanner "
+                         "(`--engine osv-scanner` / `--engine trivy`) for large dependency sets."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED",
+        ))
+    batch = [{"package": {"name": n, "ecosystem": e}, "version": v}
+             for e, n, v in deps[:OSV_BATCH_LIMIT]]
 
     try:
         req = urllib.request.Request(
@@ -2206,6 +2345,276 @@ def analyze_data_flow(rel_path: str, ext: str, text: str) -> List[Finding]:
 # day two. The baseline records what already existed so the team only sees what
 # they just introduced.
 
+# ---------------------------------------------------------------------------
+# Optional External Engine Adapters
+# ---------------------------------------------------------------------------
+# Vibe Aegis stays useful with nothing installed. These adapters let it ALSO use a
+# mature engine when the user already has one, without ever bundling, vendoring,
+# downloading or installing it.
+#
+# Three rules, and they are not negotiable:
+#
+#   1. Never auto-install. We probe PATH and nothing else. A missing engine is a
+#      COVERAGE GAP, never a silent pass - "semgrep was not run" and "semgrep found
+#      nothing" are different statements and the report makes that distinction.
+#   2. Never claim another tool's output as our own. Every imported finding is tagged
+#      with the engine that produced it and keeps that engine's own rule id.
+#   3. Anything that touches a network target requires explicit authorization.
+#
+# Licensing: we invoke installed binaries through their documented CLI and read their
+# documented output. No code from these projects is copied into this file, and running
+# a program you installed yourself imposes no licence obligation on this scanner. The
+# table records each project's licence so users can check their own obligations.
+
+ENGINE_SPECS: Dict[str, Dict[str, str]] = {
+    "semgrep": {
+        "bin": "semgrep", "licence": "LGPL-2.1-only (CLI)",
+        "role": "Multi-language AST pattern analysis",
+        "note": "Deeper than regex: real syntax trees per language.",
+    },
+    "gitleaks": {
+        "bin": "gitleaks", "licence": "MIT",
+        "role": "Secret detection across full git history",
+        "note": "Scans every commit, not just the working tree.",
+    },
+    "trivy": {
+        "bin": "trivy", "licence": "Apache-2.0",
+        "role": "Dependency, container, IaC and licence scanning",
+        "note": "Far broader dependency coverage than our OSV batch query.",
+    },
+    "osv-scanner": {
+        "bin": "osv-scanner", "licence": "Apache-2.0",
+        "role": "Lockfile-accurate vulnerability scanning",
+        "note": "Resolves transitive dependencies we cannot see from a manifest.",
+    },
+    "scorecard": {
+        "bin": "scorecard", "licence": "Apache-2.0",
+        "role": "Supply-chain posture of the repository itself",
+        "note": "Branch protection, signed releases, CI hardening, maintenance.",
+    },
+    "codeql": {
+        "bin": "codeql", "licence": "GitHub CodeQL Terms (restricted for some commercial use)",
+        "role": "Interprocedural data-flow analysis",
+        "note": "Requires a prebuilt database, which is a CI-scale job - no adapter here "
+                "yet. Run it in GitHub Actions and read its SARIF in code scanning.",
+    },
+    "zap": {
+        "bin": "zap.sh", "licence": "Apache-2.0",
+        "role": "Dynamic analysis against a RUNNING deployment",
+        "note": "Sends live traffic. Requires --authorize-network-scan and a --url you own.",
+    },
+}
+
+ENGINE_SEVERITY = {
+    "CRITICAL": "CRITICAL", "ERROR": "HIGH", "HIGH": "HIGH", "WARNING": "MEDIUM",
+    "MEDIUM": "MEDIUM", "MODERATE": "MEDIUM", "LOW": "LOW", "INFO": "LOW",
+    "INFORMATION": "LOW", "UNKNOWN": "LOW", "NOTE": "LOW",
+}
+
+
+def _engine_finding(engine: str, rule_id: str, severity: str, title: str, file: str,
+                    line: int, snippet: str, standard: str, remediation: str,
+                    confidence: str = "HIGH") -> Finding:
+    """Imported findings are clearly attributed and never silently rebranded."""
+    return Finding(
+        rule_id=f"EXT-{engine.upper()}:{rule_id}"[:120],
+        domain="EXTERNAL",
+        severity=ENGINE_SEVERITY.get(str(severity).upper(), "MEDIUM"),
+        title=f"[{engine}] {title}"[:300],
+        file=file or "(repository)",
+        line=line or 0,
+        snippet=snippet[:400],
+        cwe_or_standard=standard or f"Reported by {engine}",
+        remediation=remediation or f"See the {engine} documentation for this rule.",
+        confidence=confidence,
+    )
+
+
+def probe_engine(name: str) -> Optional[str]:
+    """Is this engine already installed? We look at PATH and do nothing else."""
+    import shutil
+    spec = ENGINE_SPECS.get(name)
+    if not spec:
+        return None
+    return shutil.which(spec["bin"])
+
+
+def parse_semgrep(payload: Dict) -> List[Finding]:
+    out: List[Finding] = []
+    for r in payload.get("results", []) or []:
+        extra = r.get("extra", {}) or {}
+        meta = extra.get("metadata", {}) or {}
+        cwe = meta.get("cwe")
+        if isinstance(cwe, list):
+            cwe = ", ".join(str(c) for c in cwe)
+        out.append(_engine_finding(
+            "semgrep", r.get("check_id", "rule"), extra.get("severity", "WARNING"),
+            extra.get("message", "")[:200] or r.get("check_id", "finding"),
+            r.get("path", ""), (r.get("start", {}) or {}).get("line", 0),
+            (extra.get("lines") or "")[:300],
+            str(cwe or meta.get("owasp") or "Semgrep rule"),
+            meta.get("fix") or extra.get("fix") or "",
+        ))
+    return out
+
+
+def parse_gitleaks(payload: List) -> List[Finding]:
+    out: List[Finding] = []
+    for r in payload or []:
+        # Never carry the raw Secret/Match field through - redact at the boundary.
+        out.append(_engine_finding(
+            "gitleaks", r.get("RuleID", "secret"), "CRITICAL",
+            f"Secret detected: {r.get('Description', r.get('RuleID', 'secret'))}",
+            r.get("File", ""), r.get("StartLine", 0),
+            f"{redact(str(r.get('Secret', '')))} (commit {str(r.get('Commit', ''))[:10]})",
+            "CWE-798 Hard-Coded Credentials",
+            "Rotate this credential - history rewriting does not uncompromise it.",
+        ))
+    return out
+
+
+def parse_trivy(payload: Dict) -> List[Finding]:
+    out: List[Finding] = []
+    for res in payload.get("Results", []) or []:
+        target = res.get("Target", "")
+        for v in res.get("Vulnerabilities", []) or []:
+            out.append(_engine_finding(
+                "trivy", v.get("VulnerabilityID", "VULN"), v.get("Severity", "MEDIUM"),
+                f"{v.get('PkgName', '?')} {v.get('InstalledVersion', '')}: "
+                f"{v.get('Title', v.get('VulnerabilityID', ''))}",
+                target, 0,
+                f"Fixed in: {v.get('FixedVersion') or 'no fix published'}",
+                v.get("VulnerabilityID", ""),
+                f"Upgrade {v.get('PkgName', '')} to {v.get('FixedVersion') or 'a patched release'}.",
+            ))
+        for m in res.get("Misconfigurations", []) or []:
+            out.append(_engine_finding(
+                "trivy", m.get("ID", "MISCONF"), m.get("Severity", "MEDIUM"),
+                m.get("Title", "Misconfiguration"), target,
+                (m.get("CauseMetadata", {}) or {}).get("StartLine", 0),
+                m.get("Message", "")[:300], m.get("ID", ""), m.get("Resolution", ""),
+            ))
+    return out
+
+
+def parse_osv_scanner(payload: Dict) -> List[Finding]:
+    out: List[Finding] = []
+    for res in payload.get("results", []) or []:
+        source = (res.get("source", {}) or {}).get("path", "")
+        for pkg in res.get("packages", []) or []:
+            info = pkg.get("package", {}) or {}
+            for v in pkg.get("vulnerabilities", []) or []:
+                out.append(_engine_finding(
+                    "osv-scanner", v.get("id", "OSV"), "MEDIUM",
+                    f"{info.get('name', '?')} {info.get('version', '')}: "
+                    f"{v.get('summary', v.get('id', ''))}",
+                    source, 0,
+                    ", ".join(v.get("aliases", [])[:4]) or v.get("id", ""),
+                    v.get("id", ""),
+                    "Upgrade to a version outside the affected range.",
+                ))
+    return out
+
+
+def parse_scorecard(payload: Dict) -> List[Finding]:
+    """Scorecard grades posture 0-10. Only weak checks become findings."""
+    out: List[Finding] = []
+    for c in payload.get("checks", []) or []:
+        score = c.get("score", -1)
+        if score is None or score < 0 or score >= 7:
+            continue
+        out.append(_engine_finding(
+            "scorecard", c.get("name", "check"),
+            "HIGH" if score <= 3 else "MEDIUM",
+            f"Supply-chain posture: {c.get('name', '')} scored {score}/10",
+            "(repository)", 0, (c.get("reason") or "")[:300],
+            "OpenSSF Scorecard",
+            "; ".join(c.get("details", [])[:2]) or
+            "See https://github.com/ossf/scorecard for how to raise this check.",
+            confidence="MEDIUM",
+        ))
+    return out
+
+
+ENGINE_PARSERS = {
+    "semgrep": parse_semgrep,
+    "gitleaks": parse_gitleaks,
+    "trivy": parse_trivy,
+    "osv-scanner": parse_osv_scanner,
+    "scorecard": parse_scorecard,
+}
+
+ENGINE_COMMANDS = {
+    "semgrep": lambda root, _a: ["semgrep", "scan", "--config", "auto", "--json",
+                                 "--quiet", "--timeout", "300", str(root)],
+    "gitleaks": lambda root, _a: ["gitleaks", "detect", "--source", str(root),
+                                  "--report-format", "json", "--report-path", "-",
+                                  "--no-banner", "--exit-code", "0"],
+    "trivy": lambda root, _a: ["trivy", "fs", "--format", "json", "--quiet",
+                               "--scanners", "vuln,misconfig,secret", str(root)],
+    "osv-scanner": lambda root, _a: ["osv-scanner", "--format", "json", "-r", str(root)],
+    "scorecard": lambda root, _a: ["scorecard", "--local", str(root), "--format", "json"],
+}
+
+
+def run_engine(name: str, root: Path, timeout: int = 600) -> Tuple[List[Finding], Optional[Finding]]:
+    """Run one installed engine. Returns (findings, gap_or_None).
+
+    Any failure - missing binary, crash, timeout, unreadable output - produces a
+    coverage gap rather than an empty finding list, because "the engine did not run"
+    must never read as "the engine found nothing".
+    """
+    import subprocess
+
+    def gap(reason: str, detail: str = "") -> Finding:
+        return Finding(
+            rule_id="ENG-00", domain="COVERAGE", severity="LOW",
+            title=f"External Engine Not Run: {name}", file="(engines)", line=0,
+            snippet=f"{reason}{(' - ' + detail) if detail else ''}"[:300],
+            cwe_or_standard="Coverage",
+            remediation=(f"{name} ({ENGINE_SPECS.get(name, {}).get('role', '')}) was "
+                         f"requested but produced no usable result, so its area is "
+                         f"UNVERIFIED. Install it yourself and re-run, or drop "
+                         f"--engine {name}. Vibe Aegis never installs tools for you."),
+            confidence="HIGH", kind="skipped_check", status="SKIPPED",
+        )
+
+    if name not in ENGINE_SPECS:
+        return [], gap("unknown engine")
+    if name not in ENGINE_COMMANDS:
+        return [], gap("no adapter implemented",
+                       ENGINE_SPECS[name].get("note", ""))
+    if not probe_engine(name):
+        return [], gap("not installed on PATH")
+
+    try:
+        proc = subprocess.run(ENGINE_COMMANDS[name](root, None), capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, shell=False)
+    except Exception as exc:
+        return [], gap("engine failed to execute", f"{type(exc).__name__}")
+
+    raw = (proc.stdout or "").strip()
+    if not raw:
+        return [], gap("engine produced no output",
+                       (proc.stderr or "")[:120].replace("\n", " "))
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        start = min((i for i in (raw.find("{"), raw.find("[")) if i >= 0), default=-1)
+        if start < 0:
+            return [], gap("engine output was not JSON", raw[:120].replace("\n", " "))
+        try:
+            payload = json.loads(raw[start:])
+        except Exception:
+            return [], gap("engine output was not parseable JSON")
+
+    try:
+        return ENGINE_PARSERS[name](payload), None
+    except Exception as exc:
+        return [], gap("engine output had an unexpected shape", type(exc).__name__)
+
+
 def fingerprint(f: Finding) -> str:
     import hashlib
     normalized = re.sub(r"\s+", " ", f.snippet).strip()[:120]
@@ -2342,11 +2751,35 @@ def _is_incomplete(f: "Finding") -> bool:
     )
 
 
+# The five states a release gate is allowed to be in. Anything else is a guess.
+#
+#   BLOCKED               a defect we can point at. Do not ship.
+#   INCOMPLETE            something was not examined. No opinion is possible.
+#   REVIEW_REQUIRED       only medium/low defects. A human decides.
+#   STATIC_CHECKS_PASSED  the static checks that RAN found nothing. NOT release-ready:
+#                         no dependency, history, artifact or live-deployment evidence.
+#   RELEASE_AUDIT_PASSED  the release profile ran every stage and all of them passed.
+#
+# The old success string was "READY TO PUBLISH", emitted after a plain source scan.
+# That is a claim the evidence never supported: reading source tells you nothing about
+# your lockfile, your git history, your built bundle or your running deployment.
+VERDICT_BLOCKED = "BLOCKED"
+VERDICT_INCOMPLETE = "INCOMPLETE"
+VERDICT_REVIEW = "REVIEW_REQUIRED"
+VERDICT_STATIC_OK = "STATIC_CHECKS_PASSED"
+VERDICT_RELEASE_OK = "RELEASE_AUDIT_PASSED"
+
+# Stages a `--profile release` run must actually have completed before the scanner is
+# willing to say the release itself was audited.
+RELEASE_STAGES = ("dependencies", "git-history", "artifacts")
+
+
 def compute_readiness_score(
     findings: List[Finding],
     skipped_checks: Optional[List[Finding]] = None,
     scanned_files: Optional[int] = None,
     allow_skipped: bool = False,
+    release_audit: bool = False,
 ) -> Tuple[int, str]:
     """Score real defects only, and refuse to certify an audit that did not run.
 
@@ -2367,26 +2800,36 @@ def compute_readiness_score(
 
     # Nothing was inspected: there is no evidence either way.
     if scanned_files is not None and scanned_files <= 0:
-        return 0, "INCOMPLETE_SCAN (0 source files scanned - cannot certify readiness)"
+        return 0, (f"{VERDICT_INCOMPLETE}_SCAN (0 source files scanned - "
+                   "cannot certify readiness)")
 
     weights = {"CRITICAL": 25, "HIGH": 10, "MEDIUM": 4, "LOW": 1}
     score = max(0, 100 - sum(weights.get(f.severity, 1) for f in real))
 
     # A live defect outranks a coverage gap.
     if any(f.severity in {"CRITICAL", "HIGH"} for f in real):
-        return score, "BLOCKED (Fix Critical/High findings before publishing)"
+        return score, f"{VERDICT_BLOCKED} (Fix Critical/High findings before publishing)"
 
     if incomplete and not allow_skipped:
         n = len(incomplete)
         names = ", ".join(sorted({f.title for f in incomplete})[:3])
         return score, (
-            f"VERIFIED_PARTIAL - INCOMPLETE_SCAN ({n} check{'s' if n != 1 else ''} "
-            f"skipped/offline: {names}; run a full online scan before publishing)"
+            f"{VERDICT_INCOMPLETE}_SCAN ({n} check{'s' if n != 1 else ''} "
+            f"skipped/offline: {names}; re-run with those stages available)"
         )
 
-    if score >= 90:
-        return score, "READY TO PUBLISH"
-    return score, "NEEDS REVIEW (Address Medium/Low polish items)"
+    # A MEDIUM is something a person should look at; a lone LOW (a missing focus ring)
+    # is polish and must not hold a release hostage, or the state stops meaning anything.
+    if any(f.severity == "MEDIUM" for f in real) or score < 90:
+        return score, (f"{VERDICT_REVIEW} ({len(real)} finding(s) need a human decision "
+                       "before release)")
+
+    # Clean - but say honestly WHICH evidence supports that.
+    if release_audit:
+        return score, (f"{VERDICT_RELEASE_OK} (source, dependencies, git history and "
+                       "shipped artifacts all audited with no findings)")
+    return score, (f"{VERDICT_STATIC_OK} (the static checks that ran found nothing - "
+                   "this is NOT a release-readiness verdict; run --profile release)")
 
 
 def redact_findings(findings: List[Finding]) -> None:
@@ -2463,6 +2906,13 @@ def main() -> int:
     gate.add_argument("--fail-on-incomplete", action="store_true",
                       help="Exit 1 if any check could not run. Use this when a green pipeline "
                            "must mean 'fully audited', not merely 'nothing found'.")
+    gate.add_argument("--profile", choices=["quick", "code", "full", "release"], default="code",
+                      help="How much evidence to gather, and therefore which verdicts are "
+                           "reachable. quick: fast source patterns only. code (default): full "
+                           "source, data-flow and secret analysis. full: adds dependencies, git "
+                           "history and build artifacts. release: everything, plus "
+                           "--fail-on-incomplete, and the only profile that can return "
+                           "RELEASE_AUDIT_PASSED. A source scan can never certify a release.")
     gate.add_argument("--min-confidence", choices=["high", "medium", "low"], default="low",
                       help="Only let findings at or above this confidence affect the exit code. "
                            "Severity says how bad a finding would be IF real; confidence says how "
@@ -2474,6 +2924,24 @@ def main() -> int:
     scope = parser.add_argument_group("scope")
     scope.add_argument("--diff", metavar="REF", nargs="?", const="origin/main",
                        help="Only scan files changed vs REF (default origin/main). Ideal for pull requests.")
+    engines = parser.add_argument_group("external engines (optional, never auto-installed)")
+    engines.add_argument("--engine", action="append", default=[], metavar="NAME",
+                         choices=sorted(ENGINE_SPECS.keys()),
+                         help="Also run an installed engine and import its findings: "
+                              + ", ".join(sorted(ENGINE_SPECS.keys())) +
+                              ". Repeatable. An engine that is not installed is reported "
+                              "as a coverage gap, never as a pass. Nothing is ever "
+                              "downloaded or installed for you.")
+    engines.add_argument("--list-engines", action="store_true",
+                         help="Show which external engines are installed, and exit.")
+    engines.add_argument("--authorize-network-scan", action="store_true",
+                         help="Required before any engine that sends traffic to a live "
+                              "target (ZAP). Confirms you own, or are authorised to test, "
+                              "the deployment named by --url.")
+
+    scope.add_argument("--max-file-size", type=int, default=1_500_000, metavar="BYTES",
+                       help="Skip files larger than this (default 1500000). Anything skipped "
+                            "is reported as a coverage gap, never as a clean result.")
     scope.add_argument("--include-tests", action="store_true",
                        help="Also audit test and fixture files. They deliberately contain "
                             "insecure code, so they are excluded by default.")
@@ -2495,14 +2963,43 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    if args.list_engines:
+        print("External engines (Vibe Aegis never installs these for you):\n")
+        for name in sorted(ENGINE_SPECS):
+            spec = ENGINE_SPECS[name]
+            path = probe_engine(name)
+            adapter = "adapter" if name in ENGINE_COMMANDS else "no adapter yet"
+            print(f"  {name:13} {'INSTALLED' if path else 'not installed':14} {adapter}")
+            print(f"  {'':13} {spec['role']}")
+            print(f"  {'':13} licence: {spec['licence']}")
+            if spec.get("note"):
+                print(f"  {'':13} {spec['note']}")
+            if path:
+                print(f"  {'':13} path: {path}")
+            print()
+        print("Add one with --engine <name>. A requested engine that is missing is")
+        print("reported as a coverage gap, never as a passing check.")
+        return 0
+
     root = Path(args.target).resolve()
     if not root.exists():
         print(f"Error: Target path '{root}' does not exist.", file=sys.stderr)
         return 2
 
-    want_artifacts = args.all or args.artifact is not None
-    want_history = args.all or args.git_history is not None
-    want_deps = args.all or args.deps or args.sbom is not None
+    # A profile is a default set of stages, never a ceiling: an explicit flag can always
+    # add a stage a profile leaves out. `quick` and `code` deliberately cannot reach a
+    # release verdict, because they do not look at the evidence a release depends on.
+    deep_profile = args.profile in ("full", "release")
+    want_artifacts = args.all or deep_profile or args.artifact is not None
+    want_history = args.all or deep_profile or args.git_history is not None
+    want_deps = args.all or deep_profile or args.deps or args.sbom is not None
+    if args.profile == "quick":
+        want_artifacts = args.artifact is not None
+        want_history = args.git_history is not None
+        want_deps = args.deps or args.sbom is not None
+    if args.profile == "release":
+        # A release gate that tolerates an unexamined stage is not a gate.
+        args.fail_on_incomplete = True
 
     stages: List[str] = ["static"]
     findings: List[Finding] = []
@@ -2518,8 +3015,10 @@ def main() -> int:
 
     # ---- Stage 1: static source analysis ---------------------------------
     stack = detect_tech_stack(root)
+    ledger = CoverageLedger()
     static_findings, scanned_files = scan_repository(
-        root, only_files=only_files, include_tests=args.include_tests)
+        root, only_files=only_files, include_tests=args.include_tests,
+        ledger=ledger, max_file_bytes=args.max_file_size)
     findings.extend(static_findings)
 
     # ---- Deep stages ------------------------------------------------------
@@ -2530,7 +3029,7 @@ def main() -> int:
     dependencies: List[Tuple[str, str, str]] = []
     if want_deps:
         dependencies = parse_dependencies(root)
-        if args.deps or args.all:
+        if args.deps or args.all or deep_profile:
             stages.append("dependencies")
             findings.extend(check_dependency_vulnerabilities(dependencies, offline=args.offline))
 
@@ -2539,11 +3038,41 @@ def main() -> int:
         source_secrets = [f for f in static_findings if f.rule_id.startswith("SEC-01")]
         findings.extend(scan_build_artifacts(root, args.artifact, source_secrets))
 
+    # ---- Optional external engines ---------------------------------------
+    for engine_name in dict.fromkeys(args.engine):   # de-duplicate, keep order
+        if engine_name == "zap":
+            # Dynamic scanning sends real traffic at a real host. Two independent
+            # conditions, because an accidental scan of someone else's deployment is
+            # not an error you can take back.
+            if not args.authorize_network_scan or not args.url:
+                findings.append(Finding(
+                    rule_id="ENG-00", domain="COVERAGE", severity="LOW",
+                    title="External Engine Not Run: zap",
+                    file="(engines)", line=0,
+                    snippet=("Dynamic scanning requires BOTH --authorize-network-scan "
+                             "and a --url you own or are authorised to test."),
+                    cwe_or_standard="Coverage",
+                    remediation=("ZAP sends live traffic to the target. Re-run with "
+                                 "--url <your deployment> --authorize-network-scan only "
+                                 "against a deployment you control."),
+                    confidence="HIGH", kind="skipped_check", status="SKIPPED"))
+                continue
+        stages.append(f"engine:{engine_name}")
+        eng_findings, eng_gap = run_engine(engine_name, root)
+        findings.extend(eng_findings)
+        if eng_gap is not None:
+            findings.append(eng_gap)
+
     if args.url and not args.offline:
         stages.append("live-url")
         findings.extend(check_live_url_posture(args.url))
     elif args.url and args.offline:
         print("Note: --offline set, skipping the live URL stage.", file=sys.stderr)
+
+    # Everything the scanner declined to read becomes a visible gap, on the same
+    # footing as a stage that could not run. Added before scoring and suppression so
+    # it reaches the verdict and cannot be baselined away.
+    findings.extend(ledger.gaps())
 
     # ---- Normalise, fingerprint, suppress --------------------------------
     redact_findings(findings)
@@ -2591,7 +3120,13 @@ def main() -> int:
     sev_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
     findings.sort(key=lambda f: (sev_rank.get(f.severity, 9), f.domain, f.file, f.line))
 
-    score, verdict = compute_readiness_score(findings, scanned_files=scanned_files)
+    # RELEASE_AUDIT_PASSED is earned by evidence, not by passing a flag: every release
+    # stage must actually appear in `stages`. Asking for --profile release on a repo with
+    # no git history or no build output yields INCOMPLETE, which is the correct answer.
+    release_audit = (args.profile == "release"
+                     and all(s in stages for s in RELEASE_STAGES))
+    score, verdict = compute_readiness_score(
+        findings, scanned_files=scanned_files, release_audit=release_audit)
 
     # `--diff` that resolved successfully and matched no source files is an EMPTY
     # CHANGESET, not a failed audit - a docs-only or config-only pull request is the
@@ -2640,8 +3175,11 @@ def main() -> int:
         "release_verdict": verdict,
         "summary_counts": counts,
         "coverage": {
-            "complete": not skipped_checks and not scan_is_incomplete,
+            "complete": (not skipped_checks and not scan_is_incomplete
+                         and ledger.material_total() == 0),
             "checks_skipped": len(skipped_checks),
+            "items_not_examined": ledger.total(),
+            "not_examined": ledger.as_dict(),
             "note": (
                 "No source files were scanned, so nothing was verified. Check the target "
                 "path and the checkout."
