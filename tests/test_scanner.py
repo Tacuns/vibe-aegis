@@ -4121,7 +4121,8 @@ class TestSignatureIsVerifiedOrSaidToBeUnverified(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             apk = root / apk_name
-            shutil.copy(ANDROID_FIXTURES / apk_name, apk)
+            # Stored as .apk.bin: the repository's .gitignore rightly excludes *.apk.
+            shutil.copy(ANDROID_FIXTURES / (apk_name + ".bin"), apk)
             if verifier == "real":
                 return {f.title for f in aegis_scan.scan_mobile_package(root, apk)}
             if verifier is None:
