@@ -475,6 +475,15 @@ bash install.sh --target /tmp/test-app --agent all
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the rule-authoring guide and severity rubric.
 
+## 💙 From the Makers of TacUNS
+
+Vibe Aegis is made by **TacUNS**, the team behind **TacUNS Firewall**: a free Android firewall that shows and controls what your apps connect to. It works on the phone itself, with no root, no account, no ads and no analytics.
+
+- 🌐 Website: [tacuns.net](https://www.tacuns.net)
+- 📱 Android app: [TacUNS Firewall on Google Play](https://play.google.com/store/apps/details?id=com.tacu.nsfwzerotrust)
+
+You don't need the app to use Vibe Aegis. Vibe Aegis stays free and MIT-licensed.
+
 ## ⚖️ Responsible Use & Scope
 
 Vibe Aegis is a **defensive pre-deployment security and UI/UX quality assurance framework**. Its live URL posture checks (`--url`) perform strictly passive, read-only HTTP `GET` requests to inspect security headers and accidental file exposure. It sends no payloads and no credentials.
